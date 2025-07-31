@@ -1,0 +1,253 @@
+#include "tensorflow/cc/client/client_session.h"
+#include "tensorflow/cc/ops/standard_ops.h"
+#include "tensorflow/cc/ops/array_ops.h"
+#include "tensorflow/cc/ops/state_ops.h"
+#include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/platform/init_main.h"
+#include "tensorflow/core/public/session_options.h"
+#include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/lib/core/status.h"
+#include <iostream>
+#include <cstring>
+#include <vector>
+#include <cmath>
+
+#define MAX_RANK 4
+#define MIN_RANK 1
+#define MIN_TENSOR_SHAPE_DIMS_TF 1
+#define MAX_TENSOR_SHAPE_DIMS_TF 10
+
+namespace tf_fuzzer_utils {
+    void logError(const std::string& message, const uint8_t* data, size_t size) {
+        std::cerr << "Error: " << message << std::endl;
+    }
+}
+
+tensorflow::DataType parseDataType(uint8_t selector) {
+    tensorflow::DataType dtype; 
+    switch (selector % 11) {  
+        case 0:
+            dtype = tensorflow::DT_FLOAT;
+            break;
+        case 1:
+            dtype = tensorflow::DT_DOUBLE;
+            break;
+        case 2:
+            dtype = tensorflow::DT_INT32;
+            break;
+        case 3:
+            dtype = tensorflow::DT_UINT8;
+            break;
+        case 4:
+            dtype = tensorflow::DT_INT16;
+            break;
+        case 5:
+            dtype = tensorflow::DT_INT8;
+            break;
+        case 6:
+            dtype = tensorflow::DT_INT64;
+            break;
+        case 7:
+            dtype = tensorflow::DT_BOOL;
+            break;
+        case 8:
+            dtype = tensorflow::DT_UINT16;
+            break;
+        case 9:
+            dtype = tensorflow::DT_UINT32;
+            break;
+        case 10:
+            dtype = tensorflow::DT_UINT64;
+            break;
+    }
+    return dtype;
+}
+
+uint8_t parseRank(uint8_t byte) {
+    constexpr uint8_t range = MAX_RANK - MIN_RANK + 1;
+    uint8_t rank = byte % range + MIN_RANK;
+    return rank;
+}
+
+std::vector<int64_t> parseShape(const uint8_t* data, size_t& offset, size_t total_size, uint8_t rank) {
+    if (rank == 0) {
+        return {};
+    }
+
+    std::vector<int64_t> shape;
+    shape.reserve(rank);
+    const auto sizeof_dim = sizeof(int64_t);
+
+    for (uint8_t i = 0; i < rank; ++i) {
+        if (offset + sizeof_dim <= total_size) {
+            int64_t dim_val;
+            std::memcpy(&dim_val, data + offset, sizeof_dim);
+            offset += sizeof_dim;
+            
+            dim_val = MIN_TENSOR_SHAPE_DIMS_TF +
+                    static_cast<int64_t>((static_cast<uint64_t>(std::abs(dim_val)) %
+                                        static_cast<uint64_t>(MAX_TENSOR_SHAPE_DIMS_TF - MIN_TENSOR_SHAPE_DIMS_TF + 1)));
+
+            shape.push_back(dim_val);
+        } else {
+             shape.push_back(1);
+        }
+    }
+
+    return shape;
+}
+
+template <typename T>
+void fillTensorWithData(tensorflow::Tensor& tensor, const uint8_t* data,
+                        size_t& offset, size_t total_size) {
+    auto flat = tensor.flat<T>();
+    const size_t num_elements = flat.size();
+    const size_t element_size = sizeof(T);
+
+    for (size_t i = 0; i < num_elements; ++i) {
+        if (offset + element_size <= total_size) {
+            T value;
+            std::memcpy(&value, data + offset, element_size);
+            offset += element_size;
+            flat(i) = value;
+        } else {
+            flat(i) = T{};
+        }
+    }
+}
+
+void fillTensorWithDataByType(tensorflow::Tensor& tensor,
+                              tensorflow::DataType dtype, const uint8_t* data,
+                              size_t& offset, size_t total_size) {
+    switch (dtype) {
+        case tensorflow::DT_FLOAT:
+            fillTensorWithData<float>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_DOUBLE:
+            fillTensorWithData<double>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_INT32:
+            fillTensorWithData<int32_t>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_UINT8:
+            fillTensorWithData<uint8_t>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_INT16:
+            fillTensorWithData<int16_t>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_INT8:
+            fillTensorWithData<int8_t>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_INT64:
+            fillTensorWithData<int64_t>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_BOOL:
+            fillTensorWithData<bool>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_UINT16:
+            fillTensorWithData<uint16_t>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_UINT32:
+            fillTensorWithData<uint32_t>(tensor, data, offset, total_size);
+            break;
+        case tensorflow::DT_UINT64:
+            fillTensorWithData<uint64_t>(tensor, data, offset, total_size);
+            break;
+        default:
+            break;
+    }
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    if (size < 10) return 0;
+    
+    size_t offset = 0;
+
+    tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
+
+    try {
+        tensorflow::DataType ref_dtype = parseDataType(data[offset++]);
+        uint8_t ref_rank = parseRank(data[offset++]);
+        std::vector<int64_t> ref_shape = parseShape(data, offset, size, ref_rank);
+        
+        if (offset >= size) return 0;
+        
+        uint8_t indices_rank = parseRank(data[offset++]);
+        if (indices_rank == 0) indices_rank = 1;
+        std::vector<int64_t> indices_shape = parseShape(data, offset, size, indices_rank);
+        
+        if (offset >= size) return 0;
+        
+        int64_t K = 1;
+        if (indices_rank > 0 && !indices_shape.empty()) {
+            K = indices_shape.back();
+            if (K <= 0 || K > static_cast<int64_t>(ref_shape.size())) {
+                K = std::min(static_cast<int64_t>(ref_shape.size()), static_cast<int64_t>(1));
+            }
+            indices_shape.back() = K;
+        }
+        
+        std::vector<int64_t> updates_shape;
+        for (int i = 0; i < indices_rank - 1; ++i) {
+            updates_shape.push_back(indices_shape[i]);
+        }
+        for (int64_t i = K; i < static_cast<int64_t>(ref_shape.size()); ++i) {
+            updates_shape.push_back(ref_shape[i]);
+        }
+        
+        tensorflow::Tensor ref_tensor(ref_dtype, tensorflow::TensorShape(ref_shape));
+        fillTensorWithDataByType(ref_tensor, ref_dtype, data, offset, size);
+        
+        tensorflow::Tensor indices_tensor(tensorflow::DT_INT32, tensorflow::TensorShape(indices_shape));
+        auto indices_flat = indices_tensor.flat<int32_t>();
+        for (int i = 0; i < indices_flat.size(); ++i) {
+            if (offset + sizeof(int32_t) <= size) {
+                int32_t idx_val;
+                std::memcpy(&idx_val, data + offset, sizeof(int32_t));
+                offset += sizeof(int32_t);
+                
+                int dim_idx = i % K;
+                if (dim_idx < static_cast<int>(ref_shape.size())) {
+                    idx_val = std::abs(idx_val) % static_cast<int32_t>(ref_shape[dim_idx]);
+                } else {
+                    idx_val = 0;
+                }
+                indices_flat(i) = idx_val;
+            } else {
+                indices_flat(i) = 0;
+            }
+        }
+        
+        tensorflow::Tensor updates_tensor(ref_dtype, tensorflow::TensorShape(updates_shape));
+        fillTensorWithDataByType(updates_tensor, ref_dtype, data, offset, size);
+        
+        auto ref_var = tensorflow::ops::Variable(root, ref_tensor.shape(), ref_dtype);
+        auto ref_assign = tensorflow::ops::Assign(root, ref_var, tensorflow::Input(ref_tensor));
+        
+        auto scatter_nd_update = tensorflow::ops::ScatterNdUpdate(
+            root, 
+            ref_var,
+            tensorflow::Input(indices_tensor),
+            tensorflow::Input(updates_tensor)
+        );
+
+        tensorflow::ClientSession session(root);
+        std::vector<tensorflow::Tensor> outputs;
+        
+        tensorflow::Status init_status = session.Run({ref_assign}, &outputs);
+        if (!init_status.ok()) {
+            return -1;
+        }
+        
+        tensorflow::Status status = session.Run({scatter_nd_update}, &outputs);
+        if (!status.ok()) {
+            return -1;
+        }
+
+    } catch (const std::exception& e) {
+        tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);
+        return -1;
+    } 
+
+    return 0;
+}
