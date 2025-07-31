@@ -52,7 +52,7 @@ def build_tf_cov() -> None:
     print("Building TensorFlow coverage harness...")
     os.system("cp -r template/tf_cpu_cov/* .")
     os.system("cp template/tf_cpu_cov/copy.py .")
-    os.system("python3 copy.py")
+    os.system("python3 -u copy.py")
     build_tf()
 
 

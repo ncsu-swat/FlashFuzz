@@ -16,6 +16,6 @@ RUN cd /root/tensorflow && ./configure
 WORKDIR /root/tensorflow/fuzz
 COPY scripts/ .
 
-RUN  python3 build_test_harness.py --dll tf --mode cov
+RUN  python3 -u build_test_harness.py --dll tf --mode cov
 
 CMD [ "bash" ]
