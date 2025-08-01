@@ -90,8 +90,12 @@ WORKDIR /root
 
 COPY docker/tensorflow-2.18.0-clang19-compat.patch /root/tensorflow
 
-RUN git apply /root/tensorflow/tensorflow-2.18.0-clang19-compat.patch && \
-    rm /root/tensorflow/tensorflow-2.18.0-clang19-compat.patch
+WORKDIR /root/tensorflow
+
+RUN git apply tensorflow-2.18.0-clang19-compat.patch && \
+    rm tensorflow-2.18.0-clang19-compat.patch
+
+WORKDIR /root
 
 # Default command
 CMD ["bash"]

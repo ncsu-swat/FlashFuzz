@@ -27,23 +27,42 @@ def run_command(cmd: str, cwd: str, timeout: Optional[float] = None) -> tuple[in
         return -2, f"ERROR: {str(e)}"
 
 
+import concurrent.futures
+
+
+def build_one_tf_api(tf_dir: str) -> tuple[str, int, str]:
+    """Build a single TensorFlow API and return the result."""
+    api_name = os.path.basename(tf_dir)
+    print(f"Building TensorFlow API: {api_name}")
+    cmd = "bash build.sh"
+    ret_code, output = run_command(cmd, tf_dir)
+    return api_name, ret_code, output
+
+
 def build_tf() -> None:
+    """Find and build all TensorFlow APIs in parallel."""
     tf_dirs = glob.glob("tf.*")
     total_dirs = len(tf_dirs)
-    print(f"Found {total_dirs} TensorFlow API directories to build.")
+    if total_dirs == 0:
+        print("No TensorFlow API directories found to build.")
+        return
+
+    print(f"Found {total_dirs} TensorFlow API directories to build in parallel.")
     success_count = 0
-    for tf_dir in tf_dirs:
-        api_name = os.path.basename(tf_dir)
-        print(f"Building TensorFlow API: {api_name}")
 
-        cmd = "bash build.sh"
-        ret_code, output = run_command(cmd, tf_dir)
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = [executor.submit(build_one_tf_api, tf_dir) for tf_dir in tf_dirs]
 
-        if ret_code != 0:
-            print(f"Error building {api_name}: {output}")
-        else:
-            print(f"Successfully built {api_name}")
-            success_count += 1
+        for future in concurrent.futures.as_completed(futures):
+            try:
+                api_name, ret_code, output = future.result()
+                if ret_code != 0:
+                    print(f"Error building {api_name}: {output}")
+                else:
+                    print(f"Successfully built {api_name}")
+                    success_count += 1
+            except Exception as e:
+                print(f"An exception occurred during build: {e}")
 
     print(f"Built {success_count}/{total_dirs} TensorFlow APIs successfully.")
 
@@ -53,7 +72,7 @@ def build_tf_cov() -> None:
     os.system("cp -r template/tf_cpu_cov/* .")
     os.system("cp template/tf_cpu_cov/copy.py .")
     os.system("python3 -u copy.py")
-    build_tf()
+    # build_tf()
 
 
 def main():

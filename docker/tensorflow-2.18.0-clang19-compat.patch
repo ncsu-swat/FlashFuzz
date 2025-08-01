@@ -67,3 +67,4 @@ index 00000000..ce5bdb98
 +       Element(1) - Element(2) * a * a, Element(-2) * a * b, Element(-2) * a * c,
 +       Element(-2) * a * b, Element(1) - Element(2) * b * b, Element(-2) * b * c,
 +       Element(-2) * a * c, Element(-2) * b * c, Element(1) - Element(2) * c * c
+
