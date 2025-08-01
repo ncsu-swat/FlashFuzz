@@ -24,7 +24,7 @@ class Experiment():
 
     def check_image(self):
 
-        cmd = f"docker image -q {self.image_name}"
+        cmd = f"docker images -q {self.image_name}"
         proc = subprocess.Popen([cmd], shell=True, stdout=subprocess.PIPE)
         out, _ = proc.communicate()
         image_available = out.decode().strip() != ""

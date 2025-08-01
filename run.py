@@ -63,7 +63,7 @@ def parse_args():
 def main():
     start_time = time.time()
     args = parse_args()
-    api_list = f"api_list/{args.dll}{args.version}_{args.mode}.txt"
+    api_list = f"api_list/{args.dll}{args.version}-flashfuzz.txt"
     with open(api_list, "r") as f:
         apis = f.read().splitlines()
 
@@ -87,3 +87,6 @@ def main():
     elapsed_time_h = elapsed_time_m / 60
     elapsed_str = f"Total Running Time : {(elapsed_time_s):.2f} sec = {(elapsed_time_m):.2f} min = {(elapsed_time_h):.2f} hr"
     print(f"\n{elapsed_str}")
+
+if __name__ == "__main__":
+    main()
