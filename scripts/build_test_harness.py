@@ -66,12 +66,22 @@ def build_tf() -> None:
 
     print(f"Built {success_count}/{total_dirs} TensorFlow APIs successfully.")
 
+def build_tf_fuzz() -> None:
+    print("Building TensorFlow fuzz harness...")
+    os.system("cp -r template/tf_cpu/* .")
+    os.system("cp template/tf_cpu/copy.py .")
+    os.system("python3 -u copy.py")
+    os.system("rm -rf template")
+    os.system("rm -rf BUILD")
+    # build_tf()
 
 def build_tf_cov() -> None:
     print("Building TensorFlow coverage harness...")
     os.system("cp -r template/tf_cpu_cov/* .")
     os.system("cp template/tf_cpu_cov/copy.py .")
     os.system("python3 -u copy.py")
+    os.system("rm -rf template")
+    os.system("rm -rf BUILD")
     # build_tf()
 
 
@@ -98,7 +108,7 @@ def main():
     if args.dll == "tf" and args.mode == "cov":
         build_tf_cov()
     elif args.dll == "tf" and args.mode == "fuzz":
-        build_tf()
+        build_tf_fuzz()
     # Add logic for torch if necessary
 
 

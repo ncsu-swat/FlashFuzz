@@ -16,6 +16,19 @@ RUN cd /root/tensorflow && ./configure
 WORKDIR /root/tensorflow/fuzz
 COPY scripts/ .
 
-RUN  python3 -u build_test_harness.py --dll tf --mode cov
+RUN  python3 -u build_test_harness.py --dll tf --mode fuzz
+
+RUN bazel build --jobs=64  \
+    --copt=-fsanitize=fuzzer\
+    --copt=-g \
+    --copt=-O0 \
+    --linkopt=-fsanitize=fuzzer \
+    --linkopt=-L/usr/lib/clang/19/lib/linux \
+    --linkopt=-lclang_rt.fuzzer-x86_64 \
+    --spawn_strategy=standalone \
+    --keep_going \
+    //fuzz/... || true 
+
+WORKDIR /root
 
 CMD [ "bash" ]

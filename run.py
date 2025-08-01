@@ -1,5 +1,4 @@
 import argparse
-import os
 import time
 from expmanager import *
 
@@ -63,5 +62,28 @@ def parse_args():
 
 def main():
     start_time = time.time()
-
     args = parse_args()
+    api_list = f"api_list/{args.dll}{args.version}_{args.mode}.txt"
+    with open(api_list, "r") as f:
+        apis = f.read().splitlines()
+
+    scheduler = Scheduler()
+
+    if args.dll == "tf" and args.mode == "fuzz":
+        for api in apis:
+            exp = Experiment(
+                dll=args.dll,
+                mode=args.mode,
+                ver=args.version,
+                api=api,
+                cpus=args.num_parallel,
+            )
+            scheduler.add_experiment(exp)
+            
+    scheduler.run_all()
+    end_time = time.time()
+    elapsed_time_s = end_time - start_time
+    elapsed_time_m = elapsed_time_s / 60
+    elapsed_time_h = elapsed_time_m / 60
+    elapsed_str = f"Total Running Time : {(elapsed_time_s):.2f} sec = {(elapsed_time_m):.2f} min = {(elapsed_time_h):.2f} hr"
+    print(f"\n{elapsed_str}")

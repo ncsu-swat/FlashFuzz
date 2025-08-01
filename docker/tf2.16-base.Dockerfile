@@ -23,6 +23,8 @@ RUN apt-get update && \
     cmake \
     git \
     fzf \
+    btop \
+    htop \
     tmux \
     python3 \
     python3-pip \

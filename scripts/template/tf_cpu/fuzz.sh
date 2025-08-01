@@ -5,11 +5,12 @@ WORKERS=2
 MAX_LEN=5000
 RSS_LIMIT=2048
 
-
 if [ ! -f "/root/tensorflow/bazel-bin/fuzz/{api_name}/fuzz" ]; then
   echo "Error: Fuzzer executable not found!" 
   exit 1
 fi
+
+python3 random_seed.py
 
 /root/tensorflow/bazel-bin/fuzz/{api_name}/fuzz ./corpus \
     -jobs=$JOBS \
@@ -26,10 +27,5 @@ fi
     -len_control=0 \
     -max_total_time=180 \
     -print_final_stats=1 
-
-llvm-profdata-19 merge -output=tensorflow_merged.profdata \
-  *.profraw
-
-llvm-cov-19 show /root/tensorflow/bazel-bin/fuzz/{api_name}/fuzz --show-branches=count  --instr-profile=tensorflow_merged.profdata -format=html -output-dir=tf_coverage
 
 echo "Fuzzing completed."

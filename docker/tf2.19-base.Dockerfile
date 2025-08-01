@@ -24,6 +24,8 @@ RUN apt-get update && \
     git \
     fzf \
     tmux \
+    btop \
+    htop \
     python3 \
     python3-pip \
     python3-dev \
