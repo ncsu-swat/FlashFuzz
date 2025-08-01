@@ -3,12 +3,23 @@ FROM ubuntu:24.04
 # Set non-interactive mode for package installations
 ENV DEBIAN_FRONTEND=noninteractive
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    apt-transport-https \
+    ca-certificates \ 
+    gnupg2 \
+    lsb-release && \
+    rm -rf /var/lib/apt/lists/*
+
+# Configure Ubuntu mirror
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirror.aaaab3n.moe/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|https://mirror.aaaab3n.moe/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+
 # Install dependencies and required tools in a single RUN block to minimize layers
 RUN apt-get update && \
     apt-get install -y \
     build-essential \
     software-properties-common \
-    ca-certificates \
     cmake \
     git \
     fzf \
