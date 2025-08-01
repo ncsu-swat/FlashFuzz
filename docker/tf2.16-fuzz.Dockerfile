@@ -18,7 +18,7 @@ COPY scripts/ .
 
 RUN  python3 -u build_test_harness.py --dll tf --mode fuzz
 
-RUN bazel build --jobs=64  \
+RUN bazel build --jobs=64  --config=monolithic \
     --copt=-fsanitize=fuzzer\
     --copt=-g \
     --copt=-O0 \

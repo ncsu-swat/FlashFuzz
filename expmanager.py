@@ -8,18 +8,18 @@ class Status(enum.Enum):
     FAILED = "failed"
 
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 2):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 2, mem: int = 16):
         self.dll = dll
         self.mode = mode
         self.ver = ver
         self.api = api
         self.cpus = cpus
+        self.mem = mem
         self.status = Status.NOT_STARTED
         self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}"
         self.container_name = f"{self.api}_container"
         self.container_id = None
         self.result_dir = f"./_fuzz_result/{self.dll}{self.ver}-{self.mode}/{self.api}_fuzz_output"
-        subprocess.run(f"mkdir -p {self.result_dir}", shell=True, check=True)
         self.check_image()
 
     def check_image(self):
@@ -31,12 +31,12 @@ class Experiment():
         
         if not image_available:
             print(f"Image {self.image_name} not found. Please build it first.")
-            return False
+            raise RuntimeError(f"Image {self.image_name} not found. Please build it first.")
         print(f"Image {self.image_name} is available.")
-        return True
+        
 
     def create_docker_container(self):
-        cmd = f'docker create --name {self.api}_container {self.image_name} --cpus="{self.cpus}"'
+        cmd = f'docker create   --name {self.api}_container {self.image_name}"'
         try:
             proc = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
             self.container_id = proc.stdout.strip()
@@ -47,7 +47,7 @@ class Experiment():
             raise
         
     def start_docker_container(self):
-        cmd = f"docker start {self.container_name}"
+        cmd = f"docker run -itd --cpus {self.cpus} -m {self.mem}g --name {self.container_name} {self.image_name}"
         try:
             subprocess.run(cmd, shell=True, check=True)
             print(f"Started container {self.container_name}.")
@@ -57,15 +57,11 @@ class Experiment():
             raise
 
     def execute_command(self, command: str):
-        cmd = f"docker exec {self.container_name} {command}"
+        cmd = f'docker exec {self.container_name} sh -c "{command}"'
         try:
-            proc = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
-            print(f"Command executed successfully: {command}")
-            return proc.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            print(f"Command execution failed: {command}")
-            print(f"Stderr: {e.stderr}")
-            raise
+            subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        except Exception:
+            pass
 
     def stop_docker_container(self):
         cmd = f"docker stop {self.container_name}"
@@ -88,26 +84,25 @@ class Experiment():
 
     def copy_results(self, src: str, dest: str):
         cmd = f"docker cp {self.container_name}:{src} {dest}"
+        subprocess.run(f"mkdir -p {self.result_dir}", shell=True, check=True)
         try:
             subprocess.run(cmd, shell=True, check=True)
             print(f"Copied results from {src} to {dest}.")
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to copy results from {src} to {dest}.")
-            print(f"Stderr: {e.stderr}")
-            raise
+        except Exception:
+            pass
 
     def run(self):
         if self.dll == "tf" and self.mode == "fuzz":
             self.status = Status.RUNNING
             try:
-                self.create_docker_container()
+                self.check_image()
                 self.start_docker_container()
                 self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && bash fuzz.sh > execution.log")
                 self.copy_results(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
                 self.copy_results(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
                 self.copy_results(f"/root/tensorflow/fuzz/{self.api}/corpus", self.result_dir)
                 self.status = Status.COMPLETED
-            except subprocess.CalledProcessError:
+            except Exception:
                 self.status = Status.FAILED
 
 class Scheduler():
@@ -125,5 +120,8 @@ class Scheduler():
                 print(f"Experiment for {exp.api} completed successfully.")
             else:
                 print(f"Experiment for {exp.api} failed.")
-            exp.stop_docker_container()
-            exp.remove_docker_container()
+            try:
+                exp.stop_docker_container()
+                exp.remove_docker_container()
+            except Exception:
+                pass
