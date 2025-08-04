@@ -1,4 +1,4 @@
-from ncsuswat/flashfuzz:tf2.13-base 
+FROM ncsuswat/flashfuzz:tf2.16-base
 
 
 # Copy the test harness
