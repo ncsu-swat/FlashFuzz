@@ -18,11 +18,16 @@ COPY scripts/ .
 
 RUN  python3 -u build_test_harness.py --dll tf --mode fuzz
 
+
+
+
 RUN bazel build \
     --copt=-fsanitize=fuzzer-no-link \
     --copt=-g \
     --copt=-O0 \
     --define=with_xla_support=false \ 
+    --define=framework_shared_object=false \
+    --define=dynamic_loaded_kernels=false \
     --linkopt=-fsanitize=fuzzer-no-link \
     --linkopt=-L/usr/lib/clang/19/lib/linux \
     --linkopt=-lclang_rt.fuzzer-x86_64 \
