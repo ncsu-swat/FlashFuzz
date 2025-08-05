@@ -13,29 +13,24 @@ ENV TF_NEED_CLANG=1
 ENV TF_SET_ANDROID_WORKSPACE=0
 RUN cd /root/tensorflow && ./configure
 
+
+WORKDIR /root/tensorflow 
+
+RUN bazel build -c opt --copt="-Wno-error=c23-extensions" --copt=-fsanitize=fuzzer-no-link  --linkopt=-fsanitize=fuzzer-no-link     --linkopt=-L/usr/lib/clang/19/lib/linux --linkopt=-lclang_rt.fuzzer-x86_64  //tensorflow:tensorflow_cc
+
+
+RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
+        ln -s libtensorflow_cc.so.2.16.1 libtensorflow_cc.so && \
+        ln -s libtensorflow_cc.so.2.16.1 libtensorflow_cc.so.2 && \
+        ln -s libtensorflow_framework.so.2.16.1 libtensorflow_framework.so.2 && \
+        ln -s libtensorflow_framework.so.2.16.1 libtensorflow_framework.so
+
 WORKDIR /root/tensorflow/fuzz
 COPY scripts/ .
 
 RUN  python3 -u build_test_harness.py --dll tf --mode fuzz
 
-
-
-
-RUN bazel build \
-    --copt=-fsanitize=fuzzer-no-link \
-    --copt=-g \
-    --copt=-O0 \
-    --define=with_xla_support=false \ 
-    --define=framework_shared_object=false \
-    --define=dynamic_loaded_kernels=false \
-    --linkopt=-fsanitize=fuzzer-no-link \
-    --linkopt=-L/usr/lib/clang/19/lib/linux \
-    --linkopt=-lclang_rt.fuzzer-x86_64 \
-    --spawn_strategy=standalone \
-    --keep_going \
-    //fuzz/... || true 
-
-RUN python3 -u build_test_harness.py --dll tf --mode cov --check_build
+# RUN python3 -u build_test_harness.py --dll tf --mode cov --check_build
 
 WORKDIR /root
 

@@ -5,14 +5,16 @@ WORKERS=2
 MAX_LEN=5000
 RSS_LIMIT=2048
 
-if [ ! -f "/root/tensorflow/bazel-bin/fuzz/{api_name}/fuzz" ]; then
+if [ ! -f "fuzz" ]; then
   echo "Error: Fuzzer executable not found!" 
   exit 1
 fi
 
 python3 random_seed.py
 
-/root/tensorflow/bazel-bin/fuzz/{api_name}/fuzz ./corpus \
+cp /root/tensorflow/bazel-bin/tensorflow/libtensorflow_*.so* .
+
+./fuzz ./corpus \
     -jobs=$JOBS \
     -workers=$WORKERS \
     -max_len=$MAX_LEN \

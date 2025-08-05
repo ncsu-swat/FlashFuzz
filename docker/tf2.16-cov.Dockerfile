@@ -18,23 +18,25 @@ COPY scripts/ .
 
 RUN  python3 -u build_test_harness.py --dll tf --mode cov
 
-RUN bazel build \
-    --copt=-fsanitize=fuzzer-no-link \
-    --copt=-g \
-    --copt=-O0 \
-    --copt=-fprofile-instr-generate \
-    --copt=-fcoverage-mapping \
-    --linkopt=-fsanitize=fuzzer-no-link \
-    --linkopt=-L/usr/lib/clang/19/lib/linux \
-    --linkopt=-lclang_rt.fuzzer-x86_64 \
-    --linkopt=-fprofile-instr-generate \
-    --linkopt=-fcoverage-mapping \
-    --spawn_strategy=standalone \
-    --keep_going \
-    //fuzz/... || true
-
-RUN python3 -u build_test_harness.py --dll tf --mode cov --check_build
-
-WORKDIR /root
-
 CMD [ "bash" ]
+
+# RUN bazel build \
+#     --copt=-fsanitize=fuzzer-no-link \
+#     --copt=-g \
+#     --copt=-O0 \
+#     --copt=-fprofile-instr-generate \
+#     --copt=-fcoverage-mapping \
+#     --linkopt=-fsanitize=fuzzer-no-link \
+#     --linkopt=-L/usr/lib/clang/19/lib/linux \
+#     --linkopt=-lclang_rt.fuzzer-x86_64 \
+#     --linkopt=-fprofile-instr-generate \
+#     --linkopt=-fcoverage-mapping \
+#     --spawn_strategy=standalone \
+#     --keep_going \
+#     //fuzz/... || true
+
+# RUN python3 -u build_test_harness.py --dll tf --mode cov --check_build
+
+# WORKDIR /root
+
+# CMD [ "bash" ]
