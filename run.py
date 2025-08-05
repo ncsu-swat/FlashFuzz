@@ -49,6 +49,8 @@ def parse_args():
         help="Memory limit for each docker (in GB)",
     )
 
+    # TODO: Add `--crash-report`, `--compilation-check`, and `--validation` arguments
+
     args = parser.parse_args()
 
     if args.dll not in ["tf", "torch"]:

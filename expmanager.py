@@ -92,6 +92,7 @@ class Experiment():
             pass
 
     def run(self):
+        # TODO: Implement subclass methods for different dlls and modes
         if self.dll == "tf" and self.mode == "fuzz":
             self.status = Status.RUNNING
             try:
@@ -113,6 +114,7 @@ class Scheduler():
         self.experiments.append(experiment)
 
     def run_all(self):
+        # TODO: Implement concurrency for running experiments
         for exp in self.experiments:
             print(f"Running experiment for {exp.api}...")
             exp.run()
