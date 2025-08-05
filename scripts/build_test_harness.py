@@ -3,6 +3,7 @@ import os
 import subprocess
 import glob
 from typing import Optional
+import concurrent.futures
 
 
 def run_command(cmd: str, cwd: str, timeout: Optional[float] = None) -> tuple[int, str]:
@@ -25,9 +26,6 @@ def run_command(cmd: str, cwd: str, timeout: Optional[float] = None) -> tuple[in
             return -1, "TIMEOUT: Command exceeded time limit"
     except Exception as e:
         return -2, f"ERROR: {str(e)}"
-
-
-import concurrent.futures
 
 
 def build_one_tf_api(tf_dir: str) -> tuple[str, int, str]:
@@ -66,6 +64,29 @@ def build_tf() -> None:
 
     print(f"Built {success_count}/{total_dirs} TensorFlow APIs successfully.")
 
+
+def check_tf_build() -> None:
+    print("Checking TensorFlow build status...")
+    tf_dirs = glob.glob("tf.*")
+    if not tf_dirs:
+        print("No TensorFlow API directories found.")
+        return
+
+    build_success: int = 0
+    success_build_apis: list[str] = []
+    total: int = len(tf_dirs)
+    for tf_dir in tf_dirs:
+        api_name = os.path.basename(tf_dir)
+        binary = f"/root/tensorflow/bazel-bin/fuzz/{api_name}/fuzz"
+        if os.path.exists(binary):
+            build_success += 1
+            success_build_apis.append(api_name)
+
+    print(f"Build status: {build_success}/{total} TensorFlow APIs built successfully.")
+    with open("success_apis.txt", "w") as f:
+        f.write("\n".join(success_build_apis))
+
+
 def build_tf_fuzz() -> None:
     print("Building TensorFlow fuzz harness...")
     os.system("cp -r template/tf_cpu/* .")
@@ -74,6 +95,7 @@ def build_tf_fuzz() -> None:
     os.system("rm -rf template")
     os.system("rm -rf BUILD")
     # build_tf()
+
 
 def build_tf_cov() -> None:
     print("Building TensorFlow coverage harness...")
@@ -103,12 +125,24 @@ def main():
         choices=["fuzz", "cov"],
         help="The mode to run in: 'fuzz' or 'cov'.",
     )
+    parser.add_argument(
+        "--check_build",
+        action="store_true",
+        help="Check if the build was successful.",
+    )
     args = parser.parse_args()
 
     if args.dll == "tf" and args.mode == "cov":
-        build_tf_cov()
+        if args.check_build:
+            check_tf_build()
+        else:
+            build_tf_cov()
     elif args.dll == "tf" and args.mode == "fuzz":
-        build_tf_fuzz()
+        if args.check_build:
+            check_tf_build()
+        else:
+            build_tf_fuzz()
+
     # Add logic for torch if necessary
 
 

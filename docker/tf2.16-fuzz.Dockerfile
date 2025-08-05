@@ -18,16 +18,19 @@ COPY scripts/ .
 
 RUN  python3 -u build_test_harness.py --dll tf --mode fuzz
 
-RUN bazel build --jobs=32 \
-    --copt=-fsanitize=fuzzer\
+RUN bazel build \
+    --copt=-fsanitize=fuzzer-no-link \
     --copt=-g \
     --copt=-O0 \
-    --linkopt=-fsanitize=fuzzer \
+    --define=with_xla_support=false \ 
+    --linkopt=-fsanitize=fuzzer-no-link \
     --linkopt=-L/usr/lib/clang/19/lib/linux \
     --linkopt=-lclang_rt.fuzzer-x86_64 \
     --spawn_strategy=standalone \
     --keep_going \
     //fuzz/... || true 
+
+RUN python3 -u build_test_harness.py --dll tf --mode cov --check_build
 
 WORKDIR /root
 
