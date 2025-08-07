@@ -32,7 +32,7 @@ def build_one_tf_api(tf_dir: str) -> tuple[str, int, str]:
     """Build a single TensorFlow API and return the result."""
     api_name = os.path.basename(tf_dir)
     print(f"Building TensorFlow API: {api_name}")
-    cmd = "bash build.sh"
+    cmd = "bash build.sh > build.log"
     ret_code, output = run_command(cmd, tf_dir)
     return api_name, ret_code, output
 
@@ -48,7 +48,7 @@ def build_tf() -> None:
     print(f"Found {total_dirs} TensorFlow API directories to build in parallel.")
     success_count = 0
 
-    with concurrent.futures.ProcessPoolExecutor() as executor:
+    with concurrent.futures.ProcessPoolExecutor(max_workers=64) as executor:
         futures = [executor.submit(build_one_tf_api, tf_dir) for tf_dir in tf_dirs]
 
         for future in concurrent.futures.as_completed(futures):
@@ -74,17 +74,22 @@ def check_tf_build() -> None:
 
     build_success: int = 0
     success_build_apis: list[str] = []
+    fail_build_apis: list[str] = [] 
     total: int = len(tf_dirs)
     for tf_dir in tf_dirs:
         api_name = os.path.basename(tf_dir)
-        binary = f"/root/tensorflow/bazel-bin/fuzz/{api_name}/fuzz"
+        binary = f"{tf_dir}/fuzz"
         if os.path.exists(binary):
             build_success += 1
             success_build_apis.append(api_name)
+        else:
+            fail_build_apis.append(api_name)
 
     print(f"Build status: {build_success}/{total} TensorFlow APIs built successfully.")
     with open("success_apis.txt", "w") as f:
         f.write("\n".join(success_build_apis))
+    with open("fail_apis.txt", "w") as f:
+        f.write("\n".join(fail_build_apis))
 
 
 def build_tf_fuzz() -> None:
@@ -92,9 +97,8 @@ def build_tf_fuzz() -> None:
     os.system("cp -r template/tf_cpu/* .")
     os.system("cp template/tf_cpu/copy.py .")
     os.system("python3 -u copy.py")
-    os.system("rm -rf template")
-    os.system("rm -rf BUILD")
-    # build_tf()
+    build_tf()
+    check_tf_build()
 
 
 def build_tf_cov() -> None:
@@ -102,8 +106,6 @@ def build_tf_cov() -> None:
     os.system("cp -r template/tf_cpu_cov/* .")
     os.system("cp template/tf_cpu_cov/copy.py .")
     os.system("python3 -u copy.py")
-    os.system("rm -rf template")
-    os.system("rm -rf BUILD")
     # build_tf()
 
 

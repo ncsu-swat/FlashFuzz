@@ -24,6 +24,7 @@ RUN apt-get update && \
     git \
     fzf \
     btop \
+    bat \
     htop \
     tmux \
     python3 \
@@ -33,6 +34,7 @@ RUN apt-get update && \
     wget \
     unzip \
     curl \
+    nano \
     patchelf && \
     rm -rf /var/lib/apt/lists/*
 

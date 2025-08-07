@@ -16,8 +16,6 @@ def replace_file_content(file_path: str, old_content: str, new_content: str) -> 
 
         if old_content in content:
             content = content.replace(old_content, new_content)
-        else:
-            content += new_content
 
         with open(file_path, "w") as file:
             file.write(content)

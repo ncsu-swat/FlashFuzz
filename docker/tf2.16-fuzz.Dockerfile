@@ -30,8 +30,6 @@ COPY scripts/ .
 
 RUN  python3 -u build_test_harness.py --dll tf --mode fuzz
 
-# RUN python3 -u build_test_harness.py --dll tf --mode cov --check_build
-
 WORKDIR /root
 
 CMD [ "bash" ]
