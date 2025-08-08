@@ -27,7 +27,7 @@ cp /root/tensorflow/bazel-bin/tensorflow/libtensorflow_*.so* .
     -ignore_crashes=1 \
     -reduce_inputs=0 \
     -len_control=0 \
-    -max_total_time=180 \
+    -max_total_time={time_budget} \
     -print_final_stats=1 
 
 echo "Fuzzing completed."

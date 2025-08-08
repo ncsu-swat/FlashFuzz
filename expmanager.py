@@ -1,25 +1,32 @@
 import enum
 import subprocess
-
+import os
 class Status(enum.Enum):
     NOT_STARTED = "not_started"
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
 
+
+
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 2, mem: int = 16):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 2, mem: int = 16, check_valid: bool = False, time_budget: int = 180):
         self.dll = dll
         self.mode = mode
         self.ver = ver
         self.api = api
         self.cpus = cpus
         self.mem = mem
+        self.check_valid = check_valid
+        self.time_budget = time_budget
         self.status = Status.NOT_STARTED
         self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}"
         self.container_name = f"{self.api}_container"
         self.container_id = None
-        self.result_dir = f"./_fuzz_result/{self.dll}{self.ver}-{self.mode}/{self.api}_fuzz_output"
+        if not self.api:
+            self.result_dir = f"./_fuzz_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s/"
+        else:
+            self.result_dir = f"./_fuzz_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s/{self.api}_output"
         self.check_image()
 
     def check_image(self):
@@ -91,20 +98,49 @@ class Experiment():
         except Exception:
             pass
 
+    def tf_fuzz(self):
+        self.status = Status.RUNNING
+        try:
+            self.check_image()
+            self.start_docker_container()
+            self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --ver {self.ver} --time_budget {self.time_budget}")
+            self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && bash fuzz.sh > execution.log")
+            self.copy_results(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
+            self.copy_results(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
+            self.copy_results(f"/root/tensorflow/fuzz/{self.api}/corpus", self.result_dir)
+            self.status = Status.COMPLETED
+        except Exception:
+            self.status = Status.FAILED
+
+    def tf_check_valid(self):
+        self.status = Status.RUNNING
+        try:
+            self.check_image()
+            self.start_docker_container()
+            self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --check_valid ")
+            self.copy_results(f"/root/tensorflow/fuzz/{self.api}", f"{self.result_dir}/{self.api}")
+            os.makedirs(f"{self.result_dir}/build_status", exist_ok=True)
+            self.copy_results(f"/root/tensorflow/fuzz/success_apis.txt", f"{self.result_dir}/build_status/")
+            self.copy_results(f"/root/tensorflow/fuzz/fail_apis.txt", f"{self.result_dir}/build_status/")
+            self.copy_results(f"/root/tensorflow/fuzz/build_summary.txt", f"{self.result_dir}/build_status/")
+            with open(f"{self.result_dir}/build_status/build_summary.txt", "r") as f:
+                summary = f.read()
+                print(f"Build Summary: {summary}")
+            self.status = Status.COMPLETED
+        except Exception:
+            self.status = Status.FAILED
+
+
     def run(self):
         # TODO: Implement subclass methods for different dlls and modes
-        if self.dll == "tf" and self.mode == "fuzz":
-            self.status = Status.RUNNING
-            try:
-                self.check_image()
-                self.start_docker_container()
-                self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && bash fuzz.sh > execution.log")
-                self.copy_results(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
-                self.copy_results(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
-                self.copy_results(f"/root/tensorflow/fuzz/{self.api}/corpus", self.result_dir)
-                self.status = Status.COMPLETED
-            except Exception:
-                self.status = Status.FAILED
+        if self.dll == "tf":
+            if self.check_valid:
+                self.tf_check_valid()
+            elif self.mode == "fuzz":
+                self.tf_fuzz()
+                
+
+
 
 class Scheduler():
     def __init__(self):
@@ -116,14 +152,19 @@ class Scheduler():
     def run_all(self):
         # TODO: Implement concurrency for running experiments
         for exp in self.experiments:
-            print(f"Running experiment for {exp.api}...")
-            exp.run()
-            if exp.status == Status.COMPLETED:
-                print(f"Experiment for {exp.api} completed successfully.")
-            else:
-                print(f"Experiment for {exp.api} failed.")
             try:
-                exp.stop_docker_container()
-                exp.remove_docker_container()
-            except Exception:
-                pass
+                print(f"Running experiment for {exp.api}...")
+                exp.run()
+                if exp.status == Status.COMPLETED:
+                    print(f"Experiment for {exp.api} completed successfully.")
+                else:
+                    print(f"Experiment for {exp.api} failed.")
+            except KeyboardInterrupt:
+                print(f"\nKeyboard interrupt received. Cleaning up experiment for {exp.api}...")
+                exp.status = Status.FAILED
+            finally:
+                try:
+                    exp.stop_docker_container()
+                    exp.remove_docker_container()
+                except Exception:
+                    pass

@@ -3,7 +3,7 @@
 import os
 import glob
 import shutil
-
+import argparse
 
 def replace_file_content(file_path: str, old_content: str, new_content: str) -> None:
     """
@@ -25,7 +25,7 @@ def replace_file_content(file_path: str, old_content: str, new_content: str) -> 
         print(f"Error updating {file_path}: {e}")
 
 
-def copy_fuzz_utils():
+def copy_fuzz_utils(time_budget: int = 180):
     """
     Copy fuzz_utils.h and fuzz_utils.cpp to every subdirectory
     that starts with 'torch', overwriting existing files.
@@ -66,6 +66,7 @@ def copy_fuzz_utils():
             shutil.copy2(random_seed, target_random_seed)
             replace_file_content(target_fuzz_sh, "{api_name}", api_name)
             replace_file_content(target_build_sh, "{api_name}", api_name)
+            replace_file_content(target_fuzz_sh, "{time_budget}", str(time_budget))
             print(f"Copied utils to {torch_dir}")
         except Exception as e:
             print(f"Error copying to {torch_dir}: {e}")
@@ -74,8 +75,18 @@ def copy_fuzz_utils():
 
 
 if __name__ == "__main__":
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Copy fuzz_utils.h and fuzz_utils.cpp to tf.* directories.")
+    parser.add_argument(
+        "--time_budget",
+        type=int,
+        default=180,
+        help="Time budget in seconds for the fuzzing process, e.g. 180 (3 minutes)",
+    )
+    args = parser.parse_args()
+
     print("Copying fuzz_utils.h and fuzz_utils.cpp to tf.* directories...")
-    success = copy_fuzz_utils()
+    success = copy_fuzz_utils(args.time_budget)
     if success:
         print("Done!")
     else:

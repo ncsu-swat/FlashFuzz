@@ -23,7 +23,7 @@ def parse_args():
     parser.add_argument(
         "--time_budget",
         type=int,
-        default=None,
+        default=180,
         help="Time budget in seconds, e.g. 1200 (20 minutes)",
     )
 
@@ -49,6 +49,12 @@ def parse_args():
         help="Memory limit for each docker (in GB)",
     )
 
+    parser.add_argument(
+        "--check_valid",
+        action="store_true",
+        help="Check the validity of generated inputs",
+    )
+
     # TODO: Add `--crash-report`, `--compilation-check`, and `--validation` arguments
 
     args = parser.parse_args()
@@ -71,16 +77,31 @@ def main():
 
     scheduler = Scheduler()
 
-    if args.dll == "tf" and args.mode == "fuzz":
-        for api in apis:
-            exp = Experiment(
-                dll=args.dll,
-                mode=args.mode,
-                ver=args.version,
-                api=api,
-                cpus=args.num_parallel,
-            )
-            scheduler.add_experiment(exp)
+    if args.dll == "tf" :
+        if args.mode == "fuzz":
+            if args.check_valid:
+                exp = Experiment(
+                    dll=args.dll,
+                    mode=args.mode,
+                    ver=args.version,
+                    api="all",
+                    cpus=args.num_parallel,
+                    mem=args.mem,
+                    check_valid=True,
+                )
+                scheduler.add_experiment(exp)
+            else:
+                for api in apis:
+                    exp = Experiment(
+                        dll=args.dll,
+                        mode=args.mode,
+                        ver=args.version,
+                        api=api,
+                        cpus=args.num_parallel,
+                        time_budget=args.time_budget
+                    )
+                    scheduler.add_experiment(exp)
+        
             
     scheduler.run_all()
     end_time = time.time()

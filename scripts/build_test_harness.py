@@ -74,39 +74,59 @@ def check_tf_build() -> None:
 
     build_success: int = 0
     success_build_apis: list[str] = []
-    fail_build_apis: list[str] = [] 
+    fail_build_apis: list[list[str]] = [] 
     total: int = len(tf_dirs)
     for tf_dir in tf_dirs:
         api_name = os.path.basename(tf_dir)
+        keyword = api_name.split(".")[-1]
         binary = f"{tf_dir}/fuzz"
+        source_file = f"{tf_dir}/fuzz.cpp"
+        status = "OK"
+        with open(source_file, "r") as f:
+            content = f.read()
+            # Check if the keyword is in the source file, ignore case sensitivity
+            if keyword.lower() in content.lower():
+               print(f"Keyword '{keyword}' found in {source_file}.")
+            else:
+               print(f"Keyword '{keyword}' NOT found in {source_file}.")
+               status = "TESTHARNESS FAIL"
+
         if os.path.exists(binary):
+            pass
+        else:
+            status = "BUILD FAIL"
+        if status == "OK":
             build_success += 1
             success_build_apis.append(api_name)
         else:
-            fail_build_apis.append(api_name)
+            fail_build_apis.append([api_name, status])
 
     print(f"Build status: {build_success}/{total} TensorFlow APIs built successfully.")
     with open("success_apis.txt", "w") as f:
         f.write("\n".join(success_build_apis))
     with open("fail_apis.txt", "w") as f:
-        f.write("\n".join(fail_build_apis))
+        for api_name, status in fail_build_apis:
+            f.write(f"{api_name}: {status}\n")
+    with open("build_summary.txt", "w") as f:
+        f.write(f"{build_success}/{total} APIs built successfully.\n")
 
 
-def build_tf_fuzz() -> None:
+def build_tf_fuzz(time_budget: int=180, no_compile: bool=False) -> None:
     print("Building TensorFlow fuzz harness...")
-    os.system("cp -r template/tf_cpu/* .")
-    os.system("cp template/tf_cpu/copy.py .")
-    os.system("python3 -u copy.py")
-    build_tf()
+    os.system("cp -r template/tf_cpu/* .") # Copy all files from the template directory
+    os.system(f"python3 -u copy.py --time_budget {time_budget}") # Copy the fuzz.sh and build.sh files with proper settings
+    if not no_compile:
+        build_tf()
     check_tf_build()
 
 
-def build_tf_cov() -> None:
+def build_tf_cov(time_budget: int=180, no_compile: bool=False) -> None:
     print("Building TensorFlow coverage harness...")
-    os.system("cp -r template/tf_cpu_cov/* .")
-    os.system("cp template/tf_cpu_cov/copy.py .")
-    os.system("python3 -u copy.py")
-    # build_tf()
+    os.system("cp -r template/tf_cpu_cov/* .") # Copy all files from the template directory
+    os.system(f"python3 -u copy.py --time_budget {time_budget}") # Copy the fuzz.sh and build.sh files with proper settings
+    if not no_compile:
+        build_tf()
+    check_tf_build()
 
 
 def main():
@@ -132,18 +152,31 @@ def main():
         action="store_true",
         help="Check if the build was successful.",
     )
+    parser.add_argument(
+        "--time_budget",
+        type=int,
+        required=False,
+        help="Time budget for the experiment in seconds.",
+        default=180,
+    )
+    parser.add_argument(
+        "--no-compile",
+        required=False,
+        action="store_true",
+        help="Skip the compilation step. This is useful for testing configurations (e.g. time budget).",
+    )
     args = parser.parse_args()
 
     if args.dll == "tf" and args.mode == "cov":
         if args.check_build:
             check_tf_build()
         else:
-            build_tf_cov()
+            build_tf_cov(no_compile=args.no_compile, time_budget=args.time_budget)
     elif args.dll == "tf" and args.mode == "fuzz":
         if args.check_build:
             check_tf_build()
         else:
-            build_tf_fuzz()
+            build_tf_fuzz(no_compile=args.no_compile, time_budget=args.time_budget)
 
     # Add logic for torch if necessary
 

@@ -22,7 +22,19 @@ bash build_docker.sh
 ```bash
 python3 -u run.py --dll tf --version 2.16 --mode fuzz 
 ```
-Results are stored in `_fyzz_result/` directory.
+Results are stored in `_fuzz_result/` directory.
+
+## 2.1.1 Check the validity of the test harnesses
+```bash
+python3 -u run.py --dll tf --version 2.16 --mode fuzz --check_valid 
+```
+Results are stored in `_fuzz_result/build_status` directory.
+
+## 2.1.2 Adjust the time budget for fuzzing
+```bash
+python3 -u run.py --dll tf --version 2.16 --mode fuzz --time_budget 300
+```
+This will set the time budget for each fuzzing run to 300 seconds. The default is 180 seconds.
 
 ## 2.2 Coverage
 ```bash
