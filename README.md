@@ -22,12 +22,24 @@ bash build_docker.sh
 ```bash
 python3 -u run.py --dll tf --version 2.16 --mode fuzz 
 ```
+
 Results are stored in `_fuzz_result/` directory.
+
+🚀 Want Faster? Try
+```bash
+python3 -u run.py --dll tf --version 2.16 --mode fuzz --num_parallel 40
+```
 
 ## 2.1.1 Check the validity of the test harnesses
 ```bash
 python3 -u run.py --dll tf --version 2.16 --mode fuzz --check_valid 
 ```
+
+Example output:
+```
+Build Summary: Build status: 668/1452 TensorFlow APIs built successfully.
+```
+
 Results are stored in `_fuzz_result/build_status` directory.
 
 ## 2.1.2 Adjust the time budget for fuzzing
