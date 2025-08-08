@@ -247,7 +247,7 @@ class Experiment():
             self.check_image()
             self.start_docker_container()
             self.copy_files_to_container(f"./_fuzz_result/{self.dll}{self.ver}-fuzz-{self.time_budget}s/{self.api}/corpus_itv_{self.itv}", f"/root/tensorflow/fuzz/{self.api}/corpus_itv_{self.itv}")
-            self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && python3 generate_coverage_file.py --dll tf --itv {self.itv} --api {self.api}")
+            self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && python3 generate_coverage_file.py --dll tf --itv {self.itv} --api {self.api} --workers 64 --timeout 120")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/corpus_itv_{self.itv}", f"{self.result_dir}")
             loop_until_ctrl_c()
             self.status = Status.COMPLETED
