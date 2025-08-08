@@ -31,7 +31,7 @@ def parse_args():
     parser.add_argument(
         "--itv",
         type=int,
-        default=None,
+        default=60,
         help="Interval for coverage collection, e.g. 60 (seconds)",
     )
 
@@ -101,7 +101,39 @@ def main():
                         time_budget=args.time_budget
                     )
                     scheduler.add_experiment(exp)
-        
+        if args.mode == "cov":
+            if args.check_valid:
+                exp = Experiment(
+                    dll=args.dll,
+                    mode=args.mode,
+                    ver=args.version,
+                    api="all",
+                    cpus=args.num_parallel,
+                    mem=args.mem,
+                    check_valid=True,
+                )
+                scheduler.add_experiment(exp)
+            else:
+                fuzz_exp = Experiment(
+                        dll=args.dll,
+                        mode="fuzz",
+                        api="all",
+                        ver=args.version,
+                        cpus=args.num_parallel,
+                        time_budget=args.time_budget
+                )
+                fuzz_exp.classify_with_itv(args.itv)
+                for api in apis:
+                    exp = Experiment(
+                        dll=args.dll,
+                        mode=args.mode,
+                        ver=args.version,
+                        api=api,
+                        cpus=args.num_parallel,
+                        time_budget=args.time_budget,
+                        itv=args.itv
+                    )
+                    scheduler.add_experiment(exp)
             
     scheduler.run_all()
     end_time = time.time()

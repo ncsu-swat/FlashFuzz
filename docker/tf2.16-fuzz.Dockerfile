@@ -16,8 +16,7 @@ RUN cd /root/tensorflow && ./configure
 
 WORKDIR /root/tensorflow 
 
-RUN bazel build -c opt --copt="-Wno-error=c23-extensions" --copt=-fsanitize=fuzzer-no-link  --linkopt=-fsanitize=fuzzer-no-link     --linkopt=-L/usr/lib/clang/19/lib/linux --linkopt=-lclang_rt.fuzzer-x86_64  //tensorflow:tensorflow_cc
-
+RUN bazel build --copt=-g --copt=-O0 --copt="-Wno-error=c23-extensions" --copt=-fsanitize=fuzzer-no-link --linkopt=-fsanitize=fuzzer-no-link --linkopt=-L/usr/lib/clang/19/lib/linux --linkopt=-lclang_rt.fuzzer-x86_64 //tensorflow:tensorflow_cc
 
 RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
         ln -s libtensorflow_cc.so.2.16.1 libtensorflow_cc.so && \

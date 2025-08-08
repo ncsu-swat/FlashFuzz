@@ -10,3 +10,4 @@ version = "0.1.0"
 [dependencies]
 python = "==3.12"
 tqdm = ">=4.67.1,<5"
+types-tqdm = ">=4.67.0.20250516,<5"

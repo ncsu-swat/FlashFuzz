@@ -211,3 +211,4 @@ __marimo__/
 
 # FlashFuzz Results
 _fuzz_result
+_cov_result

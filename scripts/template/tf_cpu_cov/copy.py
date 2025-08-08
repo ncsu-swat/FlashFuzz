@@ -35,7 +35,7 @@ def copy_fuzz_utils(time_budget: int = 180):
     build_sh = "build.sh"
     build = "BUILD"
     random_seed = "random_seed.py"
-
+    coverage_py = "generate_coverage_file.py"
     # Find all directories starting with torch
     torch_dirs = [d for d in glob.glob("tf.*") if os.path.isdir(d)]
 
@@ -58,12 +58,15 @@ def copy_fuzz_utils(time_budget: int = 180):
 
         target_random_seed = os.path.join(torch_dir, "random_seed.py")
 
+        target_coverage_py = os.path.join(torch_dir, "generate_coverage_file.py")
+
         # Copy the files (overwriting if they exist)
         try:
             shutil.copy2(fuzz_sh, target_fuzz_sh)
             shutil.copy2(build_sh, target_build_sh)
             shutil.copy2(build, target_build)
             shutil.copy2(random_seed, target_random_seed)
+            shutil.copy2(coverage_py, target_coverage_py)
             replace_file_content(target_fuzz_sh, "{api_name}", api_name)
             replace_file_content(target_build_sh, "{api_name}", api_name)
             replace_file_content(target_fuzz_sh, "{time_budget}", str(time_budget))

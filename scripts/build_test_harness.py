@@ -108,7 +108,7 @@ def check_tf_build() -> None:
         for api_name, status in fail_build_apis:
             f.write(f"{api_name}: {status}\n")
     with open("build_summary.txt", "w") as f:
-        f.write(f"{build_success}/{total} APIs built successfully.\n")
+        f.write(f"Build status: {build_success}/{total} TensorFlow APIs built successfully.\n")
 
 
 def build_tf_fuzz(time_budget: int=180, no_compile: bool=False) -> None:

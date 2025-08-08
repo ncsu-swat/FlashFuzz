@@ -2,6 +2,8 @@
 
 clang++ fuzz.cpp \
 -std=c++17 \
+    -g \
+    -O0 \
     -fsanitize=fuzzer \
 -I /root/tensorflow \
 -I /root/tensorflow/bazel-tensorflow \
@@ -19,3 +21,8 @@ clang++ fuzz.cpp \
 -ltensorflow_framework \
 -lpthread \
 -o fuzz
+
+if [ $? -ne 0 ]; then
+    echo "Error: Compilation failed!"
+    exit 1
+fi
