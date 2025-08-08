@@ -75,7 +75,7 @@ def main():
     with open(api_list, "r") as f:
         apis = f.read().splitlines()
 
-    scheduler = Scheduler()
+    scheduler = Scheduler(num_parallel=args.num_parallel)
 
     if args.dll == "tf" :
         if args.mode == "fuzz":

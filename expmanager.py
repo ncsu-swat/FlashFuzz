@@ -64,7 +64,7 @@ class Experiment():
         if not image_available:
             print(f"Image {self.image_name} not found. Please build it first.")
             raise RuntimeError(f"Image {self.image_name} not found. Please build it first.")
-        print(f"Image {self.image_name} is available.")
+        # print(f"Image {self.image_name} is available.")
 
     def classify_with_itv(self, itv: int):
         # check if dir exists
@@ -214,7 +214,7 @@ class Experiment():
         try:
             self.check_image()
             self.start_docker_container()
-            self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --ver {self.ver} --time_budget {self.time_budget}")
+            self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --ver {self.ver} --time_budget {self.time_budget} --no-compile")
             self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && bash fuzz.sh > execution.log")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
