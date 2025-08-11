@@ -28,3 +28,9 @@ if [ $? -ne 0 ]; then
     echo "Error: Compilation failed!"
     exit 1
 fi
+
+python3 random_seed.py
+
+ln /root/tensorflow/bazel-bin/tensorflow/libtensorflow_*.so* .
+
+

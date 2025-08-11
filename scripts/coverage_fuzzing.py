@@ -1,310 +1,245 @@
-#!/usr/bin/env python3
-"""
-Script to run fuzzing with coverage instrumentation and collect .profraw files every 60 seconds.
-This allows tracking coverage evolution over time.
-"""
-
 import os
 import sys
-import time
 import shutil
-import subprocess
 import signal
-import threading
-from datetime import datetime
+import subprocess
 from pathlib import Path
-from typing import Optional, List, Sequence, Dict, Protocol, runtime_checkable, cast
-from subprocess import Popen
+from typing import Optional, Sequence, List, Dict
 from types import FrameType
 
-class CoverageFuzzer:
-    # Class-level type annotations for attributes
-    corpus_dir: str
-    profraw_dir: str
-    fuzzing_process: Optional[Popen[str]]
-    copy_thread: Optional[threading.Thread]
-    stop_copying: bool
-    iteration: int
-    start_time: Optional[float]
 
-    def __init__(self, corpus_dir: str = "corpus_itv_60", profraw_dir: str = "coverage_data") -> None:
+class IntervalFuzzRunner:
+    def __init__(
+        self,
+        corpus_dir: str,
+        coverage_dir: str,
+        interval_sec: int,
+        max_time_sec: int,
+        fuzz_args: Optional[Sequence[str]] = None,
+    ) -> None:
         self.corpus_dir = corpus_dir
-        self.profraw_dir = profraw_dir
-        self.fuzzing_process = None
-        self.copy_thread = None
-        self.stop_copying = False
-        self.iteration = 0
-        self.start_time = None
-        
-        # Create coverage data directory
-        Path(self.profraw_dir).mkdir(exist_ok=True)
-        
-        # Set environment variables for coverage
-        os.environ['LLVM_PROFILE_FILE'] = 'fuzz-%p.profraw'
-        
-    def build_instrumented_binary(self) -> bool:
-        """Build the fuzzer with coverage instrumentation"""
-        print("Building instrumented fuzzer binary...")
-        
-        build_cmd: List[str] = [
-            'clang++', 'fuzz.cpp',
-            '-std=c++17',
-            '-g',
-            '-O0',
-            '-fsanitize=fuzzer',
-            '-fprofile-instr-generate',
-            '-fcoverage-mapping',
-            '-I', '/root/tensorflow',
-            '-I', '/root/tensorflow/bazel-tensorflow',
-            '-I', '/root/tensorflow/bazel-bin',
-            '-I', '/root/tensorflow/bazel-tensorflow/external/com_google_absl',
-            '-I', '/root/tensorflow/bazel-tensorflow/external/com_google_protobuf/src',
-            '-I', '/root/tensorflow/bazel-tensorflow/external/eigen_archive',
-            '-I', '/root/tensorflow/bazel-tensorflow/external/local_tsl',
-            '-I', '/root/tensorflow/bazel-bin/external/local_tsl',
-            '-I', '/root/tensorflow/bazel-tensorflow/external/nsync/public',
-            '-I', '/root/tensorflow/bazel-tensorflow/external',
-            '-L', '/root/tensorflow/bazel-bin/tensorflow',
-            '-Wl,-rpath,$ORIGIN',
-            '-ltensorflow_cc',
-            '-ltensorflow_framework',
-            '-lpthread',
-            '-o', 'fuzz'
-        ]
-        
-        try:
-            subprocess.run(build_cmd, capture_output=True, text=True, check=True)
-            print("✓ Binary built successfully with coverage instrumentation")
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"✗ Build failed: {e}")
-            print(f"stdout: {e.stdout}")
-            print(f"stderr: {e.stderr}")
-            return False
-    
-    def copy_profraw_files(self) -> None:
-        """Copy .profraw files every 60 seconds in a separate thread"""
-        while not self.stop_copying:
-            time.sleep(60)  # Wait 60 seconds
-            
-            if self.stop_copying:
-                break
-                
-            self.iteration += 1
-            
-            # Create interval naming: 0-60, 60-120, 120-180, etc.
-            interval_start = (self.iteration - 1) * 60
-            interval_end = self.iteration * 60
-            interval_name = f"{interval_start}-{interval_end}"
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # Find all .profraw files in current directory
-            profraw_files: List[Path] = list(Path('.').glob('*.profraw'))
-            
-            if profraw_files:
-                # Create timestamped directory with interval naming
-                timestamped_dir: Path = Path(self.profraw_dir) / f"{interval_name}_{timestamp}"
-                timestamped_dir.mkdir(exist_ok=True)
-                
-                print(f"\n[{timestamp}] Interval {interval_name}s: Copying {len(profraw_files)} .profraw files to {timestamped_dir}")
-                
-                for profraw_file in profraw_files:
-                    try:
-                        shutil.copy2(profraw_file, timestamped_dir)
-                        print(f"  ✓ Copied {profraw_file}")
-                    except Exception as e:
-                        print(f"  ✗ Failed to copy {profraw_file}: {e}")
-                
-                # Also create a merged profdata file for this interval
-                self.create_profdata(timestamped_dir, interval_name)
-            else:
-                print(f"\n[{timestamp}] Interval {interval_name}s: No .profraw files found")
-    
-    def create_profdata(self, profraw_dir: Path, interval_name: str) -> None:
-        """Create a merged .profdata file from .profraw files"""
-        profraw_files: List[Path] = list(profraw_dir.glob('*.profraw'))
-        if not profraw_files:
-            return
-            
-        profdata_file: Path = profraw_dir / f"merged_{interval_name}.profdata"
-        
-        # Use llvm-profdata to merge the raw profiles
-        merge_cmd: List[str] = ['llvm-profdata', 'merge', '-sparse'] + [str(f) for f in profraw_files] + ['-o', str(profdata_file)]
-        
-        try:
-            subprocess.run(merge_cmd, capture_output=True, check=True)
-            print(f"  ✓ Created merged profdata: {profdata_file}")
-        except subprocess.CalledProcessError as e:
-            print(f"  ✗ Failed to create profdata: {e}")
-        except FileNotFoundError:
-            print(f"  ✗ llvm-profdata not found, skipping profdata creation")
-    
-    def run_fuzzing(self, max_time: Optional[int] = None, additional_args: Optional[Sequence[str]] = None) -> None:
-        """Run the fuzzing process"""
-        print(f"Starting fuzzing process...")
-        
-        # Set up library path
+        self.coverage_dir = Path(coverage_dir)
+        self.interval_sec = max(1, interval_sec)
+        self.max_time_sec = max(1, max_time_sec)
+        self.fuzz_args = list(fuzz_args) if fuzz_args else []
+        self._stop = False
+
+        self.coverage_dir.mkdir(parents=True, exist_ok=True)
+        self.work_dir = self.coverage_dir / ".work"
+        self.work_dir.mkdir(exist_ok=True)
+
+        # Paths to scripts/binaries
+        self.build_sh = "./build.sh"
+        self.fuzz_bin = "./fuzz"
+
+        # API name for profraw file
+        self.api_name = "Abs"
+
+    def build(self) -> None:
+        print("Building with build.sh ...")
+        if not os.path.exists(self.build_sh):
+            raise FileNotFoundError("build.sh not found in current directory")
+
+        subprocess.run(["bash", str(self.build_sh)], check=True)
+        print("✓ Build completed")
+
+        # Ensure fuzz binary exists
+        if not os.path.exists(self.fuzz_bin):
+            raise FileNotFoundError("fuzz binary not found after build")
+        # Make sure it's executable
+        os.chmod(self.fuzz_bin, os.stat(self.fuzz_bin).st_mode | 0o111)
+
+    def _fuzz_command(self, duration: int) -> List[str]:
+        cmd: List[str] = [str(self.fuzz_bin), self.corpus_dir]
+
+        env = os.environ
+        jobs = env.get("JOBS")
+        workers = env.get("WORKERS")
+        max_len = env.get("MAX_LEN")
+        rss_limit = env.get("RSS_LIMIT")
+
+        def add_opt(flag: str, val: Optional[str]) -> None:
+            if val not in (None, ""):
+                cmd.append(f"{flag}={val}")
+
+        add_opt("-jobs", jobs)
+        add_opt("-workers", workers)
+        add_opt("-max_len", max_len)
+        add_opt("-rss_limit_mb", rss_limit)
+
+        cmd.extend([
+            "-prefer_small=0",
+            "-use_value_profile=1",
+            "-mutate_depth=100",
+            "-entropic=1",
+            "-use_counters=1",
+            "-ignore_crashes=1",
+            "-reduce_inputs=0",
+            "-len_control=0",
+            f"-max_total_time={duration}",
+            "-print_final_stats=1",
+        ])
+
+        cmd.extend(self.fuzz_args)
+        return cmd
+
+    def _run_once(self, idx: int, duration: int) -> None:
+        # Use fixed interval directory names: 0-interval, interval-2*interval, ...
+        interval_start = idx * self.interval_sec
+        interval_end = (idx + 1) * self.interval_sec
+        interval_name = f"{interval_start}-{interval_end}"
+        interval_dir = self.coverage_dir / interval_name
+        interval_dir.mkdir(parents=True, exist_ok=True)
+
+        # Temp location for raw profiles
+        tmp_dir = self.work_dir / f"run_{interval_name}"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
+        # Use {api}.profraw as the profile file name
+        profraw_path = tmp_dir / f"{self.api_name}.profraw"
+
         env: Dict[str, str] = os.environ.copy()
-        current_ld_path = env.get('LD_LIBRARY_PATH', '')
-        if current_ld_path:
-            env['LD_LIBRARY_PATH'] = f"{os.getcwd()}:{current_ld_path}"
-        else:
-            env['LD_LIBRARY_PATH'] = os.getcwd()
-        
-        # Build fuzzer command
-        fuzz_cmd: List[str] = ['./fuzz']
-        
-        # Add corpus directory if it exists
-        if os.path.exists(self.corpus_dir):
-            fuzz_cmd.append(self.corpus_dir)
-        
-        # Add additional arguments
-        if additional_args:
-            fuzz_cmd.extend(additional_args)
-        
-        # Add max time if specified
-        if max_time:
-            fuzz_cmd.extend([f'-max_total_time={max_time}'])
-        
-        print(f"Command: {' '.join(fuzz_cmd)}")
-        print(f"Environment LD_LIBRARY_PATH: {env.get('LD_LIBRARY_PATH')}")
-        
+        env["LLVM_PROFILE_FILE"] = str(profraw_path.resolve())
+
+        ld_path = env.get("LD_LIBRARY_PATH", "")
+        cwd_path = os.getcwd()
+        env["LD_LIBRARY_PATH"] = f"{cwd_path}:{ld_path}" if ld_path else cwd_path
+
+        cmd = self._fuzz_command(duration)
+        print(f"\nInterval {interval_name}s: starting fuzzing")
+        print(f"Command: {' '.join(cmd)}")
+        print(f"LLVM_PROFILE_FILE: {env['LLVM_PROFILE_FILE']}")
+
+        grace = max(15, duration // 10)
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+        )
+
         try:
-            self.fuzzing_process = subprocess.Popen(
-                fuzz_cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                universal_newlines=True
-            )
-            
-            # Start the coverage copying thread
-            self.copy_thread = threading.Thread(target=self.copy_profraw_files)
-            self.copy_thread.daemon = True
-            self.start_time = time.time()  # Record start time for interval calculations
-            self.copy_thread.start()
-            
-            print("✓ Fuzzing started. Press Ctrl+C to stop.")
-            print("✓ Coverage files will be copied every 60 seconds.")
-            print("-" * 60)
-            
-            # Stream output in real-time
-            assert self.fuzzing_process.stdout is not None
-            for line in iter(self.fuzzing_process.stdout.readline, ''):
-                if line:
-                    print(line.rstrip())
-            
-            return_code = self.fuzzing_process.wait()
-            print(f"\nFuzzing process ended with return code: {return_code}")
-            
-        except KeyboardInterrupt:
-            print("\n\nInterrupted by user")
-            self.stop_fuzzing()
-        except Exception as e:
-            print(f"Error running fuzzing: {e}")
-    
-    def stop_fuzzing(self) -> None:
-        """Stop the fuzzing process and cleanup"""
-        print("Stopping fuzzing...")
-        
-        self.stop_copying = True
-        
-        if self.fuzzing_process and self.fuzzing_process.poll() is None:
-            print("Terminating fuzzing process...")
-            self.fuzzing_process.terminate()
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                print(line.rstrip())
+            proc.wait(timeout=duration + grace)
+        except subprocess.TimeoutExpired:
+            print("✗ Interval watchdog timeout exceeded, attempting graceful termination...")
+            proc.terminate()
             try:
-                self.fuzzing_process.wait(timeout=10)
+                proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                print("Force killing fuzzing process...")
-                self.fuzzing_process.kill()
-                self.fuzzing_process.wait()
-        
-        if self.copy_thread and self.copy_thread.is_alive():
-            print("Waiting for coverage copying thread to finish...")
-            self.copy_thread.join(timeout=5)
-        
-        # Final copy of any remaining .profraw files
-        self.final_profraw_copy()
-        
-        print("✓ Cleanup completed")
-    
-    def final_profraw_copy(self) -> None:
-        """Final copy of .profraw files when stopping"""
-        profraw_files: List[Path] = list(Path('.').glob('*.profraw'))
-        if profraw_files:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            
-            # Calculate final interval
-            if self.start_time:
-                elapsed_seconds = int(time.time() - self.start_time)
-                final_interval = f"final-{elapsed_seconds}s"
-            else:
-                final_interval = "final"
-                
-            final_dir: Path = Path(self.profraw_dir) / f"{final_interval}_{timestamp}"
-            final_dir.mkdir(exist_ok=True)
-            
-            print(f"Final copy ({final_interval}): {len(profraw_files)} .profraw files to {final_dir}")
-            
-            for profraw_file in profraw_files:
-                try:
-                    shutil.copy2(profraw_file, final_dir)
-                except Exception as e:
-                    print(f"Failed to copy {profraw_file}: {e}")
-            
-            self.create_profdata(final_dir, final_interval)
+                print("Force killing process...")
+                proc.kill()
+                proc.wait()
+        except KeyboardInterrupt:
+            self._stop = True
+            print("\nInterrupted by user. Stopping after current interval...")
+            proc.terminate()
+            proc.wait()
+        finally:
+            rc = proc.returncode
+            print(f"Fuzzer exited with code: {rc}")
+
+        # Move non-empty profraw file into the interval dir, always as {api}.profraw
+        moved_count = 0
+        if profraw_path.is_file() and profraw_path.stat().st_size > 0:
+            shutil.move(str(profraw_path), interval_dir / f"{self.api_name}.profraw")
+            moved_count = 1
+
+        try:
+            tmp_dir.rmdir()
+        except OSError:
+            pass
+
+        print(f"Interval {interval_name}s: moved {moved_count} .profraw files to {interval_dir}")
+
+        self._merge_profraw(interval_dir, interval_name)
+
+    def _merge_profraw(self, interval_dir: Path, interval_name: str) -> None:
+        profraw_file = interval_dir / f"{self.api_name}.profraw"
+        if not profraw_file.exists():
+            print("  ℹ No .profraw file to merge for this interval")
+            return
+
+        merged = interval_dir / f"merged_{interval_name}.profdata"
+        cmd = ["llvm-profdata", "merge", "-sparse", str(profraw_file), "-o", str(merged)]
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"  ✓ Created merged profdata: {merged}")
+        except FileNotFoundError:
+            print("  ✗ llvm-profdata not found, skipping merge")
+        except subprocess.CalledProcessError as e:
+            print(f"  ✗ Failed to merge profiles: {e}\n  stdout: {e.stdout}\n  stderr: {e.stderr}")
+
+    def run(self) -> None:
+        self.build()
+        total = self.max_time_sec
+        step = self.interval_sec
+        num_intervals = (total + step - 1) // step  # ceil division
+
+        for idx in range(num_intervals):
+            if self._stop:
+                break
+            # Last interval may be shorter
+            remaining = total - idx * step
+            duration = min(step, remaining)
+            self._run_once(idx, duration)
+
+        print("\nAll intervals completed.")
+
+    def stop(self) -> None:
+        self._stop = True
 
 
 def main() -> None:
     import argparse
 
-    @runtime_checkable
-    class _Args(Protocol):
-        corpus: str
-        coverage_dir: str
-        max_time: Optional[int]
-        build_only: bool
-        fuzz_args: Optional[Sequence[str]]
-    
-    parser = argparse.ArgumentParser(description='Run fuzzing with coverage tracking')
-    parser.add_argument('--corpus', default='corpus_itv_60', help='Corpus directory')
-    parser.add_argument('--coverage-dir', default='coverage_data', help='Coverage data output directory')
-    parser.add_argument('--max-time', type=int, help='Maximum fuzzing time in seconds')
-    parser.add_argument('--build-only', action='store_true', help='Only build the binary, do not run fuzzing')
-    parser.add_argument('--fuzz-args', nargs='*', help='Additional arguments to pass to the fuzzer')
-    
-    args = cast(_Args, parser.parse_args())
-    
-    fuzzer: CoverageFuzzer = CoverageFuzzer(corpus_dir=args.corpus, profraw_dir=args.coverage_dir)
-    
-    # Build the instrumented binary
-    if not fuzzer.build_instrumented_binary():
-        print("Failed to build binary, exiting.")
-        sys.exit(1)
-    
+    parser = argparse.ArgumentParser(description="Interval fuzzing with coverage collection")
+    parser.add_argument("--corpus", default="corpus", help="Corpus directory")
+    parser.add_argument("--coverage-dir", default="coverage_data", help="Coverage data output directory")
+    parser.add_argument("--interval", type=int, required=True, help="Interval duration in seconds")
+    parser.add_argument("--max-time", type=int, required=True, help="Total fuzzing time in seconds")
+    parser.add_argument("--fuzz-args", nargs="*", help="Additional arguments passed to the fuzz binary")
+    parser.add_argument("--build-only", action="store_true", help="Only build via build.sh and exit")
+
+    args = parser.parse_args()
+
+    runner = IntervalFuzzRunner(
+        corpus_dir=args.corpus,
+        coverage_dir=args.coverage_dir,
+        interval_sec=args.interval,
+        max_time_sec=args.max_time,
+        fuzz_args=args.fuzz_args,
+    )
+
+    # Build only mode
     if args.build_only:
-        print("Build completed. Exiting as requested.")
-        sys.exit(0)
-    
-    # Set up signal handler for graceful shutdown
-    def signal_handler(signum: int, frame: FrameType | None) -> None:
-        print(f"\nReceived signal {signum}")
-        fuzzer.stop_fuzzing()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Run fuzzing
+        try:
+            runner.build()
+            print("Build completed. Exiting as requested.")
+            sys.exit(0)
+        except Exception as e:
+            print(f"Build failed: {e}")
+            sys.exit(1)
+    # Trap SIGINT/SIGTERM for graceful shutdown between intervals
+    def _handle_signal(signum: int, frame: Optional[FrameType]) -> None:
+        print(f"\nReceived signal {signum}, will stop after current interval...")
+        runner.stop()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
     try:
-        fuzzer.run_fuzzing(max_time=args.max_time, additional_args=args.fuzz_args)
+        runner.run()
     except Exception as e:
         print(f"Error: {e}")
-        fuzzer.stop_fuzzing()
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()

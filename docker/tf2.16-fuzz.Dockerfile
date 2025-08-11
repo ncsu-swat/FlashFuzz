@@ -27,7 +27,7 @@ RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
 WORKDIR /root/tensorflow/fuzz
 COPY scripts/ .
 
-RUN  python3 -u build_test_harness.py --dll tf --mode fuzz
+RUN  python3 -u build_test_harness.py --dll tf --mode fuzz 
 
 WORKDIR /root
 

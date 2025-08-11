@@ -246,13 +246,63 @@ class Experiment():
         try:
             self.check_image()
             self.start_docker_container()
-            self.copy_files_to_container(f"./_fuzz_result/{self.dll}{self.ver}-fuzz-{self.time_budget}s/{self.api}/corpus_itv_{self.itv}", f"/root/tensorflow/fuzz/{self.api}/corpus_itv_{self.itv}")
-            self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && python3 generate_coverage_file.py --dll tf --itv {self.itv} --api {self.api} --workers 64 --timeout 120")
-            self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/corpus_itv_{self.itv}", f"{self.result_dir}")
-            loop_until_ctrl_c()
+            self.execute_command(f"cd /root/tensorflow/fuzz/{self.api}  && python3 coverage_fuzzing.py --interval {self.itv} --max-time {self.time_budget}")
+            self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/coverage_data", f"{self.result_dir}/coverage_data")
+
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED
+
+    def merge_coverage_files(self) -> None:
+        print("Merging coverage files...")
+        output_dir = f"{self.result_dir}/all"
+        os.makedirs(output_dir, exist_ok=True)
+        previous_interval_name: Optional[str] = None
+        for idx in range(0, self.time_budget, self.itv):
+            interval_start = idx
+            interval_end = min(idx + self.itv, self.time_budget)
+            interval_name = f"{interval_start}-{interval_end}"
+            interval_dir = os.path.join(output_dir, interval_name)
+            os.makedirs(interval_dir, exist_ok=True)
+
+
+            tf_dirs = glob.glob(f"{self.result_dir}/tf.*")
+            if not tf_dirs:
+                print("No TensorFlow API directories found.")
+                return
+            for tf_dir in tf_dirs:
+                # copy the profraw files from each API directory
+                profraw_file = os.path.join(tf_dir, "coverage_data", f"{interval_name}", "*.profraw")
+                profraw_files = glob.glob(profraw_file)
+                if not interval_name:
+                    print(f"No profraw files found for {tf_dir} in interval {interval_name}.")
+                    continue
+                for profraw in profraw_files:
+                    shutil.copy2(profraw, interval_dir)
+                    print(f"Copied {profraw} to {interval_dir}")
+            # start the docker to merge the profraw files
+            try:
+                self.check_image()
+                self.start_docker_container()
+                self.copy_files_to_container(f"{output_dir}/{interval_name}", "/root/tensorflow/fuzz/")
+                if previous_interval_name:
+                    self.copy_files_to_container(f"{output_dir}/{previous_interval_name}", f"/root/tensorflow/fuzz/{previous_interval_name}")
+                if not previous_interval_name:
+                    self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 merge_profraw.py --dll tf --dir {interval_name}")
+                else:
+                    self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 merge_profraw.py --dll tf --dir {interval_name} --previous {previous_interval_name}/merged.profdata")
+                self.copy_results_from_container(f"/root/tensorflow/fuzz/{interval_name}/merged.profdata", f"{interval_dir}/merged.profdata")
+                previous_interval_name = interval_name
+            except KeyboardInterrupt:
+                print(f"\nKeyboard interrupt received.")
+            except Exception as e:
+                print(f"Failed to merge profraw files for interval {interval_name}: {e}")
+            finally:
+                try:
+                    self.stop_docker_container()
+                    self.remove_docker_container()
+                except Exception:
+                    pass
 
     def run(self):
         if self.dll == "tf":

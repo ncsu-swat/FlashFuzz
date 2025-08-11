@@ -114,28 +114,36 @@ def main():
                 )
                 scheduler.add_experiment(exp)
             else:
-                fuzz_exp = Experiment(
-                        dll=args.dll,
-                        mode="fuzz",
-                        api="all",
-                        ver=args.version,
-                        cpus=args.num_parallel,
-                        time_budget=args.time_budget
+                # for api in apis:
+                #     exp = Experiment(
+                #         dll=args.dll,
+                #         mode=args.mode,
+                #         ver=args.version,
+                #         api=api,
+                #         cpus=args.num_parallel,
+                #         time_budget=args.time_budget,
+                #         itv=args.itv
+                #     )
+                #     scheduler.add_experiment(exp)
+                # scheduler.run_all()
+                
+                exp = Experiment(
+                    dll=args.dll,
+                    mode=args.mode,
+                    ver=args.version,
+                    api="all",
+                    cpus=args.num_parallel,
+                    time_budget=args.time_budget,
+                    itv=args.itv
                 )
-                fuzz_exp.classify_with_itv(args.itv)
-                for api in apis:
-                    exp = Experiment(
-                        dll=args.dll,
-                        mode=args.mode,
-                        ver=args.version,
-                        api=api,
-                        cpus=args.num_parallel,
-                        time_budget=args.time_budget,
-                        itv=args.itv
-                    )
-                    scheduler.add_experiment(exp)
-            
+                exp.merge_coverage_files()
+
+                
+
     scheduler.run_all()
+    
+
+    
     end_time = time.time()
     elapsed_time_s = end_time - start_time
     elapsed_time_m = elapsed_time_s / 60
