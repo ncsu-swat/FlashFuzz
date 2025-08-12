@@ -35,7 +35,7 @@ def loop_until_ctrl_c(callback: Optional[Callable[[], None]] = None, interval: f
 
 
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 2, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60):
         self.dll = dll
         self.mode = mode
         self.ver = ver

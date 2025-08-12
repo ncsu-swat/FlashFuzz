@@ -29,6 +29,7 @@ RUN bazel build  \
     --linkopt="-fcoverage-mapping" \
     --copt="-Wno-error=c23-extensions" \
     --linkopt=-L/usr/lib/clang/19/lib/linux \
+    --linkopt=-lclang_rt.fuzzer-x86_64 \
     //tensorflow:tensorflow_cc
 
 RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
