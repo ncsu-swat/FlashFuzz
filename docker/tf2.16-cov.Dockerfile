@@ -19,18 +19,17 @@ WORKDIR /root/tensorflow
 CMD [ "bash" ]
 
 
-RUN bazel build //tensorflow:tensorflow_cc \
-    -c dbg -s \
-    --action_env=CC=clang-19 --action_env=CXX=clang++-19 \
-    --host_action_env=CC=clang-19 --host_action_env=CXX=clang++-19 \
-    --features=-thin_lto,-lto --strip=never \
-    --cxxopt=-O0 --cxxopt=-g \
+RUN bazel build  \
+    --copt=-O0 --copt=-g \
     --copt=-fsanitize=fuzzer-no-link \
+    --copt="-fprofile-instr-generate" \
+    --copt="-fcoverage-mapping" \
     --linkopt=-fsanitize=fuzzer-no-link \
+    --linkopt="-fprofile-instr-generate" \
+    --linkopt="-fcoverage-mapping" \
     --copt="-Wno-error=c23-extensions" \
-    --linkopt=-lclang_rt.fuzzer-x86_64 \
     --linkopt=-L/usr/lib/clang/19/lib/linux \
-    --per_file_copt='+tensorflow/core/kernels/.*@-fprofile-instr-generate,-fcoverage-mapping,-fprofile-update=atomic' 
+    //tensorflow:tensorflow_cc
 
 RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
     ln -s libtensorflow_cc.so.2.16.1 libtensorflow_cc.so && \
