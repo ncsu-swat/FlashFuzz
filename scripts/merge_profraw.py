@@ -56,6 +56,7 @@ def main():
         cmd: List[str] = [
             "llvm-profdata",
             "merge",
+            "-failure-mode=all",
             "-sparse",
             "-j",
             str(args.threads),
@@ -68,6 +69,7 @@ def main():
         cmd: List[str] = [
             "llvm-profdata",
             "merge",
+            "-failure-mode=all",
             "-sparse",
             "-j",
             str(args.threads),
