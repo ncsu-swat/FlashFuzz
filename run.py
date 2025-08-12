@@ -114,18 +114,18 @@ def main():
                 )
                 scheduler.add_experiment(exp)
             else:
-                # for api in apis:
-                #     exp = Experiment(
-                #         dll=args.dll,
-                #         mode=args.mode,
-                #         ver=args.version,
-                #         api=api,
-                #         cpus=args.num_parallel,
-                #         time_budget=args.time_budget,
-                #         itv=args.itv
-                #     )
-                #     scheduler.add_experiment(exp)
-                # scheduler.run_all()
+                for api in apis:
+                    exp = Experiment(
+                        dll=args.dll,
+                        mode=args.mode,
+                        ver=args.version,
+                        api=api,
+                        cpus=args.num_parallel,
+                        time_budget=args.time_budget,
+                        itv=args.itv
+                    )
+                    scheduler.add_experiment(exp)
+                scheduler.run_all()
                 
                 exp = Experiment(
                     dll=args.dll,
@@ -136,8 +136,8 @@ def main():
                     time_budget=args.time_budget,
                     itv=args.itv
                 )
-                exp.merge_coverage_files()
-
+                # exp.merge_coverage_files()
+                exp.get_coverage_results()
                 
 
     scheduler.run_all()

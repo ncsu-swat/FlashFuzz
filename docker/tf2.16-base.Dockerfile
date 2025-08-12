@@ -60,7 +60,8 @@ RUN wget https://apt.llvm.org/llvm.sh && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-19 100 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-19 100 && \
     update-alternatives --install /usr/bin/ld ld /usr/bin/lld-19 100 && \
-    update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-19 100
+    update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-19 100 && \
+    update-alternatives --install /usr/bin/llvm-cov llvm-cov /usr/bin/llvm-cov-19 100
 
 # Set up Python virtual environment
 RUN python3 -m venv /venv
@@ -70,7 +71,8 @@ ENV PATH="/venv/bin:$PATH"
 RUN pip install --no-cache-dir -U \
     "numpy==2.1.1" \
     packaging \
-    "protobuf==4.25.3"
+    "protobuf==4.25.3" \
+    "bs4"
 
 # Add venv activation to .bashrc
 RUN echo 'source /venv/bin/activate' >> ~/.bashrc

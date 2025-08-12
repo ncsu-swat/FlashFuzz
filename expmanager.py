@@ -304,6 +304,55 @@ class Experiment():
                 except Exception:
                     pass
 
+    def get_coverage_results(self):
+        print("Getting coverage results...")
+        output_dir = f"{self.result_dir}/all"
+        os.makedirs(output_dir, exist_ok=True)
+        for idx in range(0, self.time_budget, self.itv):
+            interval_start = idx
+            interval_end = min(idx + self.itv, self.time_budget)
+            interval_name = f"{interval_start}-{interval_end}"
+            interval_dir = os.path.join(output_dir, interval_name)
+            os.makedirs(interval_dir, exist_ok=True)
+
+            # copy the merged.profdata file to the output directory
+            merged_profdata_file = os.path.join(interval_dir, "merged.profdata")
+            if not os.path.exists(merged_profdata_file):
+                print(f"No merged.profdata file found for interval {interval_name}.")
+                continue
+
+            # start the docker to merge the profraw files
+            try:
+                self.check_image()
+                self.start_docker_container()
+                self.copy_files_to_container(merged_profdata_file, "/root/tensorflow/fuzz/")
+                self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1  --require  tensorflow/core/kernels  --coverage_file  merged.profdata --out {interval_name}.txt")
+                self.copy_results_from_container(f"/root/tensorflow/fuzz/{interval_name}.txt", f"{output_dir}/{interval_name}.txt")
+                self.copy_results_from_container(f"/root/tensorflow/fuzz/coverage_html", f"{interval_dir}/coverage_html")
+            except KeyboardInterrupt:
+                print(f"\nKeyboard interrupt received.")
+            except Exception as e:
+                print(f"Failed to get coverage results for interval {interval_name}: {e}")
+            finally:
+                try:
+                    self.stop_docker_container()
+                    self.remove_docker_container()
+                except Exception:
+                    pass
+        # print the coverage summary
+        for idx in range(0, self.time_budget, self.itv):
+            interval_start = idx
+            interval_end = min(idx + self.itv, self.time_budget)
+            interval_name = f"{interval_start}-{interval_end}"
+            interval_dir = os.path.join(output_dir, interval_name)
+            coverage_results_file = os.path.join(interval_dir, "coverage_results.txt")
+            if not os.path.exists(coverage_results_file):
+                print(f"No coverage_results.txt file found for interval {interval_name}.")
+                continue
+            with open(coverage_results_file, "r") as f:
+                coverage_summary = f.read()
+                print(f"Coverage Summary for interval {interval_name}:\n{coverage_summary}")
+
     def run(self):
         if self.dll == "tf":
             if self.check_valid:
