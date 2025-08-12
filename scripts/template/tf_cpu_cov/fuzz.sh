@@ -27,10 +27,10 @@ fi
     -max_total_time=60 \
     -print_final_stats=1 
 
-llvm-profdata-19 merge -output=tensorflow_merged.profdata \
+llvm-profdata merge -output=tensorflow_merged.profdata \
   *.profraw
 
-llvm-cov-19 show  /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 -object  /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 --show-branches=count  --instr-profile=tensorflow_merged.profdata -format=html -output-dir=tf_coverage -path-equivalence=/proc/self/cwd/,/root/tensorflow/
+llvm-cov show  /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 -object  /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 --show-branches=count  --instr-profile=tensorflow_merged.profdata -format=html -output-dir=tf_coverage -path-equivalence=/proc/self/cwd/,/root/tensorflow/
 
 echo "Fuzzing completed."
 

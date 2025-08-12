@@ -75,6 +75,9 @@ def main():
     with open(api_list, "r") as f:
         apis = f.read().splitlines()
 
+    # filter apis not start with tf or torch
+    apis = [api for api in apis if api.startswith("tf.") or api.startswith("torch.")]
+
     scheduler = Scheduler(num_parallel=args.num_parallel)
 
     if args.dll == "tf" :
@@ -136,11 +139,11 @@ def main():
                     time_budget=args.time_budget,
                     itv=args.itv
                 )
-                # exp.merge_coverage_files()
+                exp.merge_coverage_files()
                 exp.get_coverage_results()
                 
 
-    scheduler.run_all()
+    # scheduler.run_all()
     
 
     

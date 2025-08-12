@@ -16,19 +16,16 @@ RUN cd /root/tensorflow && ./configure
 
 WORKDIR /root/tensorflow 
 
-CMD [ "bash" ]
-
 
 RUN bazel build  \
     --copt=-O0 --copt=-g \
     --copt=-fsanitize=fuzzer-no-link \
-    --copt="-fprofile-instr-generate" \
-    --copt="-fcoverage-mapping" \
     --linkopt=-fsanitize=fuzzer-no-link \
     --linkopt="-fprofile-instr-generate" \
     --linkopt="-fcoverage-mapping" \
     --copt="-Wno-error=c23-extensions" \
-    --linkopt=-L/usr/lib/clang/19/lib/linux \
+    --per_file_copt=+tensorflow.*@-fprofile-instr-generate,-fcoverage-mapping \
+    --linkopt=-L/usr/lib/clang/20/lib/linux \
     --linkopt=-lclang_rt.fuzzer-x86_64 \
     //tensorflow:tensorflow_cc
 
