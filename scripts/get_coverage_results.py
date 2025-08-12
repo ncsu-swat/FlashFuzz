@@ -112,7 +112,8 @@ def main():
             "--show-branches=count",
             f"--instr-profile={args.coverage_file}",
             "-format=html",
-            f"-output-dir={args.html_dir}"
+            f"-output-dir={args.html_dir}",
+            "-path-equivalence=/proc/self/cwd/,/root/tensorflow/"
         ]
         try:
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -135,9 +136,9 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         f.write(f"Filters (ALL required): {args.require}\n")
         f.write(f"Files matched: {len(per_file)}\n")
-        f.write(f"Covered lines: {covered_sum}\n")
-        f.write(f"Total lines: {total_sum}\n")
-        f.write(f"Line coverage: {percent:.2f}%\n")
+        f.write(f"Covered branches: {covered_sum}\n")
+        f.write(f"Total branches: {total_sum}\n")
+        f.write(f"Branch coverage: {percent:.2f}%\n")
         f.write("\nPer-file (covered/total pct path):\n")
         for path, cov, tot in sorted(per_file, key=lambda x: (-x[1], x[0])):
             pct = (cov / tot * 100) if tot else 100.0

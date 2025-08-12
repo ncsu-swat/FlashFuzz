@@ -16,6 +16,7 @@ class IntervalFuzzRunner:
         interval_sec: int,
         max_time_sec: int,
         fuzz_args: Optional[Sequence[str]] = None,
+        api_name: str = "unamed"
     ) -> None:
         self.corpus_dir = corpus_dir
         self.coverage_dir = Path(coverage_dir)
@@ -33,7 +34,7 @@ class IntervalFuzzRunner:
         self.fuzz_bin = "./fuzz"
 
         # API name for profraw file
-        self.api_name = "Abs"
+        self.api_name = api_name
 
     def build(self) -> None:
         print("Building with build.sh ...")
@@ -157,7 +158,7 @@ class IntervalFuzzRunner:
 
         print(f"Interval {interval_name}s: moved {moved_count} .profraw files to {interval_dir}")
 
-        self._merge_profraw(interval_dir, interval_name)
+        # self._merge_profraw(interval_dir, interval_name)
 
     def _merge_profraw(self, interval_dir: Path, interval_name: str) -> None:
         profraw_file = interval_dir / f"{self.api_name}.profraw"
@@ -205,7 +206,7 @@ def main() -> None:
     parser.add_argument("--max-time", type=int, required=True, help="Total fuzzing time in seconds")
     parser.add_argument("--fuzz-args", nargs="*", help="Additional arguments passed to the fuzz binary")
     parser.add_argument("--build-only", action="store_true", help="Only build via build.sh and exit")
-
+    parser.add_argument("--api", type=str, required=True, help="API to fuzz (default: all)")
     args = parser.parse_args()
 
     runner = IntervalFuzzRunner(
@@ -214,6 +215,7 @@ def main() -> None:
         interval_sec=args.interval,
         max_time_sec=args.max_time,
         fuzz_args=args.fuzz_args,
+        api_name=args.api
     )
 
     # Build only mode

@@ -246,9 +246,8 @@ class Experiment():
         try:
             self.check_image()
             self.start_docker_container()
-            self.execute_command(f"cd /root/tensorflow/fuzz/{self.api}  && python3 coverage_fuzzing.py --interval {self.itv} --max-time {self.time_budget}")
+            self.execute_command(f"cd /root/tensorflow/fuzz/{self.api}  && python3 coverage_fuzzing.py --interval {self.itv} --max-time {self.time_budget} --api {self.api}")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/coverage_data", f"{self.result_dir}/coverage_data")
-
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED
@@ -395,7 +394,6 @@ class Scheduler():
         if self.num_parallel == 1:
             for exp in tqdm(self.experiments, desc="Running Experiments"):
                 self._run_experiment(exp)
-            return
         else:
             with ThreadPoolExecutor(max_workers=self.num_parallel) as executor:
                 with tqdm(total=len(self.experiments), desc="Running Experiments") as pbar:
@@ -409,3 +407,6 @@ class Scheduler():
                         for f in futures:
                             f.cancel()
                         raise
+
+            
+

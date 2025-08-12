@@ -11,6 +11,7 @@ ENV TF_NEED_ROCM=0
 ENV TF_NEED_CUDA=0
 ENV TF_NEED_CLANG=1
 ENV TF_SET_ANDROID_WORKSPACE=0
+ENV CC_OPT_FLAGS=-Wno-sign-compare
 RUN cd /root/tensorflow && ./configure
 
 WORKDIR /root/tensorflow 
@@ -29,7 +30,7 @@ RUN bazel build //tensorflow:tensorflow_cc \
     --copt="-Wno-error=c23-extensions" \
     --linkopt=-lclang_rt.fuzzer-x86_64 \
     --linkopt=-L/usr/lib/clang/19/lib/linux \
-    --per_file_copt='+//tensorflow/core/kernels/.*@-fprofile-instr-generate,-fcoverage-mapping,-fprofile-update=atomic' 
+    --per_file_copt='+tensorflow/core/kernels/.*@-fprofile-instr-generate,-fcoverage-mapping,-fprofile-update=atomic' 
 
 RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
     ln -s libtensorflow_cc.so.2.16.1 libtensorflow_cc.so && \
