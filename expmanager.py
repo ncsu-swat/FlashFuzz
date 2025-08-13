@@ -154,7 +154,8 @@ class Experiment():
             raise
 
     def start_docker_container(self):
-        cmd = f"docker run -itd --cpus {self.cpus} -m {self.mem}g --name {self.container_name} {self.image_name}"
+        # cmd = f"docker run -itd --cpus {self.cpus} -m {self.mem}g --name {self.container_name} {self.image_name}"
+        cmd = f"docker run -itd --cpus {self.cpus} --name {self.container_name} {self.image_name}"
         try:
             subprocess.run(cmd, shell=True, check=True)
             print(f"Started container {self.container_name}.")
