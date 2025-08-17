@@ -116,8 +116,7 @@ def build_tf_fuzz(time_budget: int=180, no_compile: bool=False) -> None:
     os.system("cp -r template/tf_cpu/* .") # Copy all files from the template directory
     os.system(f"python3 -u copy.py --time_budget {time_budget}") # Copy the fuzz.sh and build.sh files with proper settings
     if not no_compile:
-        pass
-        # build_tf()
+        build_tf()
     check_tf_build()
 
 
@@ -126,8 +125,7 @@ def build_tf_cov(time_budget: int=180, no_compile: bool=False) -> None:
     os.system("cp -r template/tf_cpu_cov/* .") # Copy all files from the template directory
     os.system(f"python3 -u copy.py --time_budget {time_budget}") # Copy the fuzz.sh and build.sh files with proper settings
     if not no_compile:
-        pass
-        # build_tf()
+        build_tf()
     check_tf_build()
 
 

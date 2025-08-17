@@ -7,6 +7,7 @@ import glob
 import shutil
 import time
 from typing import Callable, Optional
+import re
 
 class Status(enum.Enum):
     NOT_STARTED = "not_started"
@@ -46,7 +47,7 @@ class Experiment():
         self.time_budget = time_budget
         self.status = Status.NOT_STARTED
         self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}"
-        self.container_name = f"{self.api}_container"
+        self.container_name = f"{self.api}_{self.dll}{self.ver}_{self.mode}"
         self.container_id = None
         self.itv = itv
         if self.api == "all":
@@ -143,7 +144,7 @@ class Experiment():
             print(f"Classified {total} files from {seed_dir} into {len(bucket_counts)} buckets under {dest_base}.")
 
     def create_docker_container(self):
-        cmd = f'docker create --name {self.api}_container {self.image_name}'
+        cmd = f'docker create --name {self.container_name} {self.image_name}'
         try:
             proc = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
             self.container_id = proc.stdout.strip()
@@ -181,11 +182,16 @@ class Experiment():
             print(f"Stderr: {e.stderr}")
             raise
 
-    def remove_docker_container(self):
-        cmd = f"docker rm {self.container_name}"
+    def remove_docker_container(self, prune_volumes: bool = True):
+        # Use -v to remove anonymous volumes associated with the container
+        vol_flag = "-v" if prune_volumes else ""
+        cmd = f"docker rm {vol_flag} {self.container_name}"
         try:
             subprocess.run(cmd, shell=True, check=True)
-            print(f"Removed container {self.container_name}.")
+            if prune_volumes:
+                print(f"Removed container {self.container_name} and its anonymous volumes.")
+            else:
+                print(f"Removed container {self.container_name}.")
         except subprocess.CalledProcessError as e:
             print(f"Failed to remove container {self.container_name}.")
             print(f"Stderr: {e.stderr}")
@@ -229,12 +235,13 @@ class Experiment():
         try:
             self.check_image()
             self.start_docker_container()
-            self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --check_valid ")
+            self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 -u build_test_harness.py --dll {self.dll} --mode {self.mode} --check_build > check.log")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}", f"{self.result_dir}/{self.api}")
             os.makedirs(f"{self.result_dir}/build_status", exist_ok=True)
             self.copy_results_from_container(f"/root/tensorflow/fuzz/success_apis.txt", f"{self.result_dir}/build_status/")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/fail_apis.txt", f"{self.result_dir}/build_status/")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/build_summary.txt", f"{self.result_dir}/build_status/")
+            self.copy_results_from_container(f"/root/tensorflow/fuzz/check.log", f"{self.result_dir}/build_status/")
             with open(f"{self.result_dir}/build_status/build_summary.txt", "r") as f:
                 summary = f.read()
                 print(f"Build Summary: {summary}")
@@ -345,13 +352,18 @@ class Experiment():
             interval_end = min(idx + self.itv, self.time_budget)
             interval_name = f"{interval_start}-{interval_end}"
             interval_dir = os.path.join(output_dir, interval_name)
-            coverage_results_file = os.path.join(interval_dir, "coverage_results.txt")
+            coverage_results_file = f"{interval_dir}.txt"
             if not os.path.exists(coverage_results_file):
                 print(f"No coverage_results.txt file found for interval {interval_name}.")
                 continue
             with open(coverage_results_file, "r") as f:
                 coverage_summary = f.read()
-                print(f"Coverage Summary for interval {interval_name}:\n{coverage_summary}")
+                pattern = r"(?<=Covered branches: )\d+"
+                coverage_number = re.search(pattern, coverage_summary)
+                if coverage_number:
+                    coverage_number = coverage_number.group()
+                    print(f"{interval_name}: {coverage_number}")
+
 
     def run(self):
         if self.dll == "tf":
@@ -392,22 +404,37 @@ class Scheduler():
         return exp.api, exp.status
 
     def run_all(self):
+        # Take a snapshot so we only run what existed at call time
+        to_run = list(self.experiments)
         if self.num_parallel == 1:
-            for exp in tqdm(self.experiments, desc="Running Experiments"):
-                self._run_experiment(exp)
+            for exp in tqdm(to_run, desc="Running Experiments"):
+                try:
+                    self._run_experiment(exp)
+                finally:
+                    # Remove finished experiment to prevent re-execution
+                    try:
+                        self.experiments.remove(exp)
+                    except ValueError:
+                        pass
         else:
             with ThreadPoolExecutor(max_workers=self.num_parallel) as executor:
-                with tqdm(total=len(self.experiments), desc="Running Experiments") as pbar:
-                    futures = [executor.submit(self._run_experiment, exp) for exp in self.experiments]
+                with tqdm(total=len(to_run), desc="Running Experiments") as pbar:
+                    future_to_exp = {executor.submit(self._run_experiment, exp): exp for exp in to_run}
                     try:
-                        for future in as_completed(futures):
+                        for future in as_completed(future_to_exp):
                             pbar.update(1)
-                            future.result()
+                            exp = future_to_exp[future]
+                            try:
+                                future.result()
+                            finally:
+                                # Remove finished experiment to prevent re-execution
+                                try:
+                                    self.experiments.remove(exp)
+                                except ValueError:
+                                    pass
                     except KeyboardInterrupt:
                         print("\nInterrupted. Cancelling remaining experiments...")
-                        for f in futures:
+                        for f in future_to_exp:
                             f.cancel()
                         raise
-
-            
 

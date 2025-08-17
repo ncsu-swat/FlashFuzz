@@ -143,7 +143,7 @@ def main():
                 exp.get_coverage_results()
                 
 
-    # scheduler.run_all()
+    scheduler.run_all()
     
 
     

@@ -12,20 +12,25 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 # Configure Ubuntu mirror
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirror.aaaab3n.moe/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i 's|http://security.ubuntu.com/ubuntu|https://mirror.aaaab3n.moe/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirror.xtom.nl/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
+    sed -i 's|http://security.ubuntu.com/ubuntu|https://mirror.xtom.nl/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
 
 # Install dependencies and required tools in a single RUN block to minimize layers
 RUN apt-get update && \
     apt-get install -y \
+    apt-transport-https \
+    ca-certificates \ 
+    gnupg2 \
+    lsb-release \
     build-essential \
     software-properties-common \
     cmake \
     git \
     fzf \
-    tmux \
     btop \
+    bat \
     htop \
+    tmux \
     python3 \
     python3-pip \
     python3-dev \
@@ -33,6 +38,7 @@ RUN apt-get update && \
     wget \
     unzip \
     curl \
+    nano \
     patchelf && \
     rm -rf /var/lib/apt/lists/*
 
