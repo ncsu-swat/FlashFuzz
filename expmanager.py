@@ -300,6 +300,10 @@ class Experiment():
                     self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 merge_profraw.py --dll tf --dir {interval_name} --previous {previous_interval_name}/merged.profdata")
                 self.copy_results_from_container(f"/root/tensorflow/fuzz/{interval_name}/merged.profdata", f"{interval_dir}/merged.profdata")
                 previous_interval_name = interval_name
+                # delete the profraw files to save space
+                profraw_files = glob.glob(os.path.join(interval_dir, "*.profraw"))
+                for profraw_file in profraw_files:
+                    os.remove(profraw_file)
             except KeyboardInterrupt:
                 print(f"\nKeyboard interrupt received.")
             except Exception as e:
@@ -336,6 +340,8 @@ class Experiment():
                 self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1  --require  tensorflow/core/kernels  --coverage_file  merged.profdata --out {interval_name}.txt")
                 self.copy_results_from_container(f"/root/tensorflow/fuzz/{interval_name}.txt", f"{output_dir}/{interval_name}.txt")
                 self.copy_results_from_container(f"/root/tensorflow/fuzz/coverage_html", f"{interval_dir}/coverage_html")
+                # remove merged_profdata_file to save space
+                os.remove(merged_profdata_file)
             except KeyboardInterrupt:
                 print(f"\nKeyboard interrupt received.")
             except Exception as e:

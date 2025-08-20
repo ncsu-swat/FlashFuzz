@@ -54,6 +54,13 @@ def parse_args():
         action="store_true",
         help="Check the validity of generated inputs",
     )
+    
+    parser.add_argument(
+        "--vs",
+        type=str,
+        required=False,
+        help="specify baselines(e.g., pathfinder)"
+    )
 
     # TODO: Add `--crash-report`, `--compilation-check`, and `--validation` arguments
 
@@ -71,7 +78,11 @@ def parse_args():
 def main():
     start_time = time.time()
     args = parse_args()
-    api_list = f"api_list/{args.dll}{args.version}-flashfuzz.txt"
+    if not args.vs:
+        api_list = f"api_list/{args.dll}{args.version}-flashfuzz.txt"
+    else:
+        print(f"Using baseline: {args.vs}")
+        api_list = f"api_list/{args.dll}{args.version}-{args.vs}.txt"
     with open(api_list, "r") as f:
         apis = f.read().splitlines()
 
