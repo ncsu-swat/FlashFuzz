@@ -1,5 +1,10 @@
 FROM ncsuswat/flashfuzz:torch2.2-base
 
+WORKDIR /root/fuzz
+
+# Copy the test harness
+COPY testharness/torch_cpu /root/fuzz
+
 WORKDIR /root/pytorch
 
 RUN pip install -r requirements.txt  && \
@@ -10,8 +15,8 @@ RUN pip install -r requirements.txt  && \
     -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_BUILD_TYPE=Debug \
     -DDEBUG=1 \
-    -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link  -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-error " \
-    -DCMAKE_C_FLAGS="-fsanitize=fuzzer-no-link  -Wno-error " \
+    -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link  -fno-omit-frame-pointer  -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-error " \
+    -DCMAKE_C_FLAGS="-fsanitize=fuzzer-no-link  -fno-omit-frame-pointer  -Wno-error " \
     -DUSE_NCCL=0 \
     -DUSE_CUDA=0 \
     -DUSE_KINETO=0 \
@@ -23,3 +28,12 @@ RUN pip install -r requirements.txt  && \
     .. && \
     make -j$(nproc) 
 
+COPY scripts /root/fuzz/
+
+WORKDIR /root/fuzz
+
+RUN  python3 -u build_test_harness.py --dll torch --mode fuzz
+
+WORKDIR /root
+
+CMD ["bash"]
