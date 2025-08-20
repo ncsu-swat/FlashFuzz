@@ -11,3 +11,12 @@ docker build -t ncsuswat/flashfuzz:tf2.16-fuzz -f docker/tf2.16-fuzz.Dockerfile 
 
 # tf 2.16-cov
 docker build -t ncsuswat/flashfuzz:tf2.16-cov -f docker/tf2.16-cov.Dockerfile .
+
+# torch 2.2
+docker build -t ncsuswat/flashfuzz:torch2.2-base -f docker/torch-2.2-base.Dockerfile .
+
+# torch 2.2-fuzz
+docker build -t ncsuswat/flashfuzz:torch2.2-fuzz -f docker/torch-2.2-fuzz.Dockerfile .
+
+# torch 2.2-cov
+docker build -t ncsuswat/flashfuzz:torch2.2-cov -f docker/torch-2.2-cov.Dockerfile .

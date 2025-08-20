@@ -213,4 +213,5 @@ __marimo__/
 _fuzz_result
 _cov_result
 __fuzz_result
-.vscode/settings.json
+
+.vscode
