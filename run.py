@@ -152,7 +152,67 @@ def main():
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()
-                
+    elif args.dll == "torch":
+        if args.mode == "fuzz":
+            if args.check_valid:
+                exp = Experiment(
+                    dll=args.dll,
+                    mode=args.mode,
+                    ver=args.version,
+                    api="all",
+                    cpus=args.num_parallel,
+                    mem=args.mem,
+                    check_valid=True,
+                )
+                scheduler.add_experiment(exp)
+            else:
+                for api in apis:
+                    exp = Experiment(
+                        dll=args.dll,
+                        mode=args.mode,
+                        ver=args.version,
+                        api=api,
+                        cpus=args.num_parallel,
+                        time_budget=args.time_budget,
+                    )
+                    scheduler.add_experiment(exp)
+        if args.mode == "cov":
+            if args.check_valid:
+                exp = Experiment(
+                    dll=args.dll,
+                    mode=args.mode,
+                    ver=args.version,
+                    api="all",
+                    cpus=args.num_parallel,
+                    mem=args.mem,
+                    check_valid=True,
+                )
+                scheduler.add_experiment(exp)
+            else:
+                for api in apis:
+                    exp = Experiment(
+                        dll=args.dll,
+                        mode=args.mode,
+                        ver=args.version,
+                        api=api,
+                        cpus=args.num_parallel,
+                        time_budget=args.time_budget,
+                        itv=args.itv,
+                    )
+                    scheduler.add_experiment(exp)
+                scheduler.run_all()
+
+                exp = Experiment(
+                    dll=args.dll,
+                    mode=args.mode,
+                    ver=args.version,
+                    api="all",
+                    cpus=args.num_parallel,
+                    time_budget=args.time_budget,
+                    itv=args.itv,
+                )
+                exp.merge_coverage_files()
+                exp.get_coverage_results()
 
     scheduler.run_all()
     

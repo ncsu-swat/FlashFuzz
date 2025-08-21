@@ -1,5 +1,5 @@
 clang++ -fsanitize=fuzzer \
-         -fno-omit-frame-pointer  -fprofile-instr-generate -fcoverage-mapping \
+         -fno-omit-frame-pointer \
          -O0 -g -Werror \
          -I/root/pytorch/build-fuzz/include \
          -I/root/pytorch/aten/src \
@@ -24,3 +24,10 @@ clang++ -fsanitize=fuzzer \
          -ltorch -ltorch_cpu  \
           -lc10 \
          -o fuzz
+
+if [ $? -ne 0 ]; then
+    echo "Error: Compilation failed!"
+    exit 1
+fi
+
+python3 random_seed.py

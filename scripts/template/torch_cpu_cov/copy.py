@@ -16,21 +16,6 @@ def replace_file_content(file_path: str, old_content: str, new_content: str) -> 
 
         if old_content in content:
             content = content.replace(old_content, new_content)
-
-        with open(file_path, "w") as file:
-            file.write(content)
-
-        print(f"Updated {file_path}")
-    except Exception as e:
-        print(f"Error updating {file_path}: {e}")
-
-
-def copy_fuzz_utils(time_budget: int = 180):
-    """
-    Copy fuzz_utils.h and fuzz_utils.cpp to every subdirectory
-    that starts with 'torch', overwriting existing files.
-    """
-    # Source files
     fuzz_sh = "fuzz.sh"
     build_sh = "build.sh"
     random_seed = "random_seed.py"
@@ -98,3 +83,19 @@ if __name__ == "__main__":
         print("Done!")
     else:
         print("Operation failed!")
+ntent)
+
+        with open(file_path, "w") as file:
+            file.write(content)
+
+        print(f"Updated {file_path}")
+    except Exception as e:
+        print(f"Error updating {file_path}: {e}")
+
+
+def copy_fuzz_utils(time_budget: int = 180):
+    """
+    Copy fuzz_utils.h and fuzz_utils.cpp to every subdirectory
+    that starts with 'torch', overwriting existing files.
+    """
+    # Source files

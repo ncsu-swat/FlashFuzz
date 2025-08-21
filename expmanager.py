@@ -260,6 +260,51 @@ class Experiment():
         except Exception:
             self.status = Status.FAILED
 
+    # --- torch support ---
+    def torch_fuzz(self):
+        self.status = Status.RUNNING
+        try:
+            self.check_image()
+            self.start_docker_container()
+            self.execute_command(f"cd /root/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --ver {self.ver} --time_budget {self.time_budget} --no-compile")
+            self.execute_command(f"cd /root/fuzz/{self.api} && bash fuzz.sh > execution.log")
+            self.copy_results_from_container(f"/root/fuzz/{self.api}/execution.log", self.result_dir)
+            self.copy_results_from_container(f"/root/fuzz/{self.api}/fuzz-0.log", self.result_dir)
+            self.copy_results_from_container(f"/root/fuzz/{self.api}/corpus", self.result_dir)
+            self.status = Status.COMPLETED
+        except Exception:
+            self.status = Status.FAILED
+
+    def torch_check_valid(self):
+        self.status = Status.RUNNING
+        try:
+            self.check_image()
+            self.start_docker_container()
+            self.execute_command(f"cd /root/fuzz/ && python3 -u build_test_harness.py --dll {self.dll} --mode {self.mode} --check_build > check.log")
+            self.copy_results_from_container(f"/root/fuzz/{self.api}", f"{self.result_dir}/{self.api}")
+            os.makedirs(f"{self.result_dir}/build_status", exist_ok=True)
+            self.copy_results_from_container(f"/root/fuzz/success_apis.txt", f"{self.result_dir}/build_status/")
+            self.copy_results_from_container(f"/root/fuzz/fail_apis.txt", f"{self.result_dir}/build_status/")
+            self.copy_results_from_container(f"/root/fuzz/build_summary.txt", f"{self.result_dir}/build_status/")
+            self.copy_results_from_container(f"/root/fuzz/check.log", f"{self.result_dir}/build_status/")
+            with open(f"{self.result_dir}/build_status/build_summary.txt", "r") as f:
+                summary = f.read()
+                print(f"Build Summary: {summary}")
+            self.status = Status.COMPLETED
+        except Exception:
+            self.status = Status.FAILED
+
+    def torch_cov_api(self):
+        self.status = Status.RUNNING
+        try:
+            self.check_image()
+            self.start_docker_container()
+            self.execute_command(f"cd /root/fuzz/{self.api}  && python3 coverage_fuzzing.py --interval {self.itv} --max-time {self.time_budget} --api {self.api}")
+            self.copy_results_from_container(f"/root/fuzz/{self.api}/coverage_data", f"{self.result_dir}/coverage_data")
+            self.status = Status.COMPLETED
+        except Exception:
+            self.status = Status.FAILED
+
     def merge_coverage_files(self) -> None:
         print("Merging coverage files...")
         output_dir = f"{self.result_dir}/all"
@@ -272,33 +317,32 @@ class Experiment():
             interval_dir = os.path.join(output_dir, interval_name)
             os.makedirs(interval_dir, exist_ok=True)
 
-
-            tf_dirs = glob.glob(f"{self.result_dir}/tf.*")
-            if not tf_dirs:
-                print("No TensorFlow API directories found.")
+            api_dirs = glob.glob(f"{self.result_dir}/{self.dll}.*")
+            if not api_dirs:
+                print(f"No {self.dll} API directories found.")
                 return
-            for tf_dir in tf_dirs:
-                # copy the profraw files from each API directory
-                profraw_file = os.path.join(tf_dir, "coverage_data", f"{interval_name}", "*.profraw")
+            for api_dir in api_dirs:
+                profraw_file = os.path.join(api_dir, "coverage_data", f"{interval_name}", "*.profraw")
                 profraw_files = glob.glob(profraw_file)
-                if not interval_name:
-                    print(f"No profraw files found for {tf_dir} in interval {interval_name}.")
+                if not profraw_files:
+                    print(f"No profraw files found for {api_dir} in interval {interval_name}.")
                     continue
                 for profraw in profraw_files:
                     shutil.copy2(profraw, interval_dir)
                     print(f"Copied {profraw} to {interval_dir}")
-            # start the docker to merge the profraw files
+            # Merge inside container; choose base_root by dll
+            base_root = "/root/tensorflow/fuzz" if self.dll == "tf" else "/root/fuzz"
             try:
                 self.check_image()
                 self.start_docker_container()
-                self.copy_files_to_container(f"{output_dir}/{interval_name}", "/root/tensorflow/fuzz/")
+                self.copy_files_to_container(f"{output_dir}/{interval_name}", f"{base_root}/")
                 if previous_interval_name:
-                    self.copy_files_to_container(f"{output_dir}/{previous_interval_name}", f"/root/tensorflow/fuzz/{previous_interval_name}")
+                    self.copy_files_to_container(f"{output_dir}/{previous_interval_name}", f"{base_root}/{previous_interval_name}")
                 if not previous_interval_name:
-                    self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 merge_profraw.py --dll tf --dir {interval_name}")
+                    self.execute_command(f"cd {base_root} && python3 merge_profraw.py --dll {self.dll} --dir {interval_name}")
                 else:
-                    self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 merge_profraw.py --dll tf --dir {interval_name} --previous {previous_interval_name}/merged.profdata")
-                self.copy_results_from_container(f"/root/tensorflow/fuzz/{interval_name}/merged.profdata", f"{interval_dir}/merged.profdata")
+                    self.execute_command(f"cd {base_root} && python3 merge_profraw.py --dll {self.dll} --dir {interval_name} --previous {previous_interval_name}/merged.profdata")
+                self.copy_results_from_container(f"{base_root}/{interval_name}/merged.profdata", f"{interval_dir}/merged.profdata")
                 previous_interval_name = interval_name
                 # delete the profraw files to save space
                 profraw_files = glob.glob(os.path.join(interval_dir, "*.profraw"))
@@ -332,14 +376,18 @@ class Experiment():
                 print(f"No merged.profdata file found for interval {interval_name}.")
                 continue
 
-            # start the docker to merge the profraw files
+            # Run results extraction inside container; choose base_root by dll
+            base_root = "/root/tensorflow/fuzz" if self.dll == "tf" else "/root/fuzz"
             try:
                 self.check_image()
                 self.start_docker_container()
-                self.copy_files_to_container(merged_profdata_file, "/root/tensorflow/fuzz/")
-                self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1  --require  tensorflow/core/kernels  --coverage_file  merged.profdata --out {interval_name}.txt")
-                self.copy_results_from_container(f"/root/tensorflow/fuzz/{interval_name}.txt", f"{output_dir}/{interval_name}.txt")
-                self.copy_results_from_container(f"/root/tensorflow/fuzz/coverage_html", f"{interval_dir}/coverage_html")
+                self.copy_files_to_container(merged_profdata_file, f"{base_root}/")
+                if self.dll == "tf":
+                    self.execute_command(f"cd {base_root} && python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 --require tensorflow/core/kernels --coverage_file merged.profdata --out {interval_name}.txt")
+                else:
+                    self.execute_command(f"cd {base_root} && python3 get_coverage_results.py --dll torch --coverage_file merged.profdata --out {interval_name}.txt")
+                self.copy_results_from_container(f"{base_root}/{interval_name}.txt", f"{output_dir}/{interval_name}.txt")
+                self.copy_results_from_container(f"{base_root}/coverage_html", f"{interval_dir}/coverage_html")
                 # remove merged_profdata_file to save space
                 os.remove(merged_profdata_file)
             except KeyboardInterrupt:
@@ -380,6 +428,14 @@ class Experiment():
             elif self.mode == "cov":
                 if self.api != "all":
                     self.tf_cov_api()
+        elif self.dll == "torch":
+            if self.check_valid:
+                self.torch_check_valid()
+            elif self.mode == "fuzz":
+                self.torch_fuzz()
+            elif self.mode == "cov":
+                if self.api != "all":
+                    self.torch_cov_api()
 
 class Scheduler():
     def __init__(self, num_parallel: int = 1):
