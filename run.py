@@ -62,6 +62,13 @@ def parse_args():
         help="specify baselines(e.g., pathfinder)"
     )
 
+    parser.add_argument(
+        "--debug",
+        required=False,
+        action="store_true",
+        help="Enable debug mode",
+    )
+
     # TODO: Add `--crash-report`, `--compilation-check`, and `--validation` arguments
 
     args = parser.parse_args()
@@ -102,6 +109,7 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
+                    debug=args.debug
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -112,7 +120,8 @@ def main():
                         ver=args.version,
                         api=api,
                         cpus=args.num_parallel,
-                        time_budget=args.time_budget
+                        time_budget=args.time_budget,
+                        debug=args.debug
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -125,6 +134,7 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
+                    debug=args.debug
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -136,7 +146,8 @@ def main():
                         api=api,
                         cpus=args.num_parallel,
                         time_budget=args.time_budget,
-                        itv=args.itv
+                        itv=args.itv,
+                        debug=args.debug
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -148,7 +159,8 @@ def main():
                     api="all",
                     cpus=args.num_parallel,
                     time_budget=args.time_budget,
-                    itv=args.itv
+                    itv=args.itv,
+                    debug=args.debug
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()
@@ -163,6 +175,7 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
+                    debug=args.debug
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -174,6 +187,7 @@ def main():
                         api=api,
                         cpus=args.num_parallel,
                         time_budget=args.time_budget,
+                        debug=args.debug
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -186,6 +200,7 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
+                    debug=args.debug
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -198,6 +213,7 @@ def main():
                         cpus=args.num_parallel,
                         time_budget=args.time_budget,
                         itv=args.itv,
+                        debug=args.debug
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -210,6 +226,7 @@ def main():
                     cpus=args.num_parallel,
                     time_budget=args.time_budget,
                     itv=args.itv,
+                    debug=args.debug
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()

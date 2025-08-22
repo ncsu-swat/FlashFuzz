@@ -36,7 +36,7 @@ def loop_until_ctrl_c(callback: Optional[Callable[[], None]] = None, interval: f
 
 
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False):
         self.dll = dll
         self.mode = mode
         self.ver = ver
@@ -50,6 +50,7 @@ class Experiment():
         self.container_name = f"{self.api}_{self.dll}{self.ver}_{self.mode}"
         self.container_id = None
         self.itv = itv
+        self.debug = debug
         if self.api == "all":
             self.result_dir = f"./_{self.mode}_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s/"
         else:
@@ -346,8 +347,9 @@ class Experiment():
                 previous_interval_name = interval_name
                 # delete the profraw files to save space
                 profraw_files = glob.glob(os.path.join(interval_dir, "*.profraw"))
-                for profraw_file in profraw_files:
-                    os.remove(profraw_file)
+                if not self.debug:
+                    for profraw_file in profraw_files:
+                        os.remove(profraw_file)
             except KeyboardInterrupt:
                 print(f"\nKeyboard interrupt received.")
             except Exception as e:
@@ -382,14 +384,16 @@ class Experiment():
                 self.check_image()
                 self.start_docker_container()
                 self.copy_files_to_container(merged_profdata_file, f"{base_root}/")
+                loop_until_ctrl_c()
                 if self.dll == "tf":
-                    self.execute_command(f"cd {base_root} && python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 --require tensorflow/core/kernels --coverage_file merged.profdata --out {interval_name}.txt")
+                    self.execute_command(f"cd {base_root} &&  python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 --dll {self.dll} --require tensorflow/core/kernels --coverage_file merged.profdata --out {interval_name}.txt")
                 else:
-                    self.execute_command(f"cd {base_root} && python3 get_coverage_results.py --dll torch --coverage_file merged.profdata --out {interval_name}.txt")
+                    self.execute_command(f"cd {base_root} &&  python3 get_coverage_results.py --binary /root/pytorch/build-fuzz/lib/libtorch_cpu.so  --dll {self.dll} --require aten/src/ATen --coverage_file merged.profdata --out {interval_name}.txt")
                 self.copy_results_from_container(f"{base_root}/{interval_name}.txt", f"{output_dir}/{interval_name}.txt")
                 self.copy_results_from_container(f"{base_root}/coverage_html", f"{interval_dir}/coverage_html")
                 # remove merged_profdata_file to save space
-                os.remove(merged_profdata_file)
+                if not self.debug:
+                    os.remove(merged_profdata_file)
             except KeyboardInterrupt:
                 print(f"\nKeyboard interrupt received.")
             except Exception as e:

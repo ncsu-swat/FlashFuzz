@@ -41,7 +41,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN update-alternatives --install /usr/bin/ld ld /usr/bin/lld 20
 
 # Install Python requirements
-RUN python3 -m pip install --upgrade pip setuptools wheel \
+RUN python3 -m pip install --upgrade pip setuptools wheel bs4 \
     && pip install numpy==1.23.5 typing-extensions
 
 # Set the working directory

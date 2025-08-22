@@ -7,6 +7,8 @@ import re
 from typing import List, Tuple, cast
 
 from bs4 import BeautifulSoup
+from typing import List, Tuple
+from bs4.element import Tag
 
 
 def extract_coverage_data(html_content: str,
@@ -26,13 +28,16 @@ def extract_coverage_data(html_content: str,
     sum_tot = 0
 
     for row in rows:
-        tds = row.find_all('td')
+        if not isinstance(row, Tag):
+            continue
+
+        tds = [td for td in row.find_all('td') if isinstance(td, Tag)]
         # Need at least 5 columns because we use index 4
         if len(tds) < 5:
             continue
 
         link = tds[0].find('a')
-        if not link:
+        if not isinstance(link, Tag):
             continue
 
         path = link.get_text(strip=True)
@@ -71,8 +76,8 @@ def main():
     parser.add_argument(
         "--require",
         action="append",
-        default=["tensorflow/core/kernels"],
-        help="Substring that must appear in file path (repeatable, default: tensorflow/core/kernels)."
+        default=[""],
+        help="Substring that must appear in file path (repeatable)."
     )
     parser.add_argument(
         "--html-dir",
@@ -88,6 +93,12 @@ def main():
         "--keep-html",
         action="store_true",
         help="Keep existing HTML if already present (skip regeneration)."
+    )
+    parser.add_argument(
+        "--dll",
+        required=True,
+        type=str,
+        help="Specify the DLL name. (e.g., torch, tf)"
     )
     args = parser.parse_args()
 
