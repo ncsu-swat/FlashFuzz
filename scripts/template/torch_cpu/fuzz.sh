@@ -5,6 +5,13 @@ WORKERS=2
 MAX_LEN=65536
 RSS_LIMIT=2048
 
+if [ ! -f "fuzz" ]; then
+  echo "Error: Fuzzer executable not found!" 
+  exit 1
+fi
+
+python3 random_seed.py
+
 ./fuzz ./corpus \
   -jobs=$JOBS \
   -workers=$WORKERS \
@@ -21,3 +28,5 @@ RSS_LIMIT=2048
   -len_control=0 \
   -max_total_time={time_budget} \ 
   -print_final_stats=1
+
+echo "Fuzzing completed."

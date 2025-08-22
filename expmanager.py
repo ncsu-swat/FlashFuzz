@@ -225,7 +225,7 @@ class Experiment():
             self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && bash fuzz.sh > execution.log")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
-            self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/corpus", self.result_dir)
+            # self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/corpus", self.result_dir)
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED
@@ -270,7 +270,7 @@ class Experiment():
             self.execute_command(f"cd /root/fuzz/{self.api} && bash fuzz.sh > execution.log")
             self.copy_results_from_container(f"/root/fuzz/{self.api}/execution.log", self.result_dir)
             self.copy_results_from_container(f"/root/fuzz/{self.api}/fuzz-0.log", self.result_dir)
-            self.copy_results_from_container(f"/root/fuzz/{self.api}/corpus", self.result_dir)
+            # self.copy_results_from_container(f"/root/fuzz/{self.api}/corpus", self.result_dir)
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED
