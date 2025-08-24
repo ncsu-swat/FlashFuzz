@@ -384,7 +384,7 @@ class Experiment():
                 self.check_image()
                 self.start_docker_container()
                 self.copy_files_to_container(merged_profdata_file, f"{base_root}/")
-                loop_until_ctrl_c()
+                # loop_until_ctrl_c()
                 if self.dll == "tf":
                     self.execute_command(f"cd {base_root} &&  python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 --dll {self.dll} --require tensorflow/core/kernels --coverage_file merged.profdata --out {interval_name}.txt")
                 else:
