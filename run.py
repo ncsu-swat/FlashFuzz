@@ -69,6 +69,13 @@ def parse_args():
         help="Enable debug mode",
     )
 
+    parser.add_argument(
+        "--slurm",
+        required=False,
+        action="store_true",
+        help="Enable SLURM mode, set cpu set to slurm cpu for docker",
+    )
+
     # TODO: Add `--crash-report`, `--compilation-check`, and `--validation` arguments
 
     args = parser.parse_args()
@@ -109,7 +116,8 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
-                    debug=args.debug
+                    debug=args.debug,
+                    slurm=args.slurm,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -121,7 +129,8 @@ def main():
                         api=api,
                         cpus=args.num_parallel,
                         time_budget=args.time_budget,
-                        debug=args.debug
+                        debug=args.debug,
+                        slurm=args.slurm,
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -134,7 +143,8 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
-                    debug=args.debug
+                    debug=args.debug,
+                    slurm=args.slurm,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -147,7 +157,8 @@ def main():
                         cpus=args.num_parallel,
                         time_budget=args.time_budget,
                         itv=args.itv,
-                        debug=args.debug
+                        debug=args.debug,
+                        slurm=args.slurm,
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -160,7 +171,8 @@ def main():
                     cpus=args.num_parallel,
                     time_budget=args.time_budget,
                     itv=args.itv,
-                    debug=args.debug
+                    debug=args.debug,
+                    slurm=args.slurm,
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()
@@ -175,7 +187,8 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
-                    debug=args.debug
+                    debug=args.debug,
+                    slurm=args.slurm,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -187,7 +200,8 @@ def main():
                         api=api,
                         cpus=args.num_parallel,
                         time_budget=args.time_budget,
-                        debug=args.debug
+                        debug=args.debug,
+                        slurm=args.slurm,
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -200,7 +214,8 @@ def main():
                     cpus=args.num_parallel,
                     mem=args.mem,
                     check_valid=True,
-                    debug=args.debug
+                    debug=args.debug,
+                    slurm=args.slurm,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -213,7 +228,8 @@ def main():
                         cpus=args.num_parallel,
                         time_budget=args.time_budget,
                         itv=args.itv,
-                        debug=args.debug
+                        debug=args.debug,
+                        slurm=args.slurm,
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -226,7 +242,8 @@ def main():
                     cpus=args.num_parallel,
                     time_budget=args.time_budget,
                     itv=args.itv,
-                    debug=args.debug
+                    debug=args.debug,
+                    slurm=args.slurm,
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()

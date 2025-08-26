@@ -37,7 +37,7 @@ def loop_until_ctrl_c(callback: Optional[Callable[[], None]] = None, interval: f
 
 
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False, slurm: bool = False):
         self.dll = dll
         self.mode = mode
         self.ver = ver
@@ -52,6 +52,7 @@ class Experiment():
         self.container_id = None
         self.itv = itv
         self.debug = debug
+        self.slurm = slurm
         if self.api == "all":
             self.result_dir = f"./_{self.mode}_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s/"
         else:
@@ -156,9 +157,72 @@ class Experiment():
             print(f"Stderr: {e.stderr}")
             raise
 
+    def _get_allowed_cpus_list(self) -> Optional[str]:
+        """Return the current process CPU allow-list in Linux format (e.g., '0-3,8-11')."""
+        try:
+            with open("/proc/self/status", "r") as f:
+                for line in f:
+                    if line.startswith("Cpus_allowed_list:"):
+                        return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        # Fallback: try cgroup v2 effective cpus
+        for path in [
+            "/sys/fs/cgroup/cpuset.cpus.effective",
+            "/sys/fs/cgroup/cpuset/cpuset.cpus",
+        ]:
+            try:
+                if os.path.exists(path):
+                    content = open(path, "r").read().strip()
+                    if content:
+                        return content
+            except Exception:
+                continue
+        return None
+
+    def _count_cpus_in_list(self, cpu_list: str) -> int:
+        total = 0
+        for part in cpu_list.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-", 1)
+                try:
+                    start = int(a)
+                    end = int(b)
+                    if end >= start:
+                        total += (end - start + 1)
+                except ValueError:
+                    continue
+            else:
+                try:
+                    int(part)
+                    total += 1
+                except ValueError:
+                    continue
+        return total
+
     def start_docker_container(self):
-        # cmd = f"docker run -itd --cpus {self.cpus} -m {self.mem}g --name {self.container_name} {self.image_name}"
-        cmd = f"docker run -itd --cpus {self.cpus} --name {self.container_name} {self.image_name}"
+        # Build docker run command with optional SLURM-aware CPU pinning
+        base_cmd = f"docker run -itd --name {self.container_name}"
+        extra = []
+        if self.slurm:
+            cpus_list = self._get_allowed_cpus_list()
+            if cpus_list:
+                extra.append(f"--cpuset-cpus {cpus_list}")
+                # Optionally also set --cpus to the allowed count for fairness
+                try:
+                    count = self._count_cpus_in_list(cpus_list)
+                    if count > 0:
+                        extra.append(f"--cpus {count}")
+                except Exception:
+                    pass
+        else:
+            extra.append(f"--cpus {self.cpus}")
+        # Memory limit is currently not enforced; uncomment to enable:
+        # extra.append(f"-m {self.mem}g")
+        cmd = f"{base_cmd} {' '.join(extra)} {self.image_name}"
         try:
             subprocess.run(cmd, shell=True, check=True)
             print(f"Started container {self.container_name}.")
