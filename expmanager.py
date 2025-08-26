@@ -8,6 +8,7 @@ import shutil
 import time
 from typing import Callable, Optional
 import re
+import threading
 
 class Status(enum.Enum):
     NOT_STARTED = "not_started"
@@ -197,6 +198,19 @@ class Experiment():
             print(f"Failed to remove container {self.container_name}.")
             print(f"Stderr: {e.stderr}")
             raise
+
+    def force_remove_container(self):
+        """
+        Force kill and remove the container along with anonymous volumes.
+        This will not raise on failure; it's a best-effort cleanup.
+        """
+        cmd = f"docker rm -f -v {self.container_name}"
+        try:
+            subprocess.run(cmd, shell=True, check=False, capture_output=True, text=True)
+            print(f"Force removed container {self.container_name} (if it existed).")
+        except Exception:
+            # Best-effort; ignore any errors
+            pass
 
     def copy_results_from_container(self, src: str, dest: str):
         cmd = f"docker cp {self.container_name}:{src} {dest}"
@@ -451,6 +465,29 @@ class Scheduler():
 
     def _run_experiment(self, exp: Experiment):
         """Helper function to run a single experiment and handle cleanup."""
+        # Watchdog: hard stop at 2x time budget to avoid hanging containers
+        timeout_seconds = None if exp.check_valid else max(1, int(2 * getattr(exp, "time_budget", 180)))
+        cancel_event = threading.Event()
+
+        def watchdog():
+            if timeout_seconds is None:
+                return
+            # Wait for either completion signal or timeout
+            triggered = not cancel_event.wait(timeout=timeout_seconds)
+            if triggered:
+                # Only act if not already completed
+                if exp.status not in (Status.COMPLETED,):
+                    print(f"Time budget exceeded for {exp.api} (>{timeout_seconds}s). Forcing docker cleanup...")
+                    try:
+                        exp.force_remove_container()
+                    finally:
+                        # Mark as failed due to timeout if not already set
+                        if exp.status != Status.COMPLETED:
+                            exp.status = Status.FAILED
+
+        wd_thread = threading.Thread(target=watchdog, name=f"wd-{exp.container_name}", daemon=True)
+        wd_thread.start()
+
         try:
             print(f"Running experiment for {exp.api}...")
             exp.run()
@@ -462,11 +499,17 @@ class Scheduler():
             print(f"\nKeyboard interrupt received. Cleaning up experiment for {exp.api}...")
             exp.status = Status.FAILED
         finally:
+            # Cancel watchdog and cleanup container
+            cancel_event.set()
             try:
                 exp.stop_docker_container()
                 exp.remove_docker_container()
             except Exception:
-                pass
+                # Fall back to force remove in case normal stop/rm fails
+                try:
+                    exp.force_remove_container()
+                except Exception:
+                    pass
         return exp.api, exp.status
 
     def run_all(self):
