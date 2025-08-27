@@ -466,7 +466,7 @@ class Experiment():
                 if self.dll == "tf":
                     self.execute_command(f"cd {base_root} &&  python3 get_coverage_results.py --binary /root/tensorflow/bazel-bin/tensorflow/libtensorflow_cc.so.2.16.1 --dll {self.dll} --require tensorflow/core/kernels --coverage_file merged.profdata --out {interval_name}.txt")
                 else:
-                    self.execute_command(f"cd {base_root} &&  python3 get_coverage_results.py --binary /root/pytorch/build-fuzz/lib/libtorch_cpu.so  --dll {self.dll} --require aten/src/ATen --coverage_file merged.profdata --out {interval_name}.txt")
+                    self.execute_command(f"cd {base_root} &&  python3 get_coverage_results.py --binary /root/pytorch/build-fuzz/lib/libtorch_cpu.so  --dll {self.dll} --require aten/src/ATen/native --coverage_file merged.profdata --out {interval_name}.txt")
                 self.copy_results_from_container(f"{base_root}/{interval_name}.txt", f"{output_dir}/{interval_name}.txt")
                 self.copy_results_from_container(f"{base_root}/coverage_html", f"{interval_dir}/coverage_html")
                 # remove merged_profdata_file to save space

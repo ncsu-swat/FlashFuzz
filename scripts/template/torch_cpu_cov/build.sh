@@ -1,5 +1,7 @@
 clang++ -fsanitize=fuzzer \
          -fno-omit-frame-pointer \
+        -fprofile-instr-generate \
+        -fcoverage-mapping \
          -O0 -g -Werror \
          -I/root/pytorch/build-fuzz/include \
          -I/root/pytorch/aten/src \

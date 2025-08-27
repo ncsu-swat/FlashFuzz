@@ -1,8 +1,8 @@
 #!/bin/bash
 
 JOBS=1
-WORKERS=2
-MAX_LEN=65536
+WORKERS=1
+MAX_LEN=2048
 RSS_LIMIT=2048
 
 if [ ! -f "fuzz" ]; then
@@ -19,7 +19,7 @@ python3 random_seed.py
   -prefer_small=0 \
   -rss_limit_mb=$RSS_LIMIT \
   -use_value_profile=1 \
-  -mutate_depth=100 \
+  -mutate_depth=1000 \
   -entropic=1 \
   -use_counters=1 \
   -cross_over=1 \

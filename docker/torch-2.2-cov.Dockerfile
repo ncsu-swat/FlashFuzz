@@ -15,8 +15,8 @@ RUN pip install -r requirements.txt  && \
     -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_BUILD_TYPE=Debug \
     -DDEBUG=1 \
-    -DCMAKE_CXX_FLAGS="-fsanitize=fuzzer-no-link  -fno-omit-frame-pointer  -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-error -fprofile-instr-generate -fcoverage-mapping " \
-    -DCMAKE_C_FLAGS="-fsanitize=fuzzer-no-link  -fno-omit-frame-pointer  -Wno-error -fprofile-instr-generate -fcoverage-mapping" \
+    -DCMAKE_CXX_FLAGS="-O0 -g -fsanitize=fuzzer-no-link  -fno-omit-frame-pointer  -D_GLIBCXX_USE_CXX11_ABI=1 -Wno-error -fprofile-instr-generate -fcoverage-mapping " \
+    -DCMAKE_C_FLAGS="-O0 -g -fsanitize=fuzzer-no-link  -fno-omit-frame-pointer  -Wno-error -fprofile-instr-generate -fcoverage-mapping" \
     -DUSE_NCCL=0 \
     -DUSE_CUDA=0 \
     -DUSE_KINETO=0 \
