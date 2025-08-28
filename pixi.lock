@@ -42,7 +42,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/linux-64/tk-8.6.13-noxft_hd72426e_102.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tqdm-4.67.1-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/types-requests-2.32.4.20250611-pyhd8ed1ab_0.conda
-      - conda: https://conda.anaconda.org/conda-forge/noarch/types-tqdm-4.67.0.20250516-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/types-tqdm-4.67.0.20250809-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/typing-extensions-4.14.1-h4440ef1_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/typing_extensions-4.14.1-pyhe01879c_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2025b-h78e105d_0.conda
@@ -443,16 +443,16 @@ packages:
   license: Apache-2.0 AND MIT
   size: 26996
   timestamp: 1749646587012
-- conda: https://conda.anaconda.org/conda-forge/noarch/types-tqdm-4.67.0.20250516-pyhd8ed1ab_0.conda
-  sha256: c9b8c43449728c457b557062d0ec7979f5c321f4bb0c9b1c081bb859fae5ffc1
-  md5: 049d595986db559ac5b87a223eeea871
+- conda: https://conda.anaconda.org/conda-forge/noarch/types-tqdm-4.67.0.20250809-pyhd8ed1ab_0.conda
+  sha256: c181121ab45f6fa15bca0da0c30e94dcd08a0ab65e40afd92ca15570326421f8
+  md5: b21e9600b30c5dd4a4855d98889d9c73
   depends:
   - python >=3.9
   - types-requests
   license: Apache-2.0
   license_family: APACHE
-  size: 26683
-  timestamp: 1747494458754
+  size: 26466
+  timestamp: 1754757108681
 - conda: https://conda.anaconda.org/conda-forge/noarch/typing-extensions-4.14.1-h4440ef1_0.conda
   sha256: 349951278fa8d0860ec6b61fcdc1e6f604e6fce74fabf73af2e39a37979d0223
   md5: 75be1a943e0a7f99fcf118309092c635
