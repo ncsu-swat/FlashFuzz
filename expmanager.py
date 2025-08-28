@@ -37,7 +37,7 @@ def loop_until_ctrl_c(callback: Optional[Callable[[], None]] = None, interval: f
 
 
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False, slurm: bool = False):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False, slurm: bool = False, vs: Optional[str] = None):
         self.dll = dll
         self.mode = mode
         self.ver = ver
@@ -48,15 +48,22 @@ class Experiment():
         self.time_budget = time_budget
         self.status = Status.NOT_STARTED
         self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}"
-        self.container_name = f"{self.api}_{self.dll}{self.ver}_{self.mode}"
+        self.vs = vs
+        # include vs tag in container name if provided
+        self.container_name = (
+            f"{self.api}_{self.dll}{self.ver}_{self.mode}_{self.vs}"
+            if self.vs else f"{self.api}_{self.dll}{self.ver}_{self.mode}"
+        )
         self.container_id = None
         self.itv = itv
         self.debug = debug
         self.slurm = slurm
+        # result directory includes vs tag if provided to disambiguate baselines
+        vs_suffix = f"-{self.vs}" if self.vs else ""
         if self.api == "all":
-            self.result_dir = f"./_{self.mode}_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s/"
+            self.result_dir = f"./_{self.mode}_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s{vs_suffix}/"
         else:
-            self.result_dir = f"./_{self.mode}_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s/{self.api}/"
+            self.result_dir = f"./_{self.mode}_result/{self.dll}{self.ver}-{self.mode}-{self.time_budget}s{vs_suffix}/{self.api}/"
         self.check_image()
 
     def check_image(self):

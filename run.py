@@ -118,6 +118,7 @@ def main():
                     check_valid=True,
                     debug=args.debug,
                     slurm=args.slurm,
+                    vs=args.vs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -131,6 +132,7 @@ def main():
                         time_budget=args.time_budget,
                         debug=args.debug,
                         slurm=args.slurm,
+                        vs=args.vs,
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -145,6 +147,7 @@ def main():
                     check_valid=True,
                     debug=args.debug,
                     slurm=args.slurm,
+                    vs=args.vs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -159,6 +162,7 @@ def main():
                         itv=args.itv,
                         debug=args.debug,
                         slurm=args.slurm,
+                        vs=args.vs,
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -173,6 +177,7 @@ def main():
                     itv=args.itv,
                     debug=args.debug,
                     slurm=args.slurm,
+                    vs=args.vs,
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()
@@ -189,6 +194,7 @@ def main():
                     check_valid=True,
                     debug=args.debug,
                     slurm=args.slurm,
+                    vs=args.vs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -202,6 +208,7 @@ def main():
                         time_budget=args.time_budget,
                         debug=args.debug,
                         slurm=args.slurm,
+                        vs=args.vs,
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -216,6 +223,7 @@ def main():
                     check_valid=True,
                     debug=args.debug,
                     slurm=args.slurm,
+                    vs=args.vs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -230,6 +238,7 @@ def main():
                         itv=args.itv,
                         debug=args.debug,
                         slurm=args.slurm,
+                        vs=args.vs,
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -244,6 +253,7 @@ def main():
                     itv=args.itv,
                     debug=args.debug,
                     slurm=args.slurm,
+                    vs=args.vs,
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()
