@@ -311,7 +311,7 @@ class Experiment():
             self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && bash fuzz.sh > execution.log")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
-            # self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/corpus", self.result_dir)
+            self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/artifacts/", self.result_dir)
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED
@@ -353,10 +353,11 @@ class Experiment():
             self.check_image()
             self.start_docker_container()
             self.execute_command(f"cd /root/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --ver {self.ver} --time_budget {self.time_budget} --no-compile")
+            self.execute_command(f"mkdir -p /root/fuzz/{self.api}/artifacts")
             self.execute_command(f"cd /root/fuzz/{self.api} && bash fuzz.sh > execution.log")
             self.copy_results_from_container(f"/root/fuzz/{self.api}/execution.log", self.result_dir)
             self.copy_results_from_container(f"/root/fuzz/{self.api}/fuzz-0.log", self.result_dir)
-            # self.copy_results_from_container(f"/root/fuzz/{self.api}/corpus", self.result_dir)
+            self.copy_results_from_container(f"/root/fuzz/{self.api}/artifacts/", self.result_dir)
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED

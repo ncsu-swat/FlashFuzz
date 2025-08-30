@@ -28,6 +28,7 @@ cp /root/tensorflow/bazel-bin/tensorflow/libtensorflow_*.so* .
     -reduce_inputs=0 \
     -len_control=0 \
     -max_total_time={time_budget} \
-    -print_final_stats=1 
+    -print_final_stats=1 \
+    -artifact_prefix="./artifacts/"
 
 echo "Fuzzing completed."
