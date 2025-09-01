@@ -3,6 +3,9 @@
 # # tf 2.19
 docker build -t ncsuswat/flashfuzz:tf2.19-base -f docker/tf2.19-base.Dockerfile .
 
+# tf 2.19-fuzz
+docker build -t ncsuswat/flashfuzz:tf2.19-fuzz -f docker/tf2.19-fuzz.Dockerfile .
+
 # # tf 2.16
 docker build -t ncsuswat/flashfuzz:tf2.16-base -f docker/tf2.16-base.Dockerfile .
 
