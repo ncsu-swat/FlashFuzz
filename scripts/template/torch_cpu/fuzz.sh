@@ -11,7 +11,7 @@ if [ ! -f "fuzz" ]; then
 fi
 
 python3 random_seed.py
-
+mkdir -p artifacts
 ./fuzz ./corpus \
   -jobs=$JOBS \
   -workers=$WORKERS \

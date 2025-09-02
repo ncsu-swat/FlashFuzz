@@ -157,9 +157,12 @@ def check_torch_build() -> None:
 
 
 
-def build_tf_fuzz(time_budget: int=180, no_compile: bool=False) -> None:
+def build_tf_fuzz(time_budget: int=180, no_compile: bool=False, ver: Optional[str]=None) -> None:
     print("Building TensorFlow fuzz harness...")
-    os.system("cp -r template/tf_cpu/* .") # Copy all files from the template directory
+    if ver:
+        os.system(f"cp -r template/tf_cpu_{ver}/* .") # Copy all files from the template directory
+    else:
+        os.system("cp -r template/tf_cpu/* .") # Copy all files from the template directory
     os.system(f"python3 -u copy.py --time_budget {time_budget}") # Copy the fuzz.sh and build.sh files with proper settings
     if not no_compile:
         build_tf()
@@ -264,6 +267,12 @@ def main():
         action="store_true",
         help="Skip the compilation step. This is useful for testing configurations (e.g. time budget).",
     )
+    parser.add_argument(
+        "--ver",
+        type=str,
+        required=False,
+        help="Version of the library to use.",
+    )
     args = parser.parse_args()
 
     if args.dll == "tf" and args.mode == "cov":
@@ -275,7 +284,7 @@ def main():
         if args.check_build:
             check_tf_build()
         else:
-            build_tf_fuzz(no_compile=args.no_compile, time_budget=args.time_budget)
+            build_tf_fuzz(no_compile=args.no_compile, time_budget=args.time_budget, ver=args.ver)
     elif args.dll == "torch" and args.mode == "fuzz":
         if args.check_build:
             check_torch_build()

@@ -10,7 +10,7 @@ if [ ! -f "./fuzz" ]; then
   echo "Error: Fuzzer executable not found!" 
   exit 1
 fi
-
+mkdir -p artifacts
 ./fuzz ./corpus \
     -jobs=$JOBS \
     -workers=$WORKERS \

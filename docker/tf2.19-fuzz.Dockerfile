@@ -16,21 +16,29 @@ RUN cd /root/tensorflow && ./configure
 
 WORKDIR /root/tensorflow 
 
-RUN bazel build --copt=-g --copt=-O0 --copt="-Wno-error=c23-extensions" --copt=-fsanitize=fuzzer-no-link --linkopt=-fsanitize=fuzzer-no-link --linkopt=-L/usr/lib/clang/20/lib/linux --linkopt=-lclang_rt.fuzzer-x86_64 //tensorflow:tensorflow_cc
+RUN bazel build \
+    --strip=always \
+    --copt=-g0 \
+    --copt=-O0 \
+    --copt="-Wno-error=c23-extensions" \
+    --copt=-fsanitize=fuzzer-no-link \
+    --linkopt=-fsanitize=fuzzer-no-link \
+    --linkopt=-L/usr/lib/clang/20/lib/linux \
+    --linkopt=-lclang_rt.fuzzer-x86_64 \
+    //tensorflow:tensorflow_cc
+
+
+RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
+        ln -s libtensorflow_cc.so.2.19.0 libtensorflow_cc.so && \
+        ln -s libtensorflow_cc.so.2.19.0 libtensorflow_cc.so.2 && \
+        ln -s libtensorflow_framework.so.2.19.0 libtensorflow_framework.so.2 && \
+        ln -s libtensorflow_framework.so.2.19.0 libtensorflow_framework.so
+
+WORKDIR /root/tensorflow/fuzz
+COPY scripts/ .
+
+RUN  python3 -u build_test_harness.py --dll tf --mode fuzz --ver 2.19
+
+WORKDIR /root
 
 CMD [ "bash" ]
-
-# RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
-#         ln -s libtensorflow_cc.so.2.19.1 libtensorflow_cc.so && \
-#         ln -s libtensorflow_cc.so.2.19.1 libtensorflow_cc.so.2 && \
-#         ln -s libtensorflow_framework.so.2.19.1 libtensorflow_framework.so.2 && \
-#         ln -s libtensorflow_framework.so.2.19.1 libtensorflow_framework.so
-
-# WORKDIR /root/tensorflow/fuzz
-# COPY scripts/ .
-
-# RUN  python3 -u build_test_harness.py --dll tf --mode fuzz 
-
-# WORKDIR /root
-
-# CMD [ "bash" ]

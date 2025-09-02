@@ -11,9 +11,9 @@ RUN apt-get update && \
     lsb-release && \
     rm -rf /var/lib/apt/lists/*
 
-# Configure Ubuntu mirror
-RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirror.xtom.nl/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
-    sed -i 's|http://security.ubuntu.com/ubuntu|https://mirror.xtom.nl/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
+# # Configure Ubuntu mirror
+# RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirror.xtom.nl/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources && \
+#     sed -i 's|http://security.ubuntu.com/ubuntu|https://mirror.xtom.nl/ubuntu|g' /etc/apt/sources.list.d/ubuntu.sources
 
 # Install dependencies and required tools in a single RUN block to minimize layers
 RUN apt-get update && \
@@ -65,13 +65,13 @@ RUN wget https://apt.llvm.org/llvm.sh && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100 && \
     update-alternatives --install /usr/bin/ld ld /usr/bin/lld-20 100
 
-# Install CUDA and cuDNN dependencies
-RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
-    dpkg -i cuda-keyring_1.1-1_all.deb && \
-    apt-get update && \
-    apt-get install -y --no-install-recommends libcudnn9-dev-cuda-12 cuda-12-6 && \
-    rm cuda-keyring_1.1-1_all.deb && \
-    rm -rf /var/lib/apt/lists/*
+# # Install CUDA and cuDNN dependencies
+# RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \
+#     dpkg -i cuda-keyring_1.1-1_all.deb && \
+#     apt-get update && \
+#     apt-get install -y --no-install-recommends libcudnn9-dev-cuda-12 cuda-12-6 && \
+#     rm cuda-keyring_1.1-1_all.deb && \
+#     rm -rf /var/lib/apt/lists/*
 
 # Set up Python virtual environment
 RUN python3 -m venv /venv

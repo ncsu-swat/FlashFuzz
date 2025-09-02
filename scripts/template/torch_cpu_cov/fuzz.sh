@@ -18,7 +18,7 @@ fi
 
 mkdir -p corpus "${ART_PREFIX}"
 python3 random_seed.py
-
+mkdir -p artifacts
 # Optional sanitizer tweaks for stability in coverage mode
 export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0,allocator_may_return_null=1,abort_on_error=1,handle_abort=1}"
 export UBSAN_OPTIONS="${UBSAN_OPTIONS:-print_stacktrace=1,halt_on_error=1}"

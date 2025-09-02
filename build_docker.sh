@@ -23,3 +23,9 @@ docker build -t ncsuswat/flashfuzz:torch2.2-fuzz -f docker/torch-2.2-fuzz.Docker
 
 # torch 2.2-cov
 docker build -t ncsuswat/flashfuzz:torch2.2-cov -f docker/torch-2.2-cov.Dockerfile .
+
+# torch 2.7
+docker build -t ncsuswat/flashfuzz:torch2.7-base -f docker/torch-2.7-base.Dockerfile .
+
+# torch 2.7-fuzz
+docker build -t ncsuswat/flashfuzz:torch2.7-fuzz -f docker/torch-2.7-fuzz.Dockerfile .

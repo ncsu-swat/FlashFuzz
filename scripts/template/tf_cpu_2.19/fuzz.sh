@@ -12,6 +12,7 @@ fi
 
 python3 random_seed.py
 mkdir -p artifacts
+
 cp /root/tensorflow/bazel-bin/tensorflow/libtensorflow_*.so* .
 
 ./fuzz ./corpus \

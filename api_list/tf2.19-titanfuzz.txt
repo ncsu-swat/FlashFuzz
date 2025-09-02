@@ -30,7 +30,6 @@ tf.raw_ops.ApplyMomentum
 tf.raw_ops.ApplyProximalAdagrad
 tf.raw_ops.ApplyProximalGradientDescent
 tf.raw_ops.ApplyRMSProp
-tf.raw_ops.ApproxTopK
 tf.raw_ops.ApproximateEqual
 tf.raw_ops.ArgMax
 tf.raw_ops.ArgMin
@@ -78,9 +77,7 @@ tf.raw_ops.CheckNumericsV2
 tf.raw_ops.Cholesky
 tf.raw_ops.CholeskyGrad
 tf.raw_ops.ClipByValue
-tf.raw_ops.CollectiveAllToAllV2
 tf.raw_ops.CollectiveGatherV2
-tf.raw_ops.CollectiveReduceScatterV2
 tf.raw_ops.CombinedNonMaxSuppression
 tf.raw_ops.Complex
 tf.raw_ops.ComplexAbs
@@ -142,7 +139,6 @@ tf.raw_ops.Digamma
 tf.raw_ops.Dilation2D
 tf.raw_ops.Dilation2DBackpropFilter
 tf.raw_ops.Dilation2DBackpropInput
-tf.raw_ops.DisableCopyOnRead
 tf.raw_ops.Div
 tf.raw_ops.DivNoNan
 tf.raw_ops.DrawBoundingBoxes
@@ -201,9 +197,7 @@ tf.raw_ops.FusedResizeAndPadConv2D
 tf.raw_ops.GRUBlockCell
 tf.raw_ops.GRUBlockCellGrad
 tf.raw_ops.Gather
-tf.raw_ops.GatherNd
 tf.raw_ops.GatherV2
-tf.raw_ops.GetMinibatchesInCsrWithPhysicalReplica
 tf.raw_ops.GetSessionHandle
 tf.raw_ops.GetSessionHandleV2
 tf.raw_ops.GetSessionTensor
@@ -217,7 +211,6 @@ tf.raw_ops.HashTableV2
 tf.raw_ops.HistogramFixedWidth
 tf.raw_ops.HistogramSummary
 tf.raw_ops.IRFFT
-tf.raw_ops.IRFFTND
 tf.raw_ops.Identity
 tf.raw_ops.IdentityReader
 tf.raw_ops.If
@@ -238,7 +231,6 @@ tf.raw_ops.IsInf
 tf.raw_ops.IsNan
 tf.raw_ops.IsVariableInitialized
 tf.raw_ops.IteratorFromStringHandle
-tf.raw_ops.KMC2ChainInitialization
 tf.raw_ops.L2Loss
 tf.raw_ops.LMDBReader
 tf.raw_ops.LRN
@@ -314,7 +306,6 @@ tf.raw_ops.MutableHashTableOfTensors
 tf.raw_ops.MutexLock
 tf.raw_ops.MutexV2
 tf.raw_ops.Ndtri
-tf.raw_ops.NearestNeighbors
 tf.raw_ops.Neg
 tf.raw_ops.NextAfter
 tf.raw_ops.NextIteration
@@ -475,12 +466,9 @@ tf.raw_ops.ScatterNdUpdate
 tf.raw_ops.ScatterSub
 tf.raw_ops.ScatterUpdate
 tf.raw_ops.SegmentMax
-tf.raw_ops.SegmentMaxV2
 tf.raw_ops.SegmentMean
 tf.raw_ops.SegmentMin
-tf.raw_ops.SegmentMinV2
 tf.raw_ops.SegmentProd
-tf.raw_ops.SegmentProdV2
 tf.raw_ops.SegmentSum
 tf.raw_ops.Select
 tf.raw_ops.SelectV2
@@ -536,15 +524,12 @@ tf.raw_ops.SparseReorder
 tf.raw_ops.SparseReshape
 tf.raw_ops.SparseSegmentMean
 tf.raw_ops.SparseSegmentMeanGrad
-tf.raw_ops.SparseSegmentMeanGradV2
 tf.raw_ops.SparseSegmentMeanWithNumSegments
 tf.raw_ops.SparseSegmentSqrtN
 tf.raw_ops.SparseSegmentSqrtNGrad
-tf.raw_ops.SparseSegmentSqrtNGradV2
 tf.raw_ops.SparseSegmentSqrtNWithNumSegments
 tf.raw_ops.SparseSegmentSum
 tf.raw_ops.SparseSegmentSumGrad
-tf.raw_ops.SparseSegmentSumGradV2
 tf.raw_ops.SparseSegmentSumWithNumSegments
 tf.raw_ops.SparseSlice
 tf.raw_ops.SparseSliceGrad
@@ -618,12 +603,10 @@ tf.raw_ops.TensorListScatter
 tf.raw_ops.TensorListScatterV2
 tf.raw_ops.TensorListSetItem
 tf.raw_ops.TensorListSplit
-tf.raw_ops.TensorMapErase
 tf.raw_ops.TensorScatterAdd
 tf.raw_ops.TensorScatterMax
 tf.raw_ops.TensorScatterMin
 tf.raw_ops.TensorScatterSub
-tf.raw_ops.TensorScatterUpdate
 tf.raw_ops.TensorStridedSliceUpdate
 tf.raw_ops.TextLineReader
 tf.raw_ops.Tile
@@ -637,7 +620,6 @@ tf.raw_ops.TruncatedNormal
 tf.raw_ops.UnicodeScript
 tf.raw_ops.UnicodeTranscode
 tf.raw_ops.UniformCandidateSampler
-tf.raw_ops.UniformQuantizedDot
 tf.raw_ops.Unique
 tf.raw_ops.UniqueV2
 tf.raw_ops.UniqueWithCounts
@@ -656,15 +638,6 @@ tf.raw_ops.While
 tf.raw_ops.WholeFileReader
 tf.raw_ops.WriteFile
 tf.raw_ops.Xdivy
-tf.raw_ops.XlaSparseCoreFtrl
-tf.raw_ops.XlaSparseCoreSgd
-tf.raw_ops.XlaSparseDenseMatmul
-tf.raw_ops.XlaSparseDenseMatmulGradWithAdagradAndStaticBufferSize
-tf.raw_ops.XlaSparseDenseMatmulGradWithAdamAndCsrInput
-tf.raw_ops.XlaSparseDenseMatmulGradWithAdamAndStaticBufferSize
-tf.raw_ops.XlaSparseDenseMatmulGradWithCsrInput
-tf.raw_ops.XlaSparseDenseMatmulGradWithFtrlAndCsrInput
-tf.raw_ops.XlaSparseDenseMatmulWithStaticBufferSize
 tf.raw_ops.Xlogy
 tf.raw_ops.ZerosLike
 tf.raw_ops.Zeta
