@@ -1,0 +1,16 @@
+[workspace]
+authors = ["canarypwn <canarypwn@aosc.io>"]
+channels = ["conda-forge"]
+name = "torch"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = "==3.11"
+anthropic = ">=0.66.0,<0.67"
+numpy = "<2"
+
+[pypi-dependencies]
+torch = "==2.2.0"

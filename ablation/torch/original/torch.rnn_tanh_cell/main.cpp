@@ -1,0 +1,1 @@
+torch::rnn_tanh_cell(input, hidden, w_ih, w_hh, b_ih=None, b_hh=None)
