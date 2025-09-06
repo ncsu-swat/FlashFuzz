@@ -37,7 +37,7 @@ def loop_until_ctrl_c(callback: Optional[Callable[[], None]] = None, interval: f
 
 
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False, slurm: bool = False, vs: Optional[str] = None):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False, slurm: bool = False, vs: Optional[str] = None, gpu: bool = False):
         self.dll = dll
         self.mode = mode
         self.ver = ver
@@ -47,8 +47,9 @@ class Experiment():
         self.check_valid = check_valid
         self.time_budget = time_budget
         self.status = Status.NOT_STARTED
-        self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}"
+        self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}{"-gpu" if gpu else ""}"
         self.vs = vs
+        self.gpu = gpu
         # include vs tag in container name if provided
         self.container_name = (
             f"{self.api}_{self.dll}{self.ver}_{self.mode}_{self.vs}"
@@ -227,6 +228,8 @@ class Experiment():
                     pass
         else:
             extra.append(f"--cpus {self.cpus}")
+        if self.gpu:
+            extra.append("--gpus all")
         # Memory limit is currently not enforced; uncomment to enable:
         # extra.append(f"-m {self.mem}g")
         cmd = f"{base_cmd} {' '.join(extra)} {self.image_name}"
