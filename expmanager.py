@@ -312,6 +312,11 @@ class Experiment():
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/artifacts/", self.result_dir)
+            # Compute and persist validity stats for this API
+            try:
+                self._compute_and_write_stats()
+            except Exception as e:
+                print(f"Failed to compute stats for {self.api}: {e}")
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED
@@ -358,6 +363,11 @@ class Experiment():
             self.copy_results_from_container(f"/root/fuzz/{self.api}/execution.log", self.result_dir)
             self.copy_results_from_container(f"/root/fuzz/{self.api}/fuzz-0.log", self.result_dir)
             self.copy_results_from_container(f"/root/fuzz/{self.api}/artifacts/", self.result_dir)
+            # Compute and persist validity stats for this API
+            try:
+                self._compute_and_write_stats()
+            except Exception as e:
+                print(f"Failed to compute stats for {self.api}: {e}")
             self.status = Status.COMPLETED
         except Exception:
             self.status = Status.FAILED
@@ -508,6 +518,83 @@ class Experiment():
                     coverage_number = coverage_number.group()
                     print(f"{interval_name}: {coverage_number}")
 
+    def _parse_fuzz_logs_for_stats(self, directory: str) -> tuple[int, int]:
+        """
+        Scan fuzz logs in a directory to compute total rounds and invalid count.
+        - Rounds: prefer 'stat::number_of_executed_units', fallback to 'Done X runs'.
+        - Invalid: lines containing either 'Exception caught:' or 'CPU Execution error'.
+        Returns: (rounds, invalid_count)
+        """
+        # Find fuzz-*.log files
+        log_files = sorted(glob.glob(os.path.join(directory, "fuzz-*.log")))
+        if not log_files:
+            # Nothing to parse
+            return 0, 0
+
+        total_rounds: Optional[int] = None
+        done_runs: Optional[int] = None
+        invalid_count = 0
+
+        for log_path in log_files:
+            try:
+                with open(log_path, "r", errors="ignore") as f:
+                    for line in f:
+                        # Count invalid markers
+                        if ("Exception caught:" in line) or ("CPU Execution error" in line):
+                            invalid_count += 1
+
+                        # Capture rounds stats (prefer explicit stat line)
+                        if "stat::number_of_executed_units:" in line:
+                            try:
+                                val = int(line.strip().split(":", 1)[1])
+                                total_rounds = val
+                            except Exception:
+                                pass
+                        elif line.startswith("Done ") and " runs in " in line:
+                            # Example: Done 541361 runs in 602 second(s)
+                            try:
+                                parts = line.split()
+                                # parts[1] should be the number following 'Done'
+                                val = int(parts[1])
+                                done_runs = val
+                            except Exception:
+                                pass
+            except FileNotFoundError:
+                continue
+
+        rounds = total_rounds if total_rounds is not None else (done_runs if done_runs is not None else 0)
+        return rounds, invalid_count
+
+    def _compute_and_write_stats(self) -> None:
+        """Compute rounds and validity ratio for current API and write stat.txt."""
+        # Determine directory for this experiment's logs
+        target_dir = self.result_dir.rstrip("/")
+        os.makedirs(target_dir, exist_ok=True)
+
+        rounds, invalid = self._parse_fuzz_logs_for_stats(target_dir)
+        valid = max(0, rounds - invalid)
+        ratio = (valid / rounds) if rounds > 0 else 0.0
+
+        # Prepare output
+        lines = [
+            f"api: {self.api}",
+            f"rounds: {rounds}",
+            f"invalid: {invalid}",
+            f"valid: {valid}",
+            f"validity_ratio: {ratio:.6f}",
+        ]
+
+        # Print summary
+        print(" | ".join(lines))
+
+        # Write to stat.txt under result dir
+        stat_path = os.path.join(target_dir, "stat.txt")
+        try:
+            with open(stat_path, "w") as sf:
+                sf.write("\n".join(lines) + "\n")
+        except Exception as e:
+            print(f"Failed to write stats file {stat_path}: {e}")
+
 
     def run(self):
         if self.dll == "tf":
@@ -618,4 +705,3 @@ class Scheduler():
                         for f in future_to_exp:
                             f.cancel()
                         raise
-

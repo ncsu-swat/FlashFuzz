@@ -6,4 +6,4 @@
 # python3 -u run.py --dll tf --version 2.16 --mode cov --itv 60 --time_budget 1200 --num_parallel 55 --vs pathfinder
 # python3 -u run.py --dll torch --version 2.2 --mode cov --itv 60 --time_budget 1200 --num_parallel 10 
 
-python3 -u run.py --dll torch --version 2.2 --mode cov --itv 60 --time_budget 600 --num_parallel 50 --vs titanfuzz --slurm
+python3 -u run.py --dll torch --version 2.2 --mode cov --itv 60 --time_budget 600 --num_parallel 50 --vs titanfuzzall --slurm
