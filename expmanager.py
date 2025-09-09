@@ -47,7 +47,7 @@ class Experiment():
         self.check_valid = check_valid
         self.time_budget = time_budget
         self.status = Status.NOT_STARTED
-        self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}{"-gpu" if gpu else ""}"
+        self.image_name = f"ncsuswat/flashfuzz:{self.dll}{self.ver}-{self.mode}{'-gpu' if gpu else ''}"
         self.vs = vs
         self.gpu = gpu
         # include vs tag in container name if provided
