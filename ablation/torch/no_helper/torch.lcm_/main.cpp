@@ -1,201 +1,184 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstdint>
-#include <cstring>
-
-// Helper to consume bytes from fuzzer input
-template<typename T>
-bool consumeBytes(const uint8_t* data, size_t& offset, size_t size, T& value) {
-    if (offset + sizeof(T) > size) return false;
-    std::memcpy(&value, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return true;
-}
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
     try
     {
-        if (Size < 16) return 0; // Need minimum bytes for basic tensor creation
-        
         size_t offset = 0;
-        
-        // Consume configuration bytes
-        uint8_t num_dims1, num_dims2, dtype_idx1, dtype_idx2;
-        uint8_t use_same_shape, use_scalar1, use_scalar2, use_empty;
-        
-        if (!consumeBytes(Data, offset, Size, num_dims1)) return 0;
-        if (!consumeBytes(Data, offset, Size, num_dims2)) return 0;
-        if (!consumeBytes(Data, offset, Size, dtype_idx1)) return 0;
-        if (!consumeBytes(Data, offset, Size, dtype_idx2)) return 0;
-        if (!consumeBytes(Data, offset, Size, use_same_shape)) return 0;
-        if (!consumeBytes(Data, offset, Size, use_scalar1)) return 0;
-        if (!consumeBytes(Data, offset, Size, use_scalar2)) return 0;
-        if (!consumeBytes(Data, offset, Size, use_empty)) return 0;
-        
-        // Map to reasonable ranges
-        num_dims1 = num_dims1 % 5; // 0-4 dimensions
-        num_dims2 = num_dims2 % 5;
-        
-        // Select dtypes (only integer types make sense for lcm)
-        std::vector<torch::ScalarType> int_dtypes = {
-            torch::kByte, torch::kChar, torch::kShort, torch::kInt, torch::kLong
-        };
-        torch::ScalarType dtype1 = int_dtypes[dtype_idx1 % int_dtypes.size()];
-        torch::ScalarType dtype2 = int_dtypes[dtype_idx2 % int_dtypes.size()];
-        
-        // Create first tensor
-        torch::Tensor tensor1;
-        if (use_scalar1 & 1) {
-            // Create scalar tensor
-            int64_t scalar_val;
-            if (!consumeBytes(Data, offset, Size, scalar_val)) scalar_val = 1;
-            tensor1 = torch::tensor(scalar_val, torch::dtype(dtype1));
-        } else if (use_empty & 1) {
-            // Create empty tensor
-            tensor1 = torch::empty({0}, torch::dtype(dtype1));
-        } else {
-            // Create tensor with shape
-            std::vector<int64_t> shape1;
-            for (uint8_t i = 0; i < num_dims1; ++i) {
-                uint8_t dim_size;
-                if (!consumeBytes(Data, offset, Size, dim_size)) dim_size = 1;
-                shape1.push_back((dim_size % 10) + (use_empty & 2 ? 0 : 1)); // 0-10 or 1-10
-            }
-            if (shape1.empty()) shape1.push_back(1);
-            
-            // Calculate total elements
-            int64_t total_elems = 1;
-            for (auto d : shape1) total_elems *= d;
-            
-            // Limit total elements to prevent OOM
-            if (total_elems > 10000) {
-                for (auto& d : shape1) d = std::min(d, (int64_t)10);
-                total_elems = 1;
-                for (auto d : shape1) total_elems *= d;
-            }
-            
-            // Fill with data from fuzzer input
-            std::vector<int64_t> data_vec;
-            for (int64_t i = 0; i < total_elems; ++i) {
-                int64_t val;
-                if (!consumeBytes(Data, offset, Size, val)) {
-                    val = i + 1; // Default non-zero values
-                }
-                data_vec.push_back(val);
-            }
-            
-            tensor1 = torch::from_blob(data_vec.data(), shape1, torch::kLong).to(dtype1).clone();
-        }
-        
-        // Create second tensor
-        torch::Tensor tensor2;
-        if (use_same_shape & 1) {
-            // Use same shape as tensor1
-            if (tensor1.numel() > 0) {
-                std::vector<int64_t> data_vec;
-                for (int64_t i = 0; i < tensor1.numel(); ++i) {
-                    int64_t val;
-                    if (!consumeBytes(Data, offset, Size, val)) {
-                        val = (i + 2) % 100; // Different default values
-                    }
-                    data_vec.push_back(val);
-                }
-                tensor2 = torch::from_blob(data_vec.data(), tensor1.sizes(), torch::kLong).to(dtype2).clone();
-            } else {
-                tensor2 = torch::empty_like(tensor1).to(dtype2);
-            }
-        } else if (use_scalar2 & 1) {
-            // Create scalar tensor
-            int64_t scalar_val;
-            if (!consumeBytes(Data, offset, Size, scalar_val)) scalar_val = 2;
-            tensor2 = torch::tensor(scalar_val, torch::dtype(dtype2));
-        } else {
-            // Create tensor with different shape
-            std::vector<int64_t> shape2;
-            for (uint8_t i = 0; i < num_dims2; ++i) {
-                uint8_t dim_size;
-                if (!consumeBytes(Data, offset, Size, dim_size)) dim_size = 1;
-                shape2.push_back((dim_size % 10) + 1); // 1-10
-            }
-            if (shape2.empty()) shape2.push_back(1);
-            
-            // Calculate total elements
-            int64_t total_elems = 1;
-            for (auto d : shape2) total_elems *= d;
-            
-            // Limit total elements
-            if (total_elems > 10000) {
-                for (auto& d : shape2) d = std::min(d, (int64_t)10);
-                total_elems = 1;
-                for (auto d : shape2) total_elems *= d;
-            }
-            
-            // Fill with data
-            std::vector<int64_t> data_vec;
-            for (int64_t i = 0; i < total_elems; ++i) {
-                int64_t val;
-                if (!consumeBytes(Data, offset, Size, val)) {
-                    val = (i + 3) % 100;
-                }
-                data_vec.push_back(val);
-            }
-            
-            tensor2 = torch::from_blob(data_vec.data(), shape2, torch::kLong).to(dtype2).clone();
-        }
-        
-        // Apply lcm_ operation (in-place)
-        try {
-            tensor1.lcm_(tensor2);
-            
-            // Verify result is valid (no inf/nan for integer types)
-            if (tensor1.numel() > 0) {
-                auto flat = tensor1.flatten();
-                // Access some elements to ensure computation completed
-                if (flat.numel() > 0) {
-                    auto first = flat[0].item<int64_t>();
-                    (void)first; // Suppress unused warning
-                }
-            }
-        } catch (const c10::Error& e) {
-            // Expected errors for shape mismatches, etc.
-            return 0;
-        } catch (const std::runtime_error& e) {
-            // Expected runtime errors
+
+        // Need at least some data to create tensors
+        if (Size < 16) {
             return 0;
         }
+
+        // Extract tensor properties
+        auto dtype_choice = extract_int(Data, Size, offset) % 3;
+        torch::ScalarType dtype;
+        switch (dtype_choice) {
+            case 0: dtype = torch::kInt32; break;
+            case 1: dtype = torch::kInt64; break;
+            default: dtype = torch::kInt16; break;
+        }
+
+        // Extract tensor shapes
+        auto shape1_size = (extract_int(Data, Size, offset) % 4) + 1; // 1-4 dimensions
+        auto shape2_size = (extract_int(Data, Size, offset) % 4) + 1; // 1-4 dimensions
         
+        std::vector<int64_t> shape1, shape2;
+        for (int i = 0; i < shape1_size; i++) {
+            shape1.push_back((extract_int(Data, Size, offset) % 10) + 1); // 1-10 size per dim
+        }
+        for (int i = 0; i < shape2_size; i++) {
+            shape2.push_back((extract_int(Data, Size, offset) % 10) + 1); // 1-10 size per dim
+        }
+
+        // Create tensors with integer values (LCM only works with integers)
+        torch::Tensor tensor1, tensor2;
+        
+        // Test different tensor creation methods
+        auto creation_method = extract_int(Data, Size, offset) % 4;
+        switch (creation_method) {
+            case 0:
+                // Random integers
+                tensor1 = torch::randint(1, 100, shape1, torch::TensorOptions().dtype(dtype));
+                tensor2 = torch::randint(1, 100, shape2, torch::TensorOptions().dtype(dtype));
+                break;
+            case 1:
+                // Ones
+                tensor1 = torch::ones(shape1, torch::TensorOptions().dtype(dtype));
+                tensor2 = torch::ones(shape2, torch::TensorOptions().dtype(dtype));
+                break;
+            case 2:
+                // Sequential values
+                tensor1 = torch::arange(1, torch::prod(torch::tensor(shape1)).item<int64_t>() + 1, torch::TensorOptions().dtype(dtype)).reshape(shape1);
+                tensor2 = torch::arange(1, torch::prod(torch::tensor(shape2)).item<int64_t>() + 1, torch::TensorOptions().dtype(dtype)).reshape(shape2);
+                break;
+            default:
+                // Mixed positive and negative values
+                tensor1 = torch::randint(-50, 51, shape1, torch::TensorOptions().dtype(dtype));
+                tensor2 = torch::randint(-50, 51, shape2, torch::TensorOptions().dtype(dtype));
+                // Avoid zeros for LCM
+                tensor1 = torch::where(tensor1 == 0, torch::ones_like(tensor1), tensor1);
+                tensor2 = torch::where(tensor2 == 0, torch::ones_like(tensor2), tensor2);
+                break;
+        }
+
+        // Test different broadcasting scenarios
+        auto broadcast_test = extract_int(Data, Size, offset) % 5;
+        switch (broadcast_test) {
+            case 0:
+                // Same shape tensors
+                if (shape1 != shape2) {
+                    tensor2 = tensor2.expand(shape1);
+                }
+                break;
+            case 1:
+                // Scalar with tensor
+                tensor2 = torch::tensor(extract_int(Data, Size, offset) % 100 + 1, torch::TensorOptions().dtype(dtype));
+                break;
+            case 2:
+                // Different but broadcastable shapes
+                if (shape1.size() > 1) {
+                    std::vector<int64_t> new_shape = {1};
+                    new_shape.insert(new_shape.end(), shape1.begin() + 1, shape1.end());
+                    tensor2 = tensor2.reshape(new_shape);
+                }
+                break;
+            case 3:
+                // Single element tensor
+                tensor1 = torch::tensor(extract_int(Data, Size, offset) % 100 + 1, torch::TensorOptions().dtype(dtype));
+                break;
+            default:
+                // Keep original shapes
+                break;
+        }
+
         // Test edge cases with special values
-        uint8_t test_special;
-        if (consumeBytes(Data, offset, Size, test_special)) {
-            if (test_special & 1) {
-                // Test with zeros
-                auto zero_tensor = torch::zeros({2, 2}, torch::kInt);
-                auto ones_tensor = torch::ones({2, 2}, torch::kInt);
-                try {
-                    zero_tensor.lcm_(ones_tensor);
-                } catch (...) {
-                    // Ignore errors for edge cases
-                }
+        auto edge_case = extract_int(Data, Size, offset) % 6;
+        switch (edge_case) {
+            case 0:
+                // Large values
+                tensor1 = torch::randint(1000, 10000, tensor1.sizes(), torch::TensorOptions().dtype(dtype));
+                tensor2 = torch::randint(1000, 10000, tensor2.sizes(), torch::TensorOptions().dtype(dtype));
+                break;
+            case 1:
+                // Small values
+                tensor1 = torch::randint(1, 10, tensor1.sizes(), torch::TensorOptions().dtype(dtype));
+                tensor2 = torch::randint(1, 10, tensor2.sizes(), torch::TensorOptions().dtype(dtype));
+                break;
+            case 2:
+                // Powers of 2
+                tensor1 = torch::pow(2, torch::randint(0, 10, tensor1.sizes(), torch::TensorOptions().dtype(torch::kInt32))).to(dtype);
+                tensor2 = torch::pow(2, torch::randint(0, 10, tensor2.sizes(), torch::TensorOptions().dtype(torch::kInt32))).to(dtype);
+                break;
+            case 3:
+                // Prime numbers (small ones)
+                auto primes = std::vector<int>{2, 3, 5, 7, 11, 13, 17, 19, 23, 29};
+                tensor1.fill_(primes[extract_int(Data, Size, offset) % primes.size()]);
+                tensor2.fill_(primes[extract_int(Data, Size, offset) % primes.size()]);
+                break;
+            case 4:
+                // Negative values
+                tensor1 = -torch::abs(tensor1);
+                tensor2 = -torch::abs(tensor2);
+                break;
+            default:
+                // Keep original values
+                break;
+        }
+
+        // Store original tensor for comparison
+        torch::Tensor original_tensor1 = tensor1.clone();
+
+        // Test torch.lcm_ (in-place operation)
+        torch::lcm_(tensor1, tensor2);
+
+        // Verify the result is valid
+        if (tensor1.numel() > 0) {
+            // Check that result has same shape as original tensor1
+            if (!tensor1.sizes().equals(original_tensor1.sizes())) {
+                std::cout << "Shape mismatch after lcm_" << std::endl;
             }
-            if (test_special & 2) {
-                // Test with negative values
-                auto neg_tensor = torch::tensor({{-1, -2}, {-3, -4}}, torch::kInt);
-                auto pos_tensor = torch::tensor({{1, 2}, {3, 4}}, torch::kInt);
-                try {
-                    neg_tensor.lcm_(pos_tensor);
-                } catch (...) {
-                    // Ignore errors
-                }
+            
+            // Check that result dtype is preserved
+            if (tensor1.dtype() != original_tensor1.dtype()) {
+                std::cout << "Dtype changed after lcm_" << std::endl;
             }
         }
+
+        // Test with different tensor properties
+        auto device_test = extract_int(Data, Size, offset) % 2;
+        if (device_test == 1 && torch::cuda::is_available()) {
+            // Test CUDA tensors if available
+            auto cuda_tensor1 = torch::randint(1, 100, {3, 3}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
+            auto cuda_tensor2 = torch::randint(1, 100, {3, 3}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
+            torch::lcm_(cuda_tensor1, cuda_tensor2);
+        }
+
+        // Test memory layout variations
+        auto layout_test = extract_int(Data, Size, offset) % 3;
+        if (layout_test == 1 && tensor1.dim() >= 2) {
+            // Test with transposed tensor
+            auto transposed = tensor1.transpose(0, 1);
+            auto other = torch::randint(1, 100, transposed.sizes(), torch::TensorOptions().dtype(dtype));
+            torch::lcm_(transposed, other);
+        } else if (layout_test == 2 && tensor1.dim() >= 2) {
+            // Test with non-contiguous tensor
+            auto sliced = tensor1.slice(0, 0, tensor1.size(0), 2);
+            if (sliced.numel() > 0) {
+                auto other = torch::randint(1, 100, sliced.sizes(), torch::TensorOptions().dtype(dtype));
+                torch::lcm_(sliced, other);
+            }
+        }
+
     }
     catch (const std::exception &e)
     {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
     }
-    return 0;
+    return 0; // keep the input
 }

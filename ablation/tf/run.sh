@@ -1,0 +1,2 @@
+export ANTHROPIC_API_KEY=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
+pixi run python3 -u llm.py 

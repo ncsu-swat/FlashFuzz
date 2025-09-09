@@ -1,173 +1,158 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstdint>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-// Helper to consume bytes from the fuzzer input
-template<typename T>
-bool consumeBytes(const uint8_t*& data, size_t& size, T& value) {
-    if (size < sizeof(T)) return false;
-    std::memcpy(&value, data, sizeof(T));
-    data += sizeof(T);
-    size -= sizeof(T);
-    return true;
-}
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
+        size_t offset = 0;
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    try {
-        if (size < 16) return 0;  // Need minimum bytes for basic parameters
+        // Need at least enough data for basic parameters
+        if (Size < 16) {
+            return 0;
+        }
+
+        // Extract input tensor data
+        auto tensor_info = extract_tensor_info(Data, Size, offset);
+        if (offset >= Size) {
+            return 0;
+        }
+
+        // Create input tensor with various dtypes that make sense for quantization
+        torch::Tensor input;
+        switch (tensor_info.dtype_idx % 3) {
+            case 0:
+                input = create_tensor<float>(tensor_info, Data, Size, offset);
+                break;
+            case 1:
+                input = create_tensor<double>(tensor_info, Data, Size, offset);
+                break;
+            case 2:
+                input = create_tensor<torch::Half>(tensor_info, Data, Size, offset);
+                break;
+        }
+
+        if (offset >= Size) {
+            return 0;
+        }
+
+        // Extract numel parameter (number of elements to consider)
+        int64_t numel = extract_int64(Data, Size, offset);
+        if (offset >= Size) {
+            return 0;
+        }
+
+        // Clamp numel to reasonable range
+        numel = std::max(1L, std::min(numel, input.numel()));
+
+        // Extract reduce_range parameter
+        bool reduce_range = extract_bool(Data, Size, offset);
+        if (offset >= Size) {
+            return 0;
+        }
+
+        // Test torch::choose_qparams_optimized with different configurations
         
-        const uint8_t* ptr = data;
-        size_t remaining = size;
+        // Test 1: Basic call with extracted parameters
+        auto result1 = torch::choose_qparams_optimized(input, numel, reduce_range);
         
-        // Consume parameters for tensor creation
-        uint8_t num_dims;
-        if (!consumeBytes(ptr, remaining, num_dims)) return 0;
-        num_dims = (num_dims % 5) + 1;  // 1-5 dimensions
+        // Verify the result is a tuple with scale and zero_point
+        auto scale1 = std::get<0>(result1);
+        auto zero_point1 = std::get<1>(result1);
         
-        // Build shape
-        std::vector<int64_t> shape;
-        for (int i = 0; i < num_dims; i++) {
-            uint16_t dim_size;
-            if (!consumeBytes(ptr, remaining, dim_size)) {
-                dim_size = 1;
-            }
-            // Allow 0-sized dimensions for edge cases
-            shape.push_back(dim_size % 100);  // Cap at 100 to avoid OOM
+        // Basic sanity checks
+        if (scale1.item<double>() <= 0) {
+            std::cout << "Invalid scale: " << scale1.item<double>() << std::endl;
         }
         
-        // Consume dtype selector
-        uint8_t dtype_selector;
-        if (!consumeBytes(ptr, remaining, dtype_selector)) {
-            dtype_selector = 0;
+        int64_t zp_val = zero_point1.item<int64_t>();
+        if (zp_val < 0 || zp_val > 255) {
+            std::cout << "Zero point out of range: " << zp_val << std::endl;
         }
+
+        // Test 2: Edge case with numel = 1
+        auto result2 = torch::choose_qparams_optimized(input, 1, reduce_range);
         
-        // Select dtype - choose_qparams_optimized typically works with floating point tensors
-        torch::ScalarType dtype;
-        switch (dtype_selector % 4) {
-            case 0: dtype = torch::kFloat32; break;
-            case 1: dtype = torch::kFloat64; break;
-            case 2: dtype = torch::kFloat16; break;
-            case 3: dtype = torch::kBFloat16; break;
-            default: dtype = torch::kFloat32; break;
-        }
+        // Test 3: Edge case with full tensor
+        auto result3 = torch::choose_qparams_optimized(input, input.numel(), reduce_range);
         
-        // Consume parameters for choose_qparams_optimized
-        uint8_t qmin_raw, qmax_raw;
-        if (!consumeBytes(ptr, remaining, qmin_raw)) qmin_raw = 0;
-        if (!consumeBytes(ptr, remaining, qmax_raw)) qmax_raw = 255;
-        
-        // Ensure qmin < qmax
-        int64_t qmin = qmin_raw;
-        int64_t qmax = qmax_raw;
-        if (qmin >= qmax) {
-            qmax = qmin + 1;
-        }
-        
-        // Consume numel selector for tensor values
-        uint8_t numel_selector;
-        if (!consumeBytes(ptr, remaining, numel_selector)) {
-            numel_selector = 0;
-        }
-        
-        // Create tensor with various strategies
-        torch::Tensor tensor;
-        
-        if (numel_selector % 4 == 0) {
-            // Create from shape with random values
-            tensor = torch::randn(shape, torch::TensorOptions().dtype(dtype));
-        } else if (numel_selector % 4 == 1) {
-            // Create empty tensor
-            tensor = torch::empty(shape, torch::TensorOptions().dtype(dtype));
-        } else if (numel_selector % 4 == 2) {
-            // Create with specific values from fuzzer data
-            int64_t numel = 1;
-            for (auto dim : shape) {
-                numel *= dim;
+        // Test 4: Toggle reduce_range
+        auto result4 = torch::choose_qparams_optimized(input, numel, !reduce_range);
+
+        // Test with different tensor shapes and values
+        if (offset < Size) {
+            // Create a tensor with extreme values
+            torch::Tensor extreme_tensor;
+            uint8_t extreme_type = Data[offset++] % 4;
+            
+            switch (extreme_type) {
+                case 0: {
+                    // All zeros
+                    extreme_tensor = torch::zeros_like(input);
+                    break;
+                }
+                case 1: {
+                    // All ones
+                    extreme_tensor = torch::ones_like(input);
+                    break;
+                }
+                case 2: {
+                    // Large positive values
+                    extreme_tensor = torch::full_like(input, 1000.0);
+                    break;
+                }
+                case 3: {
+                    // Large negative values
+                    extreme_tensor = torch::full_like(input, -1000.0);
+                    break;
+                }
             }
             
-            if (numel > 0 && numel < 10000) {  // Cap to avoid OOM
-                std::vector<float> values;
-                for (int64_t i = 0; i < numel; i++) {
-                    float val;
-                    if (remaining >= sizeof(float)) {
-                        consumeBytes(ptr, remaining, val);
-                    } else {
-                        val = static_cast<float>(i);
-                    }
-                    values.push_back(val);
-                }
-                tensor = torch::from_blob(values.data(), shape, torch::kFloat32).clone().to(dtype);
-            } else {
-                tensor = torch::zeros(shape, torch::TensorOptions().dtype(dtype));
-            }
-        } else {
-            // Create with special values
-            uint8_t special_val;
-            if (!consumeBytes(ptr, remaining, special_val)) special_val = 0;
-            switch (special_val % 5) {
-                case 0: tensor = torch::zeros(shape, torch::TensorOptions().dtype(dtype)); break;
-                case 1: tensor = torch::ones(shape, torch::TensorOptions().dtype(dtype)); break;
-                case 2: tensor = torch::full(shape, std::numeric_limits<float>::infinity(), torch::TensorOptions().dtype(dtype)); break;
-                case 3: tensor = torch::full(shape, -std::numeric_limits<float>::infinity(), torch::TensorOptions().dtype(dtype)); break;
-                case 4: tensor = torch::full(shape, std::numeric_limits<float>::quiet_NaN(), torch::TensorOptions().dtype(dtype)); break;
-            }
+            auto result_extreme = torch::choose_qparams_optimized(extreme_tensor, 
+                                                                std::min(numel, extreme_tensor.numel()), 
+                                                                reduce_range);
         }
-        
-        // Test with different tensor layouts
-        uint8_t layout_selector;
-        if (consumeBytes(ptr, remaining, layout_selector)) {
-            if (layout_selector % 3 == 1 && tensor.numel() > 0) {
-                // Make non-contiguous
-                tensor = tensor.transpose(0, -1);
-            } else if (layout_selector % 3 == 2 && tensor.dim() >= 2) {
-                // Permute dimensions
-                std::vector<int64_t> perm;
-                for (int64_t i = tensor.dim() - 1; i >= 0; i--) {
-                    perm.push_back(i);
-                }
-                tensor = tensor.permute(perm);
-            }
-        }
-        
-        // Call choose_qparams_optimized
-        auto result = torch::choose_qparams_optimized(tensor, qmin, qmax);
-        
-        // Access the results to ensure they're computed
-        auto scale = std::get<0>(result);
-        auto zero_point = std::get<1>(result);
-        
-        // Optionally use the results to trigger more code paths
-        if (scale.numel() > 0) {
-            scale.item<double>();
-        }
-        if (zero_point.numel() > 0) {
-            zero_point.item<int64_t>();
-        }
-        
-        // Test with different bit widths
-        uint8_t bit_width;
-        if (consumeBytes(ptr, remaining, bit_width)) {
-            bit_width = (bit_width % 8) + 1;  // 1-8 bits
-            int64_t qmax_bits = (1 << bit_width) - 1;
-            
+
+        // Test with different tensor devices if CUDA is available
+        if (torch::cuda::is_available() && input.numel() > 0) {
             try {
-                auto result2 = torch::choose_qparams_optimized(tensor, 0, qmax_bits);
-                std::get<0>(result2);
-                std::get<1>(result2);
-            } catch (const c10::Error& e) {
-                // Quantization errors are expected for some inputs
+                auto cuda_input = input.to(torch::kCUDA);
+                auto result_cuda = torch::choose_qparams_optimized(cuda_input, 
+                                                                 std::min(numel, cuda_input.numel()), 
+                                                                 reduce_range);
+            } catch (const std::exception& e) {
+                // CUDA operations might fail, that's okay
             }
         }
-        
-    } catch (const c10::Error& e) {
-        // PyTorch errors are expected for invalid operations
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+
+        // Test with contiguous and non-contiguous tensors
+        if (input.dim() > 1) {
+            try {
+                auto transposed = input.transpose(0, -1);
+                if (!transposed.is_contiguous()) {
+                    auto result_non_contiguous = torch::choose_qparams_optimized(transposed, 
+                                                                               std::min(numel, transposed.numel()), 
+                                                                               reduce_range);
+                }
+            } catch (const std::exception& e) {
+                // Non-contiguous operations might have restrictions
+            }
+        }
+
+        // Test with very small numel values
+        for (int64_t small_numel : {1, 2, 3}) {
+            if (small_numel <= input.numel()) {
+                auto result_small = torch::choose_qparams_optimized(input, small_numel, reduce_range);
+            }
+        }
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

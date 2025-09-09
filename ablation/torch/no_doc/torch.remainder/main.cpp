@@ -1,7 +1,6 @@
 #include "fuzzer_utils.h"
-#include <torch/torch.h>
 #include <iostream>
-#include <cstring>
+#include <tuple>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
@@ -9,193 +8,115 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     {
         size_t offset = 0;
         
-        // Need at least minimal bytes for creating tensors
-        if (Size < 8) {
-            return 0;  // Not enough data, but keep for coverage
-        }
-
-        // Parse operation mode from first byte
-        uint8_t op_mode = Data[offset++];
-        
-        // Create dividend tensor
-        torch::Tensor dividend;
-        try {
-            dividend = fuzzer_utils::createTensor(Data, Size, offset);
-        } catch (const std::exception& e) {
-            // If we can't create first tensor, try with random small tensor
-            dividend = torch::randn({2, 3});
+        if (Size < 3) {
+            return 0;
         }
         
-        // Create divisor - could be tensor or scalar
-        bool use_scalar_divisor = (offset < Size) && (Data[offset++] % 3 == 0);
+        auto tensor1 = fuzzer_utils::createTensor(Data, Size, offset);
         
-        torch::Tensor result;
+        if (offset >= Size) {
+            return 0;
+        }
         
-        if (use_scalar_divisor && offset < Size) {
-            // Use scalar divisor
-            double scalar_divisor;
-            if (offset + sizeof(double) <= Size) {
-                std::memcpy(&scalar_divisor, Data + offset, sizeof(double));
-                offset += sizeof(double);
-            } else {
-                // Use remaining bytes to create a value
-                scalar_divisor = (offset < Size) ? static_cast<double>(Data[offset++]) : 1.0;
-            }
-            
-            // Handle special scalar values
-            if (op_mode % 5 == 0) scalar_divisor = 0.0;  // Test division by zero
-            else if (op_mode % 7 == 0) scalar_divisor = -scalar_divisor;  // Test negative
-            else if (op_mode % 11 == 0) scalar_divisor = std::numeric_limits<double>::infinity();
-            else if (op_mode % 13 == 0) scalar_divisor = std::numeric_limits<double>::quiet_NaN();
-            else if (op_mode % 17 == 0) scalar_divisor = std::numeric_limits<double>::epsilon();
-            
-            // Test scalar remainder
-            result = torch::remainder(dividend, scalar_divisor);
-            
-            // Also test reverse order if we have more data
-            if (offset < Size && Data[offset++] % 2 == 0) {
-                auto result2 = torch::remainder(scalar_divisor, dividend);
-            }
+        uint8_t operation_mode = Data[offset++];
+        
+        if (operation_mode % 2 == 0) {
+            auto tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::remainder(tensor1, tensor2);
         } else {
-            // Use tensor divisor
-            torch::Tensor divisor;
-            try {
-                divisor = fuzzer_utils::createTensor(Data, Size, offset);
-            } catch (const std::exception& e) {
-                // Create a compatible tensor
-                divisor = torch::ones_like(dividend);
+            if (offset + sizeof(double) <= Size) {
+                double scalar_value;
+                std::memcpy(&scalar_value, Data + offset, sizeof(double));
+                offset += sizeof(double);
+                torch::remainder(tensor1, scalar_value);
+            } else {
+                torch::remainder(tensor1, 1.0);
+            }
+        }
+        
+        if (offset < Size) {
+            uint8_t inplace_mode = Data[offset++];
+            if (inplace_mode % 3 == 0) {
+                auto tensor3 = fuzzer_utils::createTensor(Data, Size, offset);
                 if (offset < Size) {
-                    // Add some variation based on remaining data
-                    divisor = divisor * (1.0 + (Data[offset++] % 10) / 10.0);
+                    auto tensor4 = fuzzer_utils::createTensor(Data, Size, offset);
+                    tensor3.remainder_(tensor4);
                 }
-            }
-            
-            // Inject special values based on op_mode
-            if (op_mode % 3 == 0 && divisor.numel() > 0) {
-                // Inject zeros at random positions
-                auto mask = torch::rand_like(divisor) < 0.2;
-                divisor = torch::where(mask, torch::zeros_like(divisor), divisor);
-            }
-            if (op_mode % 5 == 1 && divisor.numel() > 0) {
-                // Inject infinities
-                auto mask = torch::rand_like(divisor) < 0.1;
-                divisor = torch::where(mask, torch::full_like(divisor, std::numeric_limits<float>::infinity()), divisor);
-            }
-            if (op_mode % 7 == 1 && divisor.numel() > 0) {
-                // Inject NaNs
-                auto mask = torch::rand_like(divisor) < 0.1;
-                divisor = torch::where(mask, torch::full_like(divisor, std::numeric_limits<float>::quiet_NaN()), divisor);
-            }
-            
-            // Test broadcasting scenarios
-            if (offset < Size && Data[offset++] % 4 == 0) {
-                // Try to reshape for broadcasting
-                if (dividend.dim() > 0 && divisor.dim() > 0) {
-                    auto dividend_sizes = dividend.sizes().vec();
-                    auto divisor_sizes = divisor.sizes().vec();
-                    
-                    // Make divisor broadcastable by setting some dims to 1
-                    for (size_t i = 0; i < divisor_sizes.size() && offset < Size; ++i) {
-                        if (Data[offset++] % 3 == 0) {
-                            divisor_sizes[i] = 1;
-                        }
-                    }
-                    try {
-                        divisor = divisor.reshape(divisor_sizes);
-                    } catch (...) {
-                        // Keep original shape if reshape fails
-                    }
-                }
-            }
-            
-            // Perform remainder operation
-            result = torch::remainder(dividend, divisor);
-            
-            // Test in-place operation if possible
-            if (offset < Size && Data[offset++] % 2 == 0) {
-                try {
-                    dividend.remainder_(divisor);
-                } catch (...) {
-                    // In-place might fail for various reasons (dtype, size mismatch, etc.)
+            } else if (inplace_mode % 3 == 1) {
+                auto tensor5 = fuzzer_utils::createTensor(Data, Size, offset);
+                if (offset + sizeof(float) <= Size) {
+                    float scalar_val;
+                    std::memcpy(&scalar_val, Data + offset, sizeof(float));
+                    offset += sizeof(float);
+                    tensor5.remainder_(scalar_val);
                 }
             }
         }
         
-        // Additional operations to increase coverage
-        if (result.defined() && offset < Size) {
-            uint8_t extra_op = Data[offset++];
-            
-            // Test output tensor variant
-            if (extra_op % 3 == 0) {
-                torch::Tensor out = torch::empty_like(result);
-                torch::remainder_out(out, dividend, use_scalar_divisor ? 
-                    torch::scalar_tensor(1.5) : dividend);
-            }
-            
-            // Test with different memory layouts
-            if (extra_op % 5 == 0 && dividend.dim() >= 2) {
-                auto transposed = dividend.transpose(0, 1);
-                auto result_t = torch::remainder(transposed, 2.0);
-            }
-            
-            // Test with non-contiguous tensors
-            if (extra_op % 7 == 0 && dividend.numel() > 1) {
-                auto strided = dividend.as_strided({1}, {2});
-                auto result_s = torch::remainder(strided, 1.5);
-            }
-            
-            // Test edge case: empty tensors
-            if (extra_op % 11 == 0) {
-                auto empty_tensor = torch::empty({0, 3});
-                auto result_e = torch::remainder(empty_tensor, 1.0);
-            }
-            
-            // Test with complex numbers if dtype supports
-            if (extra_op % 13 == 0) {
-                try {
-                    auto complex_dividend = torch::complex(dividend, dividend);
-                    auto result_c = torch::remainder(complex_dividend, 2.0);
-                } catch (...) {
-                    // Complex remainder might not be supported
-                }
+        if (offset < Size) {
+            auto dividend = fuzzer_utils::createTensor(Data, Size, offset);
+            if (offset < Size) {
+                auto divisor = fuzzer_utils::createTensor(Data, Size, offset);
+                auto result = torch::empty_like(dividend);
+                torch::remainder_out(result, dividend, divisor);
             }
         }
         
-        // Validate result properties
-        if (result.defined()) {
-            // Access some properties to ensure tensor is valid
-            auto shape = result.sizes();
-            auto dtype = result.dtype();
-            auto device = result.device();
-            
-            // Check for NaN/Inf in result
-            if (result.dtype().isFloatingPoint()) {
-                auto has_nan = torch::any(torch::isnan(result));
-                auto has_inf = torch::any(torch::isinf(result));
-            }
-            
-            // Force computation if lazy
-            if (result.numel() > 0 && result.numel() < 1000) {
-                result.cpu();  // Force materialization
+        if (offset < Size) {
+            auto tensor6 = fuzzer_utils::createTensor(Data, Size, offset);
+            if (offset + sizeof(int64_t) <= Size) {
+                int64_t int_scalar;
+                std::memcpy(&int_scalar, Data + offset, sizeof(int64_t));
+                offset += sizeof(int64_t);
+                torch::remainder(tensor6, int_scalar);
             }
         }
         
-    }
-    catch (const c10::Error &e)
-    {
-        // PyTorch-specific errors are expected during fuzzing
-        return 0;  // Keep the input for coverage
+        if (offset < Size) {
+            auto tensor7 = fuzzer_utils::createTensor(Data, Size, offset);
+            if (offset + sizeof(int32_t) <= Size) {
+                int32_t int32_scalar;
+                std::memcpy(&int32_scalar, Data + offset, sizeof(int32_t));
+                offset += sizeof(int32_t);
+                torch::remainder(tensor7, int32_scalar);
+            }
+        }
+        
+        if (offset < Size) {
+            auto tensor8 = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::remainder(tensor8, 0.0);
+        }
+        
+        if (offset < Size) {
+            auto tensor9 = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::remainder(tensor9, std::numeric_limits<double>::infinity());
+        }
+        
+        if (offset < Size) {
+            auto tensor10 = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::remainder(tensor10, -std::numeric_limits<double>::infinity());
+        }
+        
+        if (offset < Size) {
+            auto tensor11 = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::remainder(tensor11, std::numeric_limits<double>::quiet_NaN());
+        }
+        
+        if (offset < Size) {
+            auto tensor12 = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::remainder(tensor12, std::numeric_limits<double>::min());
+        }
+        
+        if (offset < Size) {
+            auto tensor13 = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::remainder(tensor13, std::numeric_limits<double>::max());
+        }
+        
     }
     catch (const std::exception &e)
     {
         std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;  // Discard input for unexpected errors
-    }
-    catch (...)
-    {
-        // Catch any other exceptions
         return -1;
     }
-    
     return 0;
 }

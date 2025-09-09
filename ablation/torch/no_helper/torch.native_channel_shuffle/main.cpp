@@ -1,205 +1,135 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstdint>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-// Helper function to consume bytes from the fuzzer input
-template<typename T>
-bool consumeBytes(const uint8_t* data, size_t size, size_t& offset, T& value) {
-    if (offset + sizeof(T) > size) {
-        return false;
-    }
-    std::memcpy(&value, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return true;
-}
-
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (size < 16) {
-        return 0;  // Need minimum bytes for basic parameters
-    }
-
-    try {
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
+
+        // Need at least enough data for tensor dimensions and groups
+        if (Size < 20) return 0;
+
+        // Extract tensor dimensions (batch, channels, height, width)
+        int batch = extractInt(Data, Size, offset, 1, 8);
+        int channels = extractInt(Data, Size, offset, 1, 64);
+        int height = extractInt(Data, Size, offset, 1, 32);
+        int width = extractInt(Data, Size, offset, 1, 32);
         
-        // Consume parameters for tensor creation
-        uint8_t rank;
-        if (!consumeBytes(data, size, offset, rank)) return 0;
-        rank = (rank % 4) + 1;  // Limit rank to 1-4 dimensions
+        // Extract groups parameter
+        int groups = extractInt(Data, Size, offset, 1, channels);
         
-        // Build shape vector
-        std::vector<int64_t> shape;
-        for (uint8_t i = 0; i < rank; ++i) {
-            uint8_t dim_size;
-            if (!consumeBytes(data, size, offset, dim_size)) {
-                // Use default if we run out of data
-                shape.push_back(2);
-            } else {
-                // Allow 0-sized dimensions for edge cases, cap at 32 for memory
-                shape.push_back(dim_size % 33);
-            }
+        // Ensure channels is divisible by groups for valid channel shuffle
+        if (channels % groups != 0) {
+            // Adjust channels to be divisible by groups
+            channels = (channels / groups) * groups;
+            if (channels == 0) channels = groups;
+        }
+
+        // Create input tensor with random data
+        torch::Tensor input = torch::randn({batch, channels, height, width});
+        
+        // Test different data types
+        std::vector<torch::ScalarType> dtypes = {
+            torch::kFloat32, torch::kFloat64, torch::kFloat16,
+            torch::kInt32, torch::kInt64, torch::kInt8, torch::kUInt8
+        };
+        
+        torch::ScalarType dtype = dtypes[extractInt(Data, Size, offset, 0, dtypes.size() - 1)];
+        input = input.to(dtype);
+
+        // Test with different devices if CUDA is available
+        std::vector<torch::Device> devices = {torch::kCPU};
+        if (torch::cuda::is_available()) {
+            devices.push_back(torch::kCUDA);
         }
         
-        // Consume groups parameter
-        int32_t groups = 1;
-        if (!consumeBytes(data, size, offset, groups)) {
-            groups = 2;  // Default value
-        }
-        // Ensure groups is positive and reasonable
-        groups = std::abs(groups) % 100;
-        if (groups == 0) groups = 1;
-        
-        // Consume dtype selector
-        uint8_t dtype_selector;
-        if (!consumeBytes(data, size, offset, dtype_selector)) {
-            dtype_selector = 0;
-        }
-        
-        // Select dtype based on fuzzer input
-        torch::ScalarType dtype;
-        switch (dtype_selector % 6) {
-            case 0: dtype = torch::kFloat32; break;
-            case 1: dtype = torch::kFloat64; break;
-            case 2: dtype = torch::kFloat16; break;
-            case 3: dtype = torch::kBFloat16; break;
-            case 4: dtype = torch::kInt32; break;
-            case 5: dtype = torch::kInt64; break;
-            default: dtype = torch::kFloat32; break;
-        }
-        
-        // Consume device selector
-        uint8_t device_selector;
-        if (!consumeBytes(data, size, offset, device_selector)) {
-            device_selector = 0;
-        }
-        
-        // Create device (CPU or CUDA if available)
-        torch::Device device(torch::kCPU);
-        #ifdef USE_CUDA
-        if (device_selector % 2 == 1 && torch::cuda::is_available()) {
-            device = torch::Device(torch::kCUDA);
-        }
-        #endif
-        
-        // Consume requires_grad flag
-        uint8_t requires_grad;
-        if (!consumeBytes(data, size, offset, requires_grad)) {
-            requires_grad = 0;
-        }
-        
-        // Create tensor options
-        auto options = torch::TensorOptions()
-            .dtype(dtype)
-            .device(device)
-            .requires_grad((requires_grad % 2) == 1 && 
-                          (dtype == torch::kFloat32 || dtype == torch::kFloat64 || 
-                           dtype == torch::kFloat16 || dtype == torch::kBFloat16));
-        
-        // Calculate total elements
-        int64_t total_elements = 1;
-        for (auto dim : shape) {
-            if (dim > 0 && total_elements > INT64_MAX / dim) {
-                // Prevent overflow
-                return 0;
-            }
-            total_elements *= dim;
-        }
-        
-        // Limit total elements to prevent OOM
-        if (total_elements > 100000) {
-            return 0;
-        }
-        
-        // Create input tensor
-        torch::Tensor input;
-        
-        // Decide initialization method based on fuzzer input
-        uint8_t init_method;
-        if (!consumeBytes(data, size, offset, init_method)) {
-            init_method = 0;
-        }
-        
-        switch (init_method % 5) {
-            case 0:
-                input = torch::randn(shape, options);
-                break;
-            case 1:
-                input = torch::ones(shape, options);
-                break;
-            case 2:
-                input = torch::zeros(shape, options);
-                break;
-            case 3:
-                input = torch::arange(total_elements, options).reshape(shape);
-                break;
-            case 4:
-                // Create with specific values from fuzzer data
-                if (total_elements > 0 && offset < size) {
-                    std::vector<float> values;
-                    for (int64_t i = 0; i < total_elements; ++i) {
-                        if (offset < size) {
-                            values.push_back(static_cast<float>(data[offset++]) / 255.0f);
-                        } else {
-                            values.push_back(0.0f);
-                        }
-                    }
-                    input = torch::from_blob(values.data(), shape, torch::kFloat32).to(options);
-                } else {
-                    input = torch::randn(shape, options);
-                }
-                break;
-            default:
-                input = torch::randn(shape, options);
-        }
-        
-        // Test with contiguous and non-contiguous tensors
-        uint8_t make_non_contiguous;
-        if (consumeBytes(data, size, offset, make_non_contiguous) && 
-            (make_non_contiguous % 3 == 0) && shape.size() >= 2) {
-            // Make tensor non-contiguous by transposing
-            input = input.transpose(0, shape.size() - 1);
-        }
-        
+        torch::Device device = devices[extractInt(Data, Size, offset, 0, devices.size() - 1)];
+        input = input.to(device);
+
         // Call native_channel_shuffle
         torch::Tensor output = torch::native_channel_shuffle(input, groups);
         
-        // Perform some operations on output to ensure it's valid
-        if (output.numel() > 0) {
-            auto sum = output.sum();
-            auto mean = output.mean();
+        // Verify output shape matches input shape
+        if (!output.sizes().equals(input.sizes())) {
+            std::cerr << "Output shape mismatch!" << std::endl;
+        }
+        
+        // Verify output device and dtype match input
+        if (output.device() != input.device() || output.dtype() != input.dtype()) {
+            std::cerr << "Output device or dtype mismatch!" << std::endl;
+        }
+
+        // Test edge cases
+        if (offset < Size) {
+            // Test with groups = 1 (should be identity operation)
+            torch::Tensor output_identity = torch::native_channel_shuffle(input, 1);
+            if (!torch::allclose(input, output_identity, 1e-5, 1e-8, /*equal_nan=*/true)) {
+                std::cerr << "Identity test failed!" << std::endl;
+            }
             
-            // Test backward pass if applicable
-            if (output.requires_grad()) {
-                try {
-                    sum.backward();
-                } catch (...) {
-                    // Ignore backward errors
+            // Test with groups = channels (each channel becomes its own group)
+            if (channels > 1) {
+                torch::Tensor output_max_groups = torch::native_channel_shuffle(input, channels);
+                if (!output_max_groups.sizes().equals(input.sizes())) {
+                    std::cerr << "Max groups test failed!" << std::endl;
                 }
             }
         }
-        
-        // Test with different memory formats if applicable
-        if (shape.size() == 4 && shape[0] > 0 && shape[1] > 0 && 
-            shape[2] > 0 && shape[3] > 0) {
-            try {
-                auto channels_last_input = input.contiguous(torch::MemoryFormat::ChannelsLast);
-                auto cl_output = torch::native_channel_shuffle(channels_last_input, groups);
-            } catch (...) {
-                // Ignore memory format errors
+
+        // Test with different memory layouts
+        if (offset < Size) {
+            bool test_contiguous = extractBool(Data, Size, offset);
+            if (!test_contiguous) {
+                // Create non-contiguous tensor
+                torch::Tensor non_contiguous = input.transpose(1, 2);
+                if (!non_contiguous.is_contiguous()) {
+                    torch::Tensor output_nc = torch::native_channel_shuffle(non_contiguous, groups);
+                    // Should still work with non-contiguous input
+                }
             }
         }
-        
-    } catch (const c10::Error& e) {
-        // PyTorch-specific errors are expected for invalid inputs
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
-    } catch (...) {
-        // Unknown exception
-        return -1;
+
+        // Test with zero-sized dimensions
+        if (offset < Size) {
+            bool test_zero_size = extractBool(Data, Size, offset);
+            if (test_zero_size && height > 1 && width > 1) {
+                torch::Tensor zero_height = torch::randn({batch, channels, 0, width}).to(dtype).to(device);
+                torch::Tensor output_zero = torch::native_channel_shuffle(zero_height, groups);
+                if (output_zero.size(2) != 0) {
+                    std::cerr << "Zero height test failed!" << std::endl;
+                }
+            }
+        }
+
+        // Test gradient computation if input requires grad
+        if (offset < Size && input.dtype().isFloatingType()) {
+            bool test_grad = extractBool(Data, Size, offset);
+            if (test_grad) {
+                torch::Tensor grad_input = input.clone().requires_grad_(true);
+                torch::Tensor grad_output = torch::native_channel_shuffle(grad_input, groups);
+                
+                // Compute some loss and backward
+                torch::Tensor loss = grad_output.sum();
+                loss.backward();
+                
+                // Check that gradients exist
+                if (!grad_input.grad().defined()) {
+                    std::cerr << "Gradient computation failed!" << std::endl;
+                }
+            }
+        }
+
+        // Force evaluation to catch any lazy execution issues
+        output.sum().item<double>();
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

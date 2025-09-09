@@ -1,226 +1,218 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
-#include <cstdint>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    if (size < 16) {
-        return 0; // Need minimum bytes for basic parameters
-    }
-
     try
     {
         size_t offset = 0;
-        
-        // Extract basic parameters
-        uint8_t tensor_rank = data[offset++] % 5; // 0-4 dimensions
-        uint8_t dtype_selector = data[offset++] % 4; // Select dtype
-        uint32_t bins = 1 + (data[offset] | (data[offset+1] << 8)); // 1-65536 bins
-        offset += 2;
-        
-        // Extract min/max values
-        float min_val, max_val;
-        if (offset + 8 <= size) {
-            memcpy(&min_val, data + offset, 4);
-            memcpy(&max_val, data + offset + 4, 4);
-            offset += 8;
-        } else {
-            min_val = 0.0f;
-            max_val = 0.0f;
+
+        // Need at least some bytes for parameters
+        if (Size < 16) {
+            return 0;
         }
-        
-        // Handle NaN/Inf cases
-        if (std::isnan(min_val)) min_val = 0.0f;
-        if (std::isnan(max_val)) max_val = 0.0f;
-        if (std::isinf(min_val)) min_val = -1e6f;
-        if (std::isinf(max_val)) max_val = 1e6f;
-        
-        // Build tensor shape
-        std::vector<int64_t> shape;
-        if (tensor_rank == 0) {
-            shape = {}; // Scalar tensor
-        } else {
-            for (uint8_t i = 0; i < tensor_rank && offset < size; i++) {
-                int64_t dim = (data[offset++] % 16) + 1; // 1-16 per dimension
-                shape.push_back(dim);
-            }
+
+        // Extract tensor parameters
+        auto tensor_params = extract_tensor_params(Data, Size, offset);
+        if (tensor_params.empty()) {
+            return 0;
         }
-        
-        // Calculate total elements
-        int64_t total_elements = 1;
-        for (auto dim : shape) {
-            total_elements *= dim;
-        }
-        
-        // Limit total elements to prevent OOM
-        if (total_elements > 10000) {
-            total_elements = 10000;
-            if (!shape.empty()) {
-                shape[0] = total_elements / std::max(int64_t(1), 
-                    std::accumulate(shape.begin() + 1, shape.end(), 
-                                   int64_t(1), std::multiplies<int64_t>()));
-            }
-        }
-        
-        // Create input tensor with various dtypes
+
+        // Create input tensor with various data types and shapes
         torch::Tensor input;
-        torch::TensorOptions options;
+        uint8_t tensor_type = Data[offset++] % 4;
         
-        switch (dtype_selector) {
-            case 0:
-                options = torch::TensorOptions().dtype(torch::kFloat32);
+        switch (tensor_type) {
+            case 0: {
+                // Float tensor
+                input = create_tensor<float>(tensor_params[0]);
                 break;
-            case 1:
-                options = torch::TensorOptions().dtype(torch::kFloat64);
-                break;
-            case 2:
-                options = torch::TensorOptions().dtype(torch::kInt32);
-                break;
-            case 3:
-                options = torch::TensorOptions().dtype(torch::kInt64);
-                break;
-        }
-        
-        if (shape.empty()) {
-            // Scalar tensor
-            if (offset < size) {
-                float scalar_val;
-                if (offset + 4 <= size) {
-                    memcpy(&scalar_val, data + offset, 4);
-                } else {
-                    scalar_val = static_cast<float>(data[offset]);
-                }
-                input = torch::tensor(scalar_val, options);
-            } else {
-                input = torch::tensor(1.0f, options);
             }
-        } else {
-            // Multi-dimensional tensor
-            input = torch::empty(shape, options);
+            case 1: {
+                // Double tensor
+                input = create_tensor<double>(tensor_params[0]);
+                break;
+            }
+            case 2: {
+                // Integer tensor
+                input = create_tensor<int32_t>(tensor_params[0]);
+                break;
+            }
+            case 3: {
+                // Long tensor
+                input = create_tensor<int64_t>(tensor_params[0]);
+                break;
+            }
+        }
+
+        if (input.numel() == 0) {
+            return 0;
+        }
+
+        // Extract bins parameter (1 to 1000 to avoid excessive memory usage)
+        int bins = 1;
+        if (offset < Size) {
+            bins = std::max(1, std::min(1000, static_cast<int>(Data[offset++]) + 1));
+        }
+
+        // Extract min and max parameters
+        double min_val = 0.0;
+        double max_val = 0.0;
+        
+        if (offset + 8 <= Size) {
+            // Use bytes to create min value
+            uint64_t min_bits = 0;
+            for (int i = 0; i < 8 && offset < Size; i++) {
+                min_bits |= (static_cast<uint64_t>(Data[offset++]) << (i * 8));
+            }
+            min_val = *reinterpret_cast<double*>(&min_bits);
             
-            // Fill tensor with fuzzed data
-            if (dtype_selector <= 1) { // Float types
-                auto input_data = input.data_ptr<float>();
-                for (int64_t i = 0; i < total_elements && offset < size; i++) {
-                    if (offset + 4 <= size) {
-                        float val;
-                        memcpy(&val, data + offset, 4);
-                        input_data[i] = val;
-                        offset += 4;
-                    } else {
-                        input_data[i] = static_cast<float>(data[offset++]);
-                    }
-                }
-            } else { // Integer types
-                auto input_data = input.data_ptr<int32_t>();
-                for (int64_t i = 0; i < total_elements && offset < size; i++) {
-                    if (offset + 4 <= size) {
-                        int32_t val;
-                        memcpy(&val, data + offset, 4);
-                        input_data[i] = val;
-                        offset += 4;
-                    } else {
-                        input_data[i] = static_cast<int32_t>(data[offset++]);
-                    }
-                }
+            // Handle NaN and infinity
+            if (std::isnan(min_val) || std::isinf(min_val)) {
+                min_val = 0.0;
             }
         }
-        
-        // Test different scenarios
-        uint8_t test_case = (offset < size) ? data[offset++] % 6 : 0;
-        
+
+        if (offset + 8 <= Size) {
+            // Use bytes to create max value
+            uint64_t max_bits = 0;
+            for (int i = 0; i < 8 && offset < Size; i++) {
+                max_bits |= (static_cast<uint64_t>(Data[offset++]) << (i * 8));
+            }
+            max_val = *reinterpret_cast<double*>(&max_bits);
+            
+            // Handle NaN and infinity
+            if (std::isnan(max_val) || std::isinf(max_val)) {
+                max_val = 0.0;
+            }
+        }
+
+        // Ensure min <= max, swap if necessary
+        if (min_val > max_val) {
+            std::swap(min_val, max_val);
+        }
+
+        // Test different scenarios based on remaining data
+        uint8_t test_case = 0;
+        if (offset < Size) {
+            test_case = Data[offset++] % 6;
+        }
+
         torch::Tensor result;
+
         switch (test_case) {
-            case 0:
-                // Basic histc with specified bins, min, max
+            case 0: {
+                // Basic histc call
                 result = torch::histc(input, bins, min_val, max_val);
                 break;
-            case 1:
-                // histc with auto min/max (both 0)
+            }
+            case 1: {
+                // histc with min=max=0 (auto range)
                 result = torch::histc(input, bins, 0, 0);
                 break;
-            case 2:
-                // histc with min > max (edge case)
-                result = torch::histc(input, bins, max_val, min_val);
+            }
+            case 2: {
+                // histc with only bins specified
+                result = torch::histc(input, bins);
                 break;
-            case 3:
-                // histc with very large bins
-                result = torch::histc(input, 100000, min_val, max_val);
+            }
+            case 3: {
+                // histc with output tensor
+                torch::Tensor out = torch::empty({bins}, input.options().dtype(torch::kFloat));
+                result = torch::histc(input, bins, min_val, max_val, out);
                 break;
-            case 4:
-                // histc with bins = 1
-                result = torch::histc(input, 1, min_val, max_val);
+            }
+            case 4: {
+                // Test with very small range
+                double small_range = 1e-10;
+                result = torch::histc(input, bins, min_val, min_val + small_range);
                 break;
-            case 5:
-                // Test with pre-allocated output tensor
-                {
-                    torch::Tensor out = torch::empty({static_cast<int64_t>(bins)}, 
-                                                    torch::TensorOptions().dtype(torch::kFloat32));
-                    result = torch::histc_out(out, input, bins, min_val, max_val);
+            }
+            case 5: {
+                // Test with tensor containing special values
+                torch::Tensor special_input = input.clone();
+                if (special_input.dtype().isFloatingPoint() && special_input.numel() > 0) {
+                    // Add some NaN and inf values
+                    auto flat = special_input.flatten();
+                    if (flat.numel() > 0) {
+                        flat[0] = std::numeric_limits<double>::quiet_NaN();
+                    }
+                    if (flat.numel() > 1) {
+                        flat[1] = std::numeric_limits<double>::infinity();
+                    }
+                    if (flat.numel() > 2) {
+                        flat[2] = -std::numeric_limits<double>::infinity();
+                    }
                 }
+                result = torch::histc(special_input, bins, min_val, max_val);
                 break;
+            }
         }
-        
+
         // Verify result properties
         if (result.defined()) {
-            // Access result to ensure computation completed
-            auto sum = result.sum();
+            // Check that result has correct shape
+            if (result.dim() != 1 || result.size(0) != bins) {
+                std::cerr << "Unexpected result shape" << std::endl;
+            }
             
-            // Test edge cases with the result
-            if (offset < size && data[offset++] % 2) {
-                // Try to reshape result
-                if (result.numel() > 1) {
-                    result = result.view({-1});
+            // Check that result is non-negative (histogram counts)
+            if (result.dtype().isFloatingPoint()) {
+                auto min_val_result = torch::min(result);
+                if (min_val_result.item<double>() < 0) {
+                    std::cerr << "Negative histogram count detected" << std::endl;
+                }
+            }
+            
+            // Check that sum of histogram equals number of valid elements
+            // (excluding NaN and out-of-range values)
+            auto sum_result = torch::sum(result);
+            if (sum_result.dtype().isFloatingPoint()) {
+                double total_count = sum_result.item<double>();
+                if (total_count > input.numel()) {
+                    std::cerr << "Histogram count exceeds input size" << std::endl;
                 }
             }
         }
-        
-        // Test with special tensors
-        if (offset < size) {
-            uint8_t special_case = data[offset++] % 5;
-            torch::Tensor special_input;
-            
-            switch (special_case) {
-                case 0:
-                    // Empty tensor
-                    special_input = torch::empty({0});
+
+        // Test edge cases with different bin counts
+        if (offset < Size) {
+            uint8_t edge_case = Data[offset++] % 4;
+            switch (edge_case) {
+                case 0: {
+                    // Single bin
+                    auto single_bin_result = torch::histc(input, 1, min_val, max_val);
                     break;
-                case 1:
-                    // Tensor with NaN
-                    special_input = torch::tensor({1.0f, std::numeric_limits<float>::quiet_NaN(), 2.0f});
+                }
+                case 1: {
+                    // Many bins (but reasonable)
+                    auto many_bins_result = torch::histc(input, 500, min_val, max_val);
                     break;
-                case 2:
-                    // Tensor with Inf
-                    special_input = torch::tensor({1.0f, std::numeric_limits<float>::infinity(), 2.0f});
+                }
+                case 2: {
+                    // Test with empty tensor
+                    auto empty_input = torch::empty({0}, input.options());
+                    auto empty_result = torch::histc(empty_input, bins, min_val, max_val);
                     break;
-                case 3:
-                    // Very large tensor values
-                    special_input = torch::tensor({1e30f, -1e30f, 0.0f});
+                }
+                case 3: {
+                    // Test with 1D tensor of different sizes
+                    if (input.numel() > 0) {
+                        auto reshaped = input.flatten();
+                        auto reshaped_result = torch::histc(reshaped, bins, min_val, max_val);
+                    }
                     break;
-                case 4:
-                    // Single element tensor
-                    special_input = torch::tensor({42.0f});
-                    break;
-            }
-            
-            if (special_input.defined()) {
-                torch::Tensor special_result = torch::histc(special_input, bins, min_val, max_val);
+                }
             }
         }
-    }
-    catch (const c10::Error &e)
-    {
-        // PyTorch-specific errors are expected for invalid operations
-        return 0;
+
     }
     catch (const std::exception &e)
     {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
     }
-    
-    return 0;
+    return 0; // keep the input
 }

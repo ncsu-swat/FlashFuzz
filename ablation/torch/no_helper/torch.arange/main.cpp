@@ -1,183 +1,195 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <cstring>
-#include <vector>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (size < 16) {
-        return 0;  // Need minimum bytes for parameters
-    }
-
-    try {
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
+
+        // Need at least enough data for basic parameters
+        if (Size < 16) return 0;
+
+        // Extract fuzzing parameters
+        uint8_t variant = consume_uint8_t(Data, Size, offset);
         
-        // Extract start value (double)
-        double start = 0.0;
-        if (offset + sizeof(double) <= size) {
-            std::memcpy(&start, data + offset, sizeof(double));
-            offset += sizeof(double);
-            // Clamp to reasonable range to avoid infinite loops
-            if (std::isnan(start) || std::isinf(start)) {
-                start = 0.0;
-            } else if (start > 1e6) {
-                start = 1e6;
-            } else if (start < -1e6) {
-                start = -1e6;
+        // Test different variants of torch.arange
+        switch (variant % 8) {
+            case 0: {
+                // Test arange(end) - single parameter
+                double end = consume_double(Data, Size, offset);
+                if (offset >= Size) return 0;
+                
+                // Clamp end to reasonable range to avoid excessive memory usage
+                end = std::clamp(end, -10000.0, 10000.0);
+                
+                auto result = torch::arange(end);
+                break;
+            }
+            case 1: {
+                // Test arange(start, end) - two parameters
+                double start = consume_double(Data, Size, offset);
+                double end = consume_double(Data, Size, offset);
+                if (offset >= Size) return 0;
+                
+                // Clamp to reasonable ranges
+                start = std::clamp(start, -10000.0, 10000.0);
+                end = std::clamp(end, -10000.0, 10000.0);
+                
+                auto result = torch::arange(start, end);
+                break;
+            }
+            case 2: {
+                // Test arange(start, end, step) - three parameters
+                double start = consume_double(Data, Size, offset);
+                double end = consume_double(Data, Size, offset);
+                double step = consume_double(Data, Size, offset);
+                if (offset >= Size) return 0;
+                
+                // Clamp to reasonable ranges
+                start = std::clamp(start, -10000.0, 10000.0);
+                end = std::clamp(end, -10000.0, 10000.0);
+                
+                // Ensure step is not zero and not too small/large
+                if (std::abs(step) < 1e-10 || std::abs(step) > 1000.0) {
+                    step = (step >= 0) ? 1.0 : -1.0;
+                }
+                
+                auto result = torch::arange(start, end, step);
+                break;
+            }
+            case 3: {
+                // Test with different dtypes
+                double start = consume_double(Data, Size, offset);
+                double end = consume_double(Data, Size, offset);
+                uint8_t dtype_choice = consume_uint8_t(Data, Size, offset);
+                if (offset >= Size) return 0;
+                
+                start = std::clamp(start, -1000.0, 1000.0);
+                end = std::clamp(end, -1000.0, 1000.0);
+                
+                torch::ScalarType dtype;
+                switch (dtype_choice % 6) {
+                    case 0: dtype = torch::kFloat32; break;
+                    case 1: dtype = torch::kFloat64; break;
+                    case 2: dtype = torch::kInt32; break;
+                    case 3: dtype = torch::kInt64; break;
+                    case 4: dtype = torch::kInt16; break;
+                    case 5: dtype = torch::kInt8; break;
+                }
+                
+                auto options = torch::TensorOptions().dtype(dtype);
+                auto result = torch::arange(start, end, options);
+                break;
+            }
+            case 4: {
+                // Test with device specification
+                double end = consume_double(Data, Size, offset);
+                uint8_t device_choice = consume_uint8_t(Data, Size, offset);
+                if (offset >= Size) return 0;
+                
+                end = std::clamp(end, -1000.0, 1000.0);
+                
+                torch::Device device = (device_choice % 2 == 0) ? torch::kCPU : torch::kCPU; // Always CPU for safety
+                auto options = torch::TensorOptions().device(device);
+                auto result = torch::arange(end, options);
+                break;
+            }
+            case 5: {
+                // Test with requires_grad
+                double start = consume_double(Data, Size, offset);
+                double end = consume_double(Data, Size, offset);
+                bool requires_grad = consume_uint8_t(Data, Size, offset) % 2;
+                if (offset >= Size) return 0;
+                
+                start = std::clamp(start, -1000.0, 1000.0);
+                end = std::clamp(end, -1000.0, 1000.0);
+                
+                auto options = torch::TensorOptions().requires_grad(requires_grad);
+                auto result = torch::arange(start, end, options);
+                break;
+            }
+            case 6: {
+                // Test edge cases with integer parameters
+                int32_t start = static_cast<int32_t>(consume_uint32_t(Data, Size, offset) % 2000 - 1000);
+                int32_t end = static_cast<int32_t>(consume_uint32_t(Data, Size, offset) % 2000 - 1000);
+                int32_t step = static_cast<int32_t>(consume_uint32_t(Data, Size, offset) % 20 + 1);
+                if (offset >= Size) return 0;
+                
+                // Randomly make step negative
+                if (consume_uint8_t(Data, Size, offset) % 2) step = -step;
+                
+                auto result = torch::arange(start, end, step);
+                break;
+            }
+            case 7: {
+                // Test with all options combined
+                double start = consume_double(Data, Size, offset);
+                double end = consume_double(Data, Size, offset);
+                double step = consume_double(Data, Size, offset);
+                uint8_t dtype_choice = consume_uint8_t(Data, Size, offset);
+                bool requires_grad = consume_uint8_t(Data, Size, offset) % 2;
+                if (offset >= Size) return 0;
+                
+                start = std::clamp(start, -500.0, 500.0);
+                end = std::clamp(end, -500.0, 500.0);
+                
+                if (std::abs(step) < 1e-10 || std::abs(step) > 100.0) {
+                    step = (step >= 0) ? 1.0 : -1.0;
+                }
+                
+                torch::ScalarType dtype;
+                switch (dtype_choice % 4) {
+                    case 0: dtype = torch::kFloat32; break;
+                    case 1: dtype = torch::kFloat64; break;
+                    case 2: dtype = torch::kInt32; break;
+                    case 3: dtype = torch::kInt64; break;
+                }
+                
+                auto options = torch::TensorOptions()
+                    .dtype(dtype)
+                    .device(torch::kCPU)
+                    .requires_grad(requires_grad);
+                    
+                auto result = torch::arange(start, end, step, options);
+                break;
             }
         }
 
-        // Extract end value (double)
-        double end = 1.0;
-        if (offset + sizeof(double) <= size) {
-            std::memcpy(&end, data + offset, sizeof(double));
-            offset += sizeof(double);
-            // Clamp to reasonable range
-            if (std::isnan(end) || std::isinf(end)) {
-                end = start + 10.0;
-            } else if (end > 1e6) {
-                end = 1e6;
-            } else if (end < -1e6) {
-                end = -1e6;
-            }
-        }
-
-        // Extract step value (double)
-        double step = 1.0;
-        if (offset + sizeof(double) <= size) {
-            std::memcpy(&step, data + offset, sizeof(double));
-            offset += sizeof(double);
-            // Avoid zero/nan/inf step
-            if (std::isnan(step) || std::isinf(step) || step == 0.0) {
-                step = 1.0;
-            } else if (std::abs(step) > 1e4) {
-                step = (step > 0) ? 1e4 : -1e4;
-            }
-        }
-
-        // Extract dtype choice
-        uint8_t dtype_choice = 0;
-        if (offset < size) {
-            dtype_choice = data[offset++] % 8;
-        }
-
-        // Extract device choice
-        uint8_t device_choice = 0;
-        if (offset < size) {
-            device_choice = data[offset++] % 2;
-        }
-
-        // Extract requires_grad flag
-        bool requires_grad = false;
-        if (offset < size) {
-            requires_grad = (data[offset++] % 2) == 1;
-        }
-
-        // Set dtype based on fuzzer input
-        torch::ScalarType dtype = torch::kFloat32;
-        switch (dtype_choice) {
-            case 0: dtype = torch::kFloat32; break;
-            case 1: dtype = torch::kFloat64; break;
-            case 2: dtype = torch::kInt32; break;
-            case 3: dtype = torch::kInt64; break;
-            case 4: dtype = torch::kInt16; break;
-            case 5: dtype = torch::kInt8; break;
-            case 6: dtype = torch::kUInt8; break;
-            case 7: dtype = torch::kFloat16; break;
-            default: dtype = torch::kFloat32; break;
-        }
-
-        // Set device
-        torch::Device device = torch::kCPU;
-        if (device_choice == 1 && torch::cuda::is_available()) {
-            device = torch::kCUDA;
-        }
-
-        // Limit the number of elements to prevent OOM
-        double num_elements = std::abs((end - start) / step);
-        if (num_elements > 100000) {
-            // Adjust end to limit elements
-            end = start + step * 100000;
-        }
-
-        // Test 1: Basic arange with all parameters
-        {
-            auto options = torch::TensorOptions()
-                .dtype(dtype)
-                .device(device)
-                .requires_grad(requires_grad && (dtype == torch::kFloat32 || dtype == torch::kFloat64));
-            
-            torch::Tensor result = torch::arange(start, end, step, options);
-            
-            // Perform some operations to exercise the tensor
-            if (result.numel() > 0) {
-                auto sum = result.sum();
-                if (result.numel() > 1) {
-                    auto mean = result.mean();
+        // Additional edge case testing
+        if (offset < Size) {
+            uint8_t edge_case = consume_uint8_t(Data, Size, offset);
+            switch (edge_case % 4) {
+                case 0: {
+                    // Test with very small step
+                    auto result = torch::arange(0.0, 1.0, 0.1);
+                    break;
+                }
+                case 1: {
+                    // Test with negative range
+                    auto result = torch::arange(10, 0, -1);
+                    break;
+                }
+                case 2: {
+                    // Test with zero range
+                    auto result = torch::arange(5, 5);
+                    break;
+                }
+                case 3: {
+                    // Test with single element
+                    auto result = torch::arange(1);
+                    break;
                 }
             }
         }
 
-        // Test 2: arange with integer inputs for integer dtypes
-        if (dtype == torch::kInt32 || dtype == torch::kInt64 || 
-            dtype == torch::kInt16 || dtype == torch::kInt8) {
-            int64_t int_start = static_cast<int64_t>(start);
-            int64_t int_end = static_cast<int64_t>(end);
-            int64_t int_step = static_cast<int64_t>(step);
-            if (int_step == 0) int_step = 1;
-            
-            auto options = torch::TensorOptions()
-                .dtype(dtype)
-                .device(device);
-            
-            torch::Tensor result = torch::arange(int_start, int_end, int_step, options);
-        }
-
-        // Test 3: Single argument arange (end only)
-        if (offset < size && end > 0) {
-            auto options = torch::TensorOptions()
-                .dtype(dtype)
-                .device(device);
-            
-            torch::Tensor result = torch::arange(end, options);
-        }
-
-        // Test 4: Two argument arange (start, end)
-        {
-            auto options = torch::TensorOptions()
-                .dtype(dtype)
-                .device(device);
-            
-            torch::Tensor result = torch::arange(start, end, options);
-        }
-
-        // Test 5: Edge cases with negative step
-        if (step < 0 && start > end) {
-            auto options = torch::TensorOptions()
-                .dtype(torch::kFloat32)
-                .device(device);
-            
-            torch::Tensor result = torch::arange(start, end, step, options);
-        }
-
-        // Test 6: Very small step values (floating point precision test)
-        if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-            double tiny_step = 1e-6;
-            double tiny_end = start + tiny_step * 100;
-            
-            auto options = torch::TensorOptions()
-                .dtype(dtype)
-                .device(device);
-            
-            torch::Tensor result = torch::arange(start, tiny_end, tiny_step, options);
-        }
-
-    } catch (const c10::Error& e) {
-        // PyTorch-specific exceptions are expected for invalid inputs
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
     }
-
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

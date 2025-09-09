@@ -216,8 +216,10 @@ __fuzz_result
 
 .vscode
 testharness_generation/torch_cpu/torch_cpu
-testharness_generation/torch_cpu/torch_cpu_1
+testharness_generation/torch_cpu/torch_cpu_*
 reports/torch2.7-fuzz-600s-crashes-bullets.txt
 reports/torch2.7-fuzz-600s-crashes-bullets.filtered-by-2.2.txt
 testharness_generation/torch_cpu/run.sh
 testharness_generation/torch_cpu/run1.sh
+_pytorch_abb
+_tf_abb

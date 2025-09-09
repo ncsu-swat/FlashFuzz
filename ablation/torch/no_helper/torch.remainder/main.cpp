@@ -1,245 +1,188 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (size < 16) {
-        return 0;  // Need minimum bytes for configuration
-    }
-
-    try {
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
-        
-        // Helper lambda to consume bytes
-        auto consumeBytes = [&](size_t n) -> std::vector<uint8_t> {
-            if (offset + n > size) {
-                n = (size > offset) ? (size - offset) : 0;
-            }
-            std::vector<uint8_t> result(data + offset, data + offset + n);
-            offset += n;
-            return result;
-        };
-        
-        auto consumeByte = [&]() -> uint8_t {
-            if (offset >= size) return 0;
-            return data[offset++];
-        };
-        
-        auto consumeInt = [&]() -> int {
-            if (offset + sizeof(int) > size) return 1;
-            int val;
-            std::memcpy(&val, data + offset, sizeof(int));
-            offset += sizeof(int);
-            return (std::abs(val) % 100) + 1;  // Bounded positive value
-        };
-        
-        auto consumeFloat = [&]() -> float {
-            if (offset + sizeof(float) > size) return 1.0f;
-            float val;
-            std::memcpy(&val, data + offset, sizeof(float));
-            offset += sizeof(float);
-            return val;
-        };
 
-        // Determine tensor configuration for input
-        uint8_t config1 = consumeByte();
-        bool use_scalar_input = (config1 & 1);
-        uint8_t dtype_selector1 = (config1 >> 1) & 7;
-        
+        // Need at least basic data for tensor creation
+        if (Size < 16) {
+            return 0;
+        }
+
+        // Generate input tensor
+        auto input_info = generate_tensor_info(Data, Size, offset);
+        if (input_info.numel == 0) {
+            return 0;
+        }
+
+        // Create input tensor with various dtypes (excluding complex)
         torch::Tensor input;
-        
-        if (use_scalar_input) {
-            // Create scalar tensor
-            float scalar_val = consumeFloat();
-            input = torch::tensor(scalar_val);
-        } else {
-            // Create tensor with shape
-            int ndims = (consumeByte() % 4) + 1;
-            std::vector<int64_t> shape;
-            int64_t total_elements = 1;
-            
-            for (int i = 0; i < ndims; i++) {
-                int dim_size = consumeInt() % 10;  // Keep dimensions small
-                shape.push_back(dim_size);
-                total_elements *= dim_size;
-                if (total_elements > 1000) break;  // Prevent excessive memory
-            }
-            
-            // Select dtype for input
-            torch::ScalarType dtype;
-            switch (dtype_selector1) {
-                case 0: dtype = torch::kFloat32; break;
-                case 1: dtype = torch::kFloat64; break;
-                case 2: dtype = torch::kInt32; break;
-                case 3: dtype = torch::kInt64; break;
-                case 4: dtype = torch::kInt8; break;
-                case 5: dtype = torch::kUInt8; break;
-                case 6: dtype = torch::kInt16; break;
-                default: dtype = torch::kFloat32; break;
-            }
-            
-            // Create input tensor
-            if (total_elements == 0) {
-                input = torch::empty(shape, torch::dtype(dtype));
-            } else {
-                input = torch::randn(shape, torch::dtype(dtype));
-                
-                // Fill with fuzzed data
-                if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-                    auto input_accessor = input.flatten();
-                    for (int64_t i = 0; i < input_accessor.numel() && offset < size; i++) {
-                        float val = consumeFloat();
-                        // Include special values occasionally
-                        uint8_t special = consumeByte();
-                        if (special < 5) val = 0.0f;
-                        else if (special < 10) val = std::numeric_limits<float>::infinity();
-                        else if (special < 15) val = -std::numeric_limits<float>::infinity();
-                        else if (special < 20) val = std::numeric_limits<float>::quiet_NaN();
-                        
-                        input_accessor[i] = val;
-                    }
-                } else {
-                    auto input_accessor = input.flatten();
-                    for (int64_t i = 0; i < input_accessor.numel() && offset < size; i++) {
-                        input_accessor[i] = static_cast<int>(consumeInt());
-                    }
-                }
-            }
+        auto dtype_choice = get_value<uint8_t>(Data, Size, offset) % 6;
+        switch (dtype_choice) {
+            case 0: input = create_tensor(input_info, torch::kFloat32); break;
+            case 1: input = create_tensor(input_info, torch::kFloat64); break;
+            case 2: input = create_tensor(input_info, torch::kInt32); break;
+            case 3: input = create_tensor(input_info, torch::kInt64); break;
+            case 4: input = create_tensor(input_info, torch::kInt8); break;
+            case 5: input = create_tensor(input_info, torch::kInt16); break;
         }
+
+        // Test different types of divisors
+        auto divisor_type = get_value<uint8_t>(Data, Size, offset) % 4;
         
-        // Determine configuration for other
-        uint8_t config2 = consumeByte();
-        bool use_scalar_other = (config2 & 1);
-        bool use_same_shape = (config2 & 2) && !use_scalar_input;
-        uint8_t dtype_selector2 = (config2 >> 2) & 7;
-        
-        torch::Tensor other;
-        
-        if (use_scalar_other) {
-            // Create scalar for other
-            float scalar_val = consumeFloat();
-            // Occasionally use zero or near-zero divisor
-            uint8_t zero_chance = consumeByte();
-            if (zero_chance < 30) scalar_val = 0.0f;
-            else if (zero_chance < 60) scalar_val = 1e-10f;
+        if (divisor_type == 0) {
+            // Test with scalar divisor
+            auto scalar_val = get_value<float>(Data, Size, offset);
             
-            other = torch::tensor(scalar_val);
-        } else {
-            // Create tensor for other
-            std::vector<int64_t> other_shape;
-            
-            if (use_same_shape && input.dim() > 0) {
-                other_shape = input.sizes().vec();
-            } else {
-                // Create potentially broadcastable shape
-                int ndims = (consumeByte() % 4) + 1;
-                int64_t total_elements = 1;
-                
-                for (int i = 0; i < ndims; i++) {
-                    int dim_size = consumeInt() % 10;
-                    // Occasionally use size 1 for broadcasting
-                    if (consumeByte() < 50) dim_size = 1;
-                    other_shape.push_back(dim_size);
-                    total_elements *= dim_size;
-                    if (total_elements > 1000) break;
+            // Avoid zero divisor for most cases, but test it occasionally
+            if (scalar_val == 0.0f) {
+                auto zero_test = get_value<uint8_t>(Data, Size, offset) % 10;
+                if (zero_test != 0) {
+                    scalar_val = 1.0f; // Replace zero with non-zero
                 }
             }
             
-            // Select dtype for other
-            torch::ScalarType dtype;
-            switch (dtype_selector2) {
-                case 0: dtype = torch::kFloat32; break;
-                case 1: dtype = torch::kFloat64; break;
-                case 2: dtype = torch::kInt32; break;
-                case 3: dtype = torch::kInt64; break;
-                case 4: dtype = torch::kInt8; break;
-                case 5: dtype = torch::kUInt8; break;
-                case 6: dtype = torch::kInt16; break;
-                default: dtype = torch::kFloat32; break;
+            // Test with positive and negative scalars
+            if (get_value<uint8_t>(Data, Size, offset) % 2 == 0) {
+                scalar_val = -std::abs(scalar_val);
             }
             
-            // Create other tensor
-            int64_t total_other = 1;
-            for (auto d : other_shape) total_other *= d;
+            auto result = torch::remainder(input, scalar_val);
             
-            if (total_other == 0) {
-                other = torch::empty(other_shape, torch::dtype(dtype));
-            } else {
-                other = torch::randn(other_shape, torch::dtype(dtype));
+            // Test with out parameter
+            if (get_value<uint8_t>(Data, Size, offset) % 3 == 0) {
+                auto out_tensor = torch::empty_like(result);
+                torch::remainder_out(out_tensor, input, scalar_val);
+            }
+            
+        } else if (divisor_type == 1) {
+            // Test with tensor divisor of same shape
+            auto other_info = input_info; // Same shape as input
+            torch::Tensor other;
+            
+            auto other_dtype_choice = get_value<uint8_t>(Data, Size, offset) % 6;
+            switch (other_dtype_choice) {
+                case 0: other = create_tensor(other_info, torch::kFloat32); break;
+                case 1: other = create_tensor(other_info, torch::kFloat64); break;
+                case 2: other = create_tensor(other_info, torch::kInt32); break;
+                case 3: other = create_tensor(other_info, torch::kInt64); break;
+                case 4: other = create_tensor(other_info, torch::kInt8); break;
+                case 5: other = create_tensor(other_info, torch::kInt16); break;
+            }
+            
+            // Avoid zero divisors in most cases
+            auto mask = other == 0;
+            if (mask.any().item<bool>()) {
+                auto zero_replacement = get_value<uint8_t>(Data, Size, offset) % 10;
+                if (zero_replacement != 0) {
+                    other = torch::where(mask, torch::ones_like(other), other);
+                }
+            }
+            
+            auto result = torch::remainder(input, other);
+            
+            // Test with out parameter
+            if (get_value<uint8_t>(Data, Size, offset) % 3 == 0) {
+                auto out_tensor = torch::empty_like(result);
+                torch::remainder_out(out_tensor, input, other);
+            }
+            
+        } else if (divisor_type == 2) {
+            // Test with broadcasting - different shapes
+            auto other_info = generate_tensor_info(Data, Size, offset);
+            if (other_info.numel > 0) {
+                torch::Tensor other = create_tensor(other_info, torch::kFloat32);
                 
-                // Fill with fuzzed data, including zeros
-                if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-                    auto other_accessor = other.flatten();
-                    for (int64_t i = 0; i < other_accessor.numel() && offset < size; i++) {
-                        float val = consumeFloat();
-                        // Higher chance of zeros and special values for divisor
-                        uint8_t special = consumeByte();
-                        if (special < 40) val = 0.0f;
-                        else if (special < 50) val = 1e-10f;
-                        else if (special < 55) val = -1e-10f;
-                        else if (special < 60) val = std::numeric_limits<float>::infinity();
-                        else if (special < 65) val = -std::numeric_limits<float>::infinity();
-                        else if (special < 70) val = std::numeric_limits<float>::quiet_NaN();
-                        
-                        other_accessor[i] = val;
+                // Avoid zero divisors
+                auto mask = other == 0;
+                if (mask.any().item<bool>()) {
+                    other = torch::where(mask, torch::ones_like(other), other);
+                }
+                
+                auto result = torch::remainder(input, other);
+            }
+            
+        } else {
+            // Test edge cases with special values
+            auto special_case = get_value<uint8_t>(Data, Size, offset) % 5;
+            
+            switch (special_case) {
+                case 0: {
+                    // Test with very small divisor
+                    auto small_val = 1e-6f;
+                    if (get_value<uint8_t>(Data, Size, offset) % 2 == 0) {
+                        small_val = -small_val;
                     }
-                } else {
-                    auto other_accessor = other.flatten();
-                    for (int64_t i = 0; i < other_accessor.numel() && offset < size; i++) {
-                        int val = consumeInt();
-                        // Include zeros
-                        if (consumeByte() < 40) val = 0;
-                        other_accessor[i] = val;
+                    auto result = torch::remainder(input, small_val);
+                    break;
+                }
+                case 1: {
+                    // Test with very large divisor
+                    auto large_val = 1e6f;
+                    if (get_value<uint8_t>(Data, Size, offset) % 2 == 0) {
+                        large_val = -large_val;
                     }
+                    auto result = torch::remainder(input, large_val);
+                    break;
+                }
+                case 2: {
+                    // Test with fractional divisor
+                    auto frac_val = 0.5f + get_value<float>(Data, Size, offset) * 0.001f;
+                    if (get_value<uint8_t>(Data, Size, offset) % 2 == 0) {
+                        frac_val = -frac_val;
+                    }
+                    auto result = torch::remainder(input, frac_val);
+                    break;
+                }
+                case 3: {
+                    // Test with integer divisor
+                    auto int_val = static_cast<int>(get_value<uint8_t>(Data, Size, offset) % 10 + 1);
+                    if (get_value<uint8_t>(Data, Size, offset) % 2 == 0) {
+                        int_val = -int_val;
+                    }
+                    auto result = torch::remainder(input, int_val);
+                    break;
+                }
+                case 4: {
+                    // Test with tensor containing mixed positive/negative values
+                    auto mixed_tensor = torch::randn_like(input.to(torch::kFloat32));
+                    // Ensure no zeros
+                    mixed_tensor = torch::where(mixed_tensor == 0, torch::ones_like(mixed_tensor), mixed_tensor);
+                    auto result = torch::remainder(input, mixed_tensor);
+                    break;
                 }
             }
         }
-        
-        // Decide whether to use out parameter
-        bool use_out = consumeByte() < 128;
-        
-        if (use_out) {
-            // Create output tensor
-            torch::Tensor out;
-            
-            // Try to infer output shape (broadcasting rules)
-            try {
-                auto dummy_result = torch::empty_like(torch::add(input, other));
-                out = torch::empty_like(dummy_result);
-                
-                // Call remainder with out parameter
-                torch::remainder_out(out, input, other);
-            } catch (...) {
-                // If shape inference fails, try without out
-                torch::remainder(input, other);
+
+        // Test method call syntax as well
+        if (get_value<uint8_t>(Data, Size, offset) % 4 == 0) {
+            auto divisor_val = get_value<float>(Data, Size, offset);
+            if (divisor_val == 0.0f) {
+                divisor_val = 1.0f;
             }
-        } else {
-            // Call remainder without out parameter
-            torch::Tensor result = torch::remainder(input, other);
-            
-            // Optionally perform some operations on result to trigger more code paths
-            if (consumeByte() < 100) {
-                auto sum = result.sum();
-                auto mean = result.mean();
+            auto result = input.remainder(divisor_val);
+        }
+
+        // Test in-place operation
+        if (get_value<uint8_t>(Data, Size, offset) % 5 == 0) {
+            auto input_copy = input.clone();
+            auto divisor_val = get_value<float>(Data, Size, offset);
+            if (divisor_val == 0.0f) {
+                divisor_val = 1.0f;
             }
+            input_copy.remainder_(divisor_val);
         }
-        
-        // Try scalar versions
-        if (consumeByte() < 50 && input.numel() > 0) {
-            float scalar_divisor = consumeFloat();
-            if (consumeByte() < 30) scalar_divisor = 0.0f;  // Test division by zero
-            
-            torch::Tensor scalar_result = torch::remainder(input, scalar_divisor);
-        }
-        
-    } catch (const c10::Error& e) {
-        // PyTorch-specific errors are expected for invalid operations
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

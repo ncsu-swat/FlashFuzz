@@ -1,206 +1,153 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
     try
     {
-        if (Size < 16) {
-            // Need minimum bytes for basic tensor construction
-            return 0;
-        }
-
         size_t offset = 0;
 
-        // Extract parameters from fuzzer input
-        uint8_t rank = Data[offset++] % 5; // Limit rank to 0-4 for memory constraints
-        uint8_t dtype_selector = Data[offset++] % 4;
-        uint8_t device_selector = Data[offset++] % 2;
-        uint8_t requires_grad = Data[offset++] % 2;
-        uint8_t layout_selector = Data[offset++] % 2;
+        // Need at least basic parameters
+        if (Size < 16) return 0;
+
+        // Extract matrix dimensions
+        int rows = extractInt(Data, Size, offset, 1, 10);
+        int cols = extractInt(Data, Size, offset, 1, 10);
         
-        // Determine dtype
+        // matrix_exp requires square matrices
+        int dim = std::min(rows, cols);
+        
+        // Extract data type
+        int dtype_idx = extractInt(Data, Size, offset, 0, 3);
         torch::ScalarType dtype;
-        switch (dtype_selector) {
+        switch (dtype_idx) {
             case 0: dtype = torch::kFloat32; break;
             case 1: dtype = torch::kFloat64; break;
             case 2: dtype = torch::kComplexFloat; break;
             case 3: dtype = torch::kComplexDouble; break;
-            default: dtype = torch::kFloat32;
+            default: dtype = torch::kFloat32; break;
         }
 
-        // Determine device
-        torch::Device device = device_selector ? torch::kCUDA : torch::kCPU;
-        if (device == torch::kCUDA && !torch::cuda::is_available()) {
-            device = torch::kCPU;
-        }
+        // Extract device type
+        torch::Device device = extractDevice(Data, Size, offset);
 
-        // Build tensor shape - matrix_exp expects square matrices
-        std::vector<int64_t> shape;
-        if (rank == 0) {
-            // Scalar case - will likely fail but tests edge case
-            shape = {};
-        } else if (rank == 1) {
-            // 1D tensor - will likely fail but tests edge case
-            uint8_t dim = Data[offset++] % 16 + 1;
-            shape = {dim};
-        } else if (rank == 2) {
-            // 2D square matrix - expected case
-            uint8_t dim = Data[offset++] % 10 + 1; // Keep matrices small
-            shape = {dim, dim};
-        } else {
-            // Higher dimensional with last two dims as square matrix
-            for (int i = 0; i < rank - 2 && offset < Size; i++) {
-                shape.push_back((Data[offset++] % 3) + 1);
+        // Create square matrix
+        torch::Tensor A = torch::randn({dim, dim}, torch::TensorOptions().dtype(dtype).device(device));
+        
+        // Fill matrix with fuzzed data
+        if (dtype == torch::kFloat32) {
+            auto accessor = A.accessor<float, 2>();
+            for (int i = 0; i < dim && offset < Size; i++) {
+                for (int j = 0; j < dim && offset < Size; j++) {
+                    accessor[i][j] = extractFloat(Data, Size, offset);
+                }
             }
-            uint8_t matrix_dim = (offset < Size) ? (Data[offset++] % 8 + 1) : 3;
-            shape.push_back(matrix_dim);
-            shape.push_back(matrix_dim);
-        }
-
-        // Calculate total elements
-        int64_t numel = 1;
-        for (auto dim : shape) {
-            numel *= dim;
-        }
-        
-        // Limit total size to prevent OOM
-        if (numel > 10000) {
-            return 0;
-        }
-
-        // Create tensor with various initialization methods
-        torch::Tensor tensor;
-        uint8_t init_method = (offset < Size) ? Data[offset++] % 6 : 0;
-        
-        torch::TensorOptions options = torch::TensorOptions()
-            .dtype(dtype)
-            .device(device)
-            .requires_grad(requires_grad);
-
-        if (shape.empty()) {
-            // Scalar tensor
-            float value = (offset < Size) ? static_cast<float>(Data[offset++]) / 128.0f : 1.0f;
-            tensor = torch::tensor(value, options);
-        } else {
-            switch (init_method) {
-                case 0:
-                    tensor = torch::zeros(shape, options);
-                    break;
-                case 1:
-                    tensor = torch::ones(shape, options);
-                    break;
-                case 2:
-                    tensor = torch::randn(shape, options);
-                    break;
-                case 3:
-                    tensor = torch::eye(shape.size() >= 2 ? shape[shape.size()-2] : 1, options);
-                    if (shape.size() > 2) {
-                        // Broadcast eye to batch dimensions
-                        std::vector<int64_t> broadcast_shape = shape;
-                        tensor = tensor.expand(broadcast_shape);
-                    }
-                    break;
-                case 4: {
-                    // Create from raw data if enough bytes available
-                    tensor = torch::empty(shape, options);
-                    if (dtype == torch::kFloat32 || dtype == torch::kComplexFloat) {
-                        float* data_ptr = tensor.data_ptr<float>();
-                        int64_t float_numel = (dtype == torch::kComplexFloat) ? numel * 2 : numel;
-                        for (int64_t i = 0; i < float_numel && offset < Size; i++) {
-                            data_ptr[i] = static_cast<float>(Data[offset++]) / 128.0f;
-                        }
-                    } else if (dtype == torch::kFloat64 || dtype == torch::kComplexDouble) {
-                        double* data_ptr = tensor.data_ptr<double>();
-                        int64_t double_numel = (dtype == torch::kComplexDouble) ? numel * 2 : numel;
-                        for (int64_t i = 0; i < double_numel && offset < Size; i++) {
-                            data_ptr[i] = static_cast<double>(Data[offset++]) / 128.0;
-                        }
-                    }
-                    break;
+        } else if (dtype == torch::kFloat64) {
+            auto accessor = A.accessor<double, 2>();
+            for (int i = 0; i < dim && offset < Size; i++) {
+                for (int j = 0; j < dim && offset < Size; j++) {
+                    accessor[i][j] = extractDouble(Data, Size, offset);
                 }
-                case 5: {
-                    // Create with special values (inf, nan)
-                    tensor = torch::empty(shape, options);
-                    if (offset < Size) {
-                        uint8_t special_val = Data[offset++] % 4;
-                        switch (special_val) {
-                            case 0: tensor.fill_(std::numeric_limits<float>::infinity()); break;
-                            case 1: tensor.fill_(-std::numeric_limits<float>::infinity()); break;
-                            case 2: tensor.fill_(std::numeric_limits<float>::quiet_NaN()); break;
-                            case 3: tensor.fill_(0.0); break;
-                        }
-                    }
-                    break;
+            }
+        } else if (dtype == torch::kComplexFloat) {
+            auto accessor = A.accessor<c10::complex<float>, 2>();
+            for (int i = 0; i < dim && offset < Size; i++) {
+                for (int j = 0; j < dim && offset < Size; j++) {
+                    float real = extractFloat(Data, Size, offset);
+                    float imag = extractFloat(Data, Size, offset);
+                    accessor[i][j] = c10::complex<float>(real, imag);
                 }
-                default:
-                    tensor = torch::randn(shape, options);
+            }
+        } else if (dtype == torch::kComplexDouble) {
+            auto accessor = A.accessor<c10::complex<double>, 2>();
+            for (int i = 0; i < dim && offset < Size; i++) {
+                for (int j = 0; j < dim && offset < Size; j++) {
+                    double real = extractDouble(Data, Size, offset);
+                    double imag = extractDouble(Data, Size, offset);
+                    accessor[i][j] = c10::complex<double>(real, imag);
+                }
             }
         }
 
-        // Apply additional transformations
+        // Test basic matrix_exp
+        torch::Tensor result = torch::matrix_exp(A);
+        
+        // Verify result properties
+        if (result.sizes() != A.sizes()) {
+            std::cerr << "matrix_exp result has wrong shape" << std::endl;
+        }
+        
+        if (result.dtype() != A.dtype()) {
+            std::cerr << "matrix_exp result has wrong dtype" << std::endl;
+        }
+
+        // Test edge cases with special matrices
         if (offset < Size) {
-            uint8_t transform = Data[offset++] % 4;
-            switch (transform) {
-                case 0:
-                    // Make tensor contiguous
-                    tensor = tensor.contiguous();
-                    break;
-                case 1:
-                    // Transpose if 2D or higher
-                    if (tensor.dim() >= 2) {
-                        tensor = tensor.transpose(-2, -1);
-                    }
-                    break;
-                case 2:
-                    // Add small noise
-                    if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-                        tensor = tensor + torch::randn_like(tensor) * 0.01;
-                    }
-                    break;
-                case 3:
-                    // Make symmetric (for square matrices)
-                    if (tensor.dim() >= 2 && tensor.size(-1) == tensor.size(-2)) {
-                        tensor = (tensor + tensor.transpose(-2, -1)) / 2.0;
-                    }
-                    break;
-            }
-        }
-
-        // Call matrix_exp
-        torch::Tensor result = torch::matrix_exp(tensor);
-
-        // Perform basic operations on result to ensure it's valid
-        if (result.defined()) {
-            // Access some properties to trigger potential issues
-            auto result_shape = result.sizes();
-            auto result_dtype = result.dtype();
-            auto result_device = result.device();
+            int special_case = extractInt(Data, Size, offset, 0, 4);
             
-            // Try to compute some values
-            if (result.numel() > 0) {
-                auto sum_val = result.sum();
-                auto mean_val = result.mean();
-                
-                // Check for NaN/Inf in result
-                auto has_nan = result.isnan().any().item<bool>();
-                auto has_inf = result.isinf().any().item<bool>();
+            switch (special_case) {
+                case 0: {
+                    // Zero matrix
+                    torch::Tensor zero_mat = torch::zeros({dim, dim}, torch::TensorOptions().dtype(dtype).device(device));
+                    torch::Tensor zero_exp = torch::matrix_exp(zero_mat);
+                    break;
+                }
+                case 1: {
+                    // Identity matrix
+                    torch::Tensor eye_mat = torch::eye(dim, torch::TensorOptions().dtype(dtype).device(device));
+                    torch::Tensor eye_exp = torch::matrix_exp(eye_mat);
+                    break;
+                }
+                case 2: {
+                    // Diagonal matrix
+                    torch::Tensor diag_vals = torch::randn({dim}, torch::TensorOptions().dtype(dtype).device(device));
+                    torch::Tensor diag_mat = torch::diag(diag_vals);
+                    torch::Tensor diag_exp = torch::matrix_exp(diag_mat);
+                    break;
+                }
+                case 3: {
+                    // Upper triangular matrix
+                    torch::Tensor upper_mat = torch::triu(A);
+                    torch::Tensor upper_exp = torch::matrix_exp(upper_mat);
+                    break;
+                }
+                case 4: {
+                    // Lower triangular matrix
+                    torch::Tensor lower_mat = torch::tril(A);
+                    torch::Tensor lower_exp = torch::matrix_exp(lower_mat);
+                    break;
+                }
             }
         }
 
-    }
-    catch (const c10::Error &e)
-    {
-        // PyTorch-specific errors are expected for invalid inputs
-        return 0;
+        // Test with different matrix sizes if we have more data
+        if (offset < Size) {
+            int new_dim = extractInt(Data, Size, offset, 1, 5);
+            torch::Tensor small_mat = torch::randn({new_dim, new_dim}, torch::TensorOptions().dtype(dtype).device(device));
+            torch::Tensor small_exp = torch::matrix_exp(small_mat);
+        }
+
+        // Test batched matrices
+        if (offset < Size && dim <= 5) {
+            int batch_size = extractInt(Data, Size, offset, 1, 3);
+            torch::Tensor batch_mat = torch::randn({batch_size, dim, dim}, torch::TensorOptions().dtype(dtype).device(device));
+            torch::Tensor batch_exp = torch::matrix_exp(batch_mat);
+            
+            if (batch_exp.sizes() != batch_mat.sizes()) {
+                std::cerr << "Batched matrix_exp result has wrong shape" << std::endl;
+            }
+        }
+
+        // Force evaluation of results
+        result.sum().item<double>();
+
     }
     catch (const std::exception &e)
     {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
     }
-    return 0;
+    return 0; // keep the input
 }

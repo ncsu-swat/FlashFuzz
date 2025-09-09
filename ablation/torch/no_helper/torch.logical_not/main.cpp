@@ -1,206 +1,161 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
     try
     {
-        if (Size < 8) {
-            return 0;  // Need minimum bytes for basic tensor creation
-        }
-
         size_t offset = 0;
-        
-        // Extract parameters from fuzzer input
-        uint8_t dtype_selector = Data[offset++] % 10;
-        uint8_t ndims = (Data[offset++] % 5) + 1;  // 1-5 dimensions
-        bool use_out_tensor = Data[offset++] & 1;
-        uint8_t out_dtype_selector = Data[offset++] % 10;
-        bool make_non_contiguous = Data[offset++] & 1;
-        
-        // Build shape vector
-        std::vector<int64_t> shape;
-        size_t total_elements = 1;
-        for (size_t i = 0; i < ndims && offset < Size; ++i) {
-            int64_t dim = (Data[offset++] % 8);  // 0-7 to allow empty tensors
-            shape.push_back(dim);
-            total_elements *= dim;
-        }
-        
-        // Limit total elements to prevent OOM
-        if (total_elements > 100000) {
+
+        // Need at least basic data for tensor creation
+        if (Size < 16) {
             return 0;
         }
+
+        // Extract tensor configuration
+        auto dtype = extract_dtype(Data, Size, offset);
+        auto shape = extract_shape(Data, Size, offset);
         
-        // Create input tensor with various dtypes
+        // Skip if shape is too large to avoid memory issues
+        int64_t total_elements = 1;
+        for (auto dim : shape) {
+            total_elements *= dim;
+            if (total_elements > 10000) {
+                return 0;
+            }
+        }
+
+        // Create input tensor with various data types
         torch::Tensor input;
-        torch::TensorOptions options;
         
-        switch (dtype_selector) {
-            case 0:
-                options = torch::TensorOptions().dtype(torch::kBool);
-                break;
-            case 1:
-                options = torch::TensorOptions().dtype(torch::kInt8);
-                break;
-            case 2:
-                options = torch::TensorOptions().dtype(torch::kInt16);
-                break;
-            case 3:
-                options = torch::TensorOptions().dtype(torch::kInt32);
-                break;
-            case 4:
-                options = torch::TensorOptions().dtype(torch::kInt64);
-                break;
-            case 5:
-                options = torch::TensorOptions().dtype(torch::kFloat16);
-                break;
-            case 6:
-                options = torch::TensorOptions().dtype(torch::kFloat32);
-                break;
-            case 7:
-                options = torch::TensorOptions().dtype(torch::kFloat64);
-                break;
-            case 8:
-                options = torch::TensorOptions().dtype(torch::kUInt8);
-                break;
-            default:
-                options = torch::TensorOptions().dtype(torch::kFloat32);
-        }
-        
-        // Create input tensor
-        if (total_elements == 0) {
-            input = torch::empty(shape, options);
-        } else if (offset + total_elements <= Size) {
-            // Use fuzzer data for tensor values
-            input = torch::empty(shape, options);
-            
-            if (options.dtype() == torch::kBool) {
-                auto accessor = input.flatten().accessor<bool, 1>();
-                for (int64_t i = 0; i < total_elements; ++i) {
-                    accessor[i] = Data[offset++] & 1;
-                }
-            } else if (options.dtype() == torch::kInt8) {
-                auto accessor = input.flatten().accessor<int8_t, 1>();
-                for (int64_t i = 0; i < total_elements; ++i) {
-                    accessor[i] = static_cast<int8_t>(Data[offset++]);
-                }
-            } else if (options.dtype() == torch::kUInt8) {
-                auto accessor = input.flatten().accessor<uint8_t, 1>();
-                for (int64_t i = 0; i < total_elements; ++i) {
-                    accessor[i] = Data[offset++];
-                }
-            } else {
-                // For other types, use random values
-                input = torch::randn(shape, options);
-                if (offset < Size) {
-                    float scale = static_cast<float>(Data[offset++]) / 255.0f * 20.0f - 10.0f;
-                    input.mul_(scale);
-                }
+        if (dtype == torch::kBool) {
+            // For boolean tensors, create with random true/false values
+            input = torch::randint(0, 2, shape, torch::kBool);
+        } else if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
+            // For floating point, include zeros, positive, negative, inf, nan
+            input = torch::randn(shape, dtype);
+            if (total_elements > 0) {
+                // Inject some special values
+                auto flat = input.flatten();
+                if (flat.numel() > 0) flat[0] = 0.0;
+                if (flat.numel() > 1) flat[1] = std::numeric_limits<double>::infinity();
+                if (flat.numel() > 2) flat[2] = std::numeric_limits<double>::quiet_NaN();
+                if (flat.numel() > 3) flat[3] = -std::numeric_limits<double>::infinity();
             }
         } else {
-            // Not enough data, use random tensor
-            input = torch::randn(shape, options);
+            // For integer types, include zeros and non-zeros
+            input = torch::randint(-100, 101, shape, dtype);
+            if (total_elements > 0) {
+                auto flat = input.flatten();
+                if (flat.numel() > 0) flat[0] = 0; // Ensure we have at least one zero
+            }
+        }
+
+        // Test basic logical_not operation
+        auto result1 = torch::logical_not(input);
+        
+        // Verify result properties
+        if (result1.dtype() != torch::kBool) {
+            std::cerr << "logical_not should return bool tensor by default" << std::endl;
         }
         
-        // Make non-contiguous if requested
-        if (make_non_contiguous && ndims > 1 && shape[0] > 1) {
-            input = input.transpose(0, ndims - 1);
+        if (!result1.sizes().equals(input.sizes())) {
+            std::cerr << "logical_not should preserve input shape" << std::endl;
         }
-        
-        // Test logical_not with and without out tensor
-        if (use_out_tensor && total_elements > 0) {
-            torch::TensorOptions out_options;
-            switch (out_dtype_selector) {
-                case 0:
-                    out_options = torch::TensorOptions().dtype(torch::kBool);
-                    break;
-                case 1:
-                    out_options = torch::TensorOptions().dtype(torch::kInt8);
-                    break;
-                case 2:
-                    out_options = torch::TensorOptions().dtype(torch::kInt16);
-                    break;
-                case 3:
-                    out_options = torch::TensorOptions().dtype(torch::kInt32);
-                    break;
-                case 4:
-                    out_options = torch::TensorOptions().dtype(torch::kFloat32);
-                    break;
-                case 5:
-                    out_options = torch::TensorOptions().dtype(torch::kUInt8);
-                    break;
-                default:
-                    out_options = torch::TensorOptions().dtype(torch::kBool);
+
+        // Test with output tensor of different dtypes
+        if (offset < Size - 1) {
+            uint8_t out_dtype_idx = Data[offset++];
+            std::vector<torch::ScalarType> out_dtypes = {
+                torch::kBool, torch::kInt8, torch::kInt16, torch::kInt32, torch::kInt64,
+                torch::kFloat32, torch::kFloat64
+            };
+            
+            auto out_dtype = out_dtypes[out_dtype_idx % out_dtypes.size()];
+            auto out_tensor = torch::empty(shape, out_dtype);
+            
+            // Test with pre-allocated output tensor
+            torch::logical_not_out(out_tensor, input);
+            
+            // Verify output tensor properties
+            if (out_tensor.dtype() != out_dtype) {
+                std::cerr << "logical_not_out should preserve output tensor dtype" << std::endl;
             }
             
-            torch::Tensor out = torch::empty(shape, out_options);
-            torch::logical_not_out(out, input);
-            
-            // Verify output was written
-            if (out.numel() > 0) {
-                out.sum();  // Force computation
-            }
-        } else {
-            // Test without out tensor
-            torch::Tensor result = torch::logical_not(input);
-            
-            // Verify result
-            if (result.numel() > 0) {
-                result.sum();  // Force computation
+            if (!out_tensor.sizes().equals(input.sizes())) {
+                std::cerr << "logical_not_out should preserve input shape" << std::endl;
             }
         }
-        
-        // Additional edge cases
-        if (offset < Size) {
-            uint8_t edge_case = Data[offset++] % 4;
-            switch (edge_case) {
-                case 0:
-                    // Test with scalar tensor
-                    {
-                        torch::Tensor scalar = torch::tensor(0.0);
-                        torch::logical_not(scalar);
+
+        // Test edge cases
+        if (input.numel() > 0) {
+            // Test scalar extraction for verification
+            if (input.numel() == 1) {
+                auto scalar_input = input.item();
+                auto scalar_result = torch::logical_not(input).item<bool>();
+                
+                // Verify logical consistency for scalars
+                bool expected = false;
+                if (input.dtype() == torch::kBool) {
+                    expected = !scalar_input.toBool();
+                } else {
+                    // Non-zero values should become false, zero values should become true
+                    if (input.dtype().isFloatingPoint()) {
+                        double val = scalar_input.toDouble();
+                        expected = (val == 0.0 && !std::isnan(val));
+                    } else {
+                        expected = (scalar_input.toLong() == 0);
                     }
-                    break;
-                case 1:
-                    // Test with view
-                    if (total_elements > 1) {
-                        auto view = input.view({-1});
-                        torch::logical_not(view);
-                    }
-                    break;
-                case 2:
-                    // Test with slice
-                    if (shape.size() > 0 && shape[0] > 1) {
-                        auto slice = input.narrow(0, 0, 1);
-                        torch::logical_not(slice);
-                    }
-                    break;
-                case 3:
-                    // Test with special values
-                    {
-                        torch::Tensor special = torch::tensor({0.0, 1.0, -1.0, 
-                            std::numeric_limits<float>::infinity(),
-                            -std::numeric_limits<float>::infinity(),
-                            std::numeric_limits<float>::quiet_NaN()});
-                        torch::logical_not(special);
-                    }
-                    break;
+                }
+                
+                if (scalar_result != expected) {
+                    std::cerr << "Logical inconsistency detected in scalar case" << std::endl;
+                }
             }
         }
-    }
-    catch (const c10::Error &e)
-    {
-        // PyTorch-specific errors are expected for invalid operations
-        return 0;
+
+        // Test with empty tensor
+        auto empty_tensor = torch::empty({0}, dtype);
+        auto empty_result = torch::logical_not(empty_tensor);
+        if (empty_result.numel() != 0) {
+            std::cerr << "logical_not of empty tensor should be empty" << std::endl;
+        }
+
+        // Test double negation property: logical_not(logical_not(x)) should equal (x != 0)
+        if (input.numel() > 0 && input.numel() <= 100) {
+            auto double_neg = torch::logical_not(torch::logical_not(input));
+            auto expected_double_neg = (input != 0);
+            
+            if (!torch::allclose(double_neg.to(torch::kFloat32), expected_double_neg.to(torch::kFloat32))) {
+                // This might fail for NaN values, which is expected behavior
+                if (input.dtype().isFloatingPoint()) {
+                    auto has_nan = torch::isnan(input).any().item<bool>();
+                    if (!has_nan) {
+                        std::cerr << "Double negation property violated" << std::endl;
+                    }
+                } else {
+                    std::cerr << "Double negation property violated" << std::endl;
+                }
+            }
+        }
+
+        // Test with different tensor layouts if possible
+        if (input.dim() >= 2) {
+            auto transposed = input.transpose(0, 1);
+            auto transposed_result = torch::logical_not(transposed);
+            
+            if (!transposed_result.sizes().equals(transposed.sizes())) {
+                std::cerr << "logical_not should work with non-contiguous tensors" << std::endl;
+            }
+        }
+
     }
     catch (const std::exception &e)
     {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
     }
-    return 0;
+    return 0; // keep the input
 }

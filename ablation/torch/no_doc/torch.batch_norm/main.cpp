@@ -1,19 +1,6 @@
 #include "fuzzer_utils.h"
-#include <torch/torch.h>
 #include <iostream>
-#include <cstring>
-
-// Helper to consume a value from fuzzer data
-template<typename T>
-T consumeValue(const uint8_t* data, size_t& offset, size_t size, T default_val) {
-    if (offset + sizeof(T) > size) {
-        return default_val;
-    }
-    T value;
-    std::memcpy(&value, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return value;
-}
+#include <tuple>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
@@ -21,198 +8,139 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     {
         size_t offset = 0;
         
-        // Need at least minimal bytes for configuration
         if (Size < 10) {
             return 0;
         }
 
-        // Parse configuration bytes
-        uint8_t config_byte = Data[offset++];
-        bool training = config_byte & 0x01;
-        bool use_weight = (config_byte >> 1) & 0x01;
-        bool use_bias = (config_byte >> 2) & 0x01;
-        bool use_running_mean = (config_byte >> 3) & 0x01;
-        bool use_running_var = (config_byte >> 4) & 0x01;
-        bool cudnn_enabled = (config_byte >> 5) & 0x01;
+        auto input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Parse momentum and epsilon with fuzzer-controlled values
-        float momentum_raw = consumeValue<float>(Data, offset, Size, 0.1f);
-        float epsilon_raw = consumeValue<float>(Data, offset, Size, 1e-5f);
-        
-        // Constrain momentum to [0, 1] and epsilon to positive values
-        float momentum = std::abs(momentum_raw);
-        if (momentum > 1.0f) momentum = 1.0f / (1.0f + momentum); // Map to (0, 1)
-        float epsilon = std::abs(epsilon_raw);
-        if (epsilon == 0.0f) epsilon = 1e-8f; // Avoid exact zero
-        
-        // Create input tensor
-        torch::Tensor input;
-        try {
-            input = fuzzer_utils::createTensor(Data, Size, offset);
-        } catch (const std::exception& e) {
-            // If we can't create input tensor, try with minimal default
-            input = torch::randn({2, 3, 4, 4});
+        if (offset >= Size) {
+            return 0;
         }
         
-        // Batch norm requires at least 2D input
         if (input.dim() < 2) {
-            // Reshape to add batch dimension
-            input = input.unsqueeze(0);
-            if (input.dim() < 2) {
-                input = input.unsqueeze(0);
-            }
+            return 0;
         }
         
-        // Get number of features (channel dimension for 2D+ inputs)
-        int64_t num_features = (input.dim() >= 2) ? input.size(1) : 1;
+        int64_t num_features = input.size(1);
         
-        // Handle edge case of 0 features
         if (num_features <= 0) {
-            num_features = 1;
-            input = input.reshape({input.size(0), 1, -1});
+            return 0;
         }
         
-        // Create optional parameters based on config
-        torch::Tensor weight, bias, running_mean, running_var;
+        auto running_mean = torch::zeros({num_features}, input.options());
+        auto running_var = torch::ones({num_features}, input.options());
+        auto weight = torch::ones({num_features}, input.options());
+        auto bias = torch::zeros({num_features}, input.options());
         
-        if (use_weight) {
+        uint8_t training_byte = (offset < Size) ? Data[offset++] : 0;
+        bool training = (training_byte % 2) == 1;
+        
+        uint8_t momentum_bytes[4] = {0};
+        size_t momentum_size = std::min(size_t(4), Size - offset);
+        for (size_t i = 0; i < momentum_size; ++i) {
+            momentum_bytes[i] = Data[offset++];
+        }
+        float momentum_raw;
+        std::memcpy(&momentum_raw, momentum_bytes, sizeof(float));
+        double momentum = static_cast<double>(momentum_raw);
+        if (std::isnan(momentum) || std::isinf(momentum)) {
+            momentum = 0.1;
+        }
+        momentum = std::abs(momentum);
+        if (momentum > 1.0) {
+            momentum = 1.0;
+        }
+        
+        uint8_t eps_bytes[4] = {0};
+        size_t eps_size = std::min(size_t(4), Size - offset);
+        for (size_t i = 0; i < eps_size; ++i) {
+            eps_bytes[i] = Data[offset++];
+        }
+        float eps_raw;
+        std::memcpy(&eps_raw, eps_bytes, sizeof(float));
+        double eps = static_cast<double>(eps_raw);
+        if (std::isnan(eps) || std::isinf(eps) || eps <= 0) {
+            eps = 1e-5;
+        }
+        eps = std::abs(eps);
+        if (eps > 1.0) {
+            eps = 1e-5;
+        }
+        
+        auto result = torch::batch_norm(input, weight, bias, running_mean, running_var, training, momentum, eps);
+        
+        if (offset < Size) {
+            auto input2 = fuzzer_utils::createTensor(Data, Size, offset);
+            if (input2.dim() >= 2 && input2.size(1) == num_features) {
+                auto result2 = torch::batch_norm(input2, weight, bias, running_mean, running_var, training, momentum, eps);
+            }
+        }
+        
+        if (offset < Size) {
             try {
-                weight = fuzzer_utils::createTensor(Data, Size, offset);
-                // Ensure weight has correct shape
-                if (weight.numel() != num_features) {
-                    weight = weight.flatten().slice(0, 0, num_features);
-                    if (weight.numel() < num_features) {
-                        weight = torch::ones({num_features}, input.options());
-                    }
-                }
-                weight = weight.reshape({num_features});
+                auto weight_alt = torch::randn({num_features}, input.options());
+                auto bias_alt = torch::randn({num_features}, input.options());
+                auto result3 = torch::batch_norm(input, weight_alt, bias_alt, running_mean, running_var, training, momentum, eps);
             } catch (...) {
-                weight = torch::ones({num_features}, input.options());
             }
         }
         
-        if (use_bias) {
+        if (offset < Size) {
             try {
-                bias = fuzzer_utils::createTensor(Data, Size, offset);
-                // Ensure bias has correct shape
-                if (bias.numel() != num_features) {
-                    bias = bias.flatten().slice(0, 0, num_features);
-                    if (bias.numel() < num_features) {
-                        bias = torch::zeros({num_features}, input.options());
-                    }
-                }
-                bias = bias.reshape({num_features});
+                auto running_mean_alt = torch::randn({num_features}, input.options());
+                auto running_var_alt = torch::abs(torch::randn({num_features}, input.options())) + eps;
+                auto result4 = torch::batch_norm(input, weight, bias, running_mean_alt, running_var_alt, training, momentum, eps);
             } catch (...) {
-                bias = torch::zeros({num_features}, input.options());
             }
         }
         
-        if (use_running_mean) {
+        if (offset < Size) {
             try {
-                running_mean = fuzzer_utils::createTensor(Data, Size, offset);
-                // Ensure running_mean has correct shape
-                if (running_mean.numel() != num_features) {
-                    running_mean = running_mean.flatten().slice(0, 0, num_features);
-                    if (running_mean.numel() < num_features) {
-                        running_mean = torch::zeros({num_features}, input.options());
-                    }
-                }
-                running_mean = running_mean.reshape({num_features});
+                auto result5 = torch::batch_norm(input, torch::Tensor(), torch::Tensor(), running_mean, running_var, training, momentum, eps);
             } catch (...) {
-                running_mean = torch::zeros({num_features}, input.options());
             }
         }
         
-        if (use_running_var) {
+        if (offset < Size) {
             try {
-                running_var = fuzzer_utils::createTensor(Data, Size, offset);
-                // Ensure running_var has correct shape and is positive
-                if (running_var.numel() != num_features) {
-                    running_var = running_var.flatten().slice(0, 0, num_features);
-                    if (running_var.numel() < num_features) {
-                        running_var = torch::ones({num_features}, input.options());
-                    }
-                }
-                running_var = running_var.reshape({num_features}).abs();
-                // Avoid exact zero variance
-                running_var = running_var + epsilon;
+                auto result6 = torch::batch_norm(input, weight, bias, torch::Tensor(), torch::Tensor(), training, momentum, eps);
             } catch (...) {
-                running_var = torch::ones({num_features}, input.options());
             }
         }
         
-        // Test different input shapes and configurations
-        try {
-            // Call batch_norm with various parameter combinations
-            torch::Tensor output = torch::batch_norm(
-                input,
-                weight.defined() ? weight : torch::Tensor(),
-                bias.defined() ? bias : torch::Tensor(),
-                running_mean.defined() ? running_mean : torch::Tensor(),
-                running_var.defined() ? running_var : torch::Tensor(),
-                training,
-                momentum,
-                epsilon,
-                cudnn_enabled
-            );
-            
-            // Verify output shape matches input shape
-            if (output.sizes() != input.sizes()) {
-                std::cerr << "Output shape mismatch: " << output.sizes() << " vs " << input.sizes() << std::endl;
+        if (offset < Size && input.dim() >= 3) {
+            try {
+                auto input_3d = input.view({input.size(0), input.size(1), -1});
+                auto result7 = torch::batch_norm(input_3d, weight, bias, running_mean, running_var, training, momentum, eps);
+            } catch (...) {
             }
-            
-            // Test with different memory formats if applicable
-            if (input.dim() == 4 && offset < Size) {
-                uint8_t format_byte = Data[offset++];
-                if (format_byte & 0x01) {
-                    // Try channels_last format for 4D tensors
-                    auto input_cl = input.to(torch::MemoryFormat::ChannelsLast);
-                    torch::Tensor output_cl = torch::batch_norm(
-                        input_cl,
-                        weight.defined() ? weight : torch::Tensor(),
-                        bias.defined() ? bias : torch::Tensor(),
-                        running_mean.defined() ? running_mean : torch::Tensor(),
-                        running_var.defined() ? running_var : torch::Tensor(),
-                        training,
-                        momentum,
-                        epsilon,
-                        cudnn_enabled
-                    );
-                }
-            }
-            
-            // Test edge cases with special values
-            if (offset < Size && (Data[offset++] & 0x01)) {
-                // Test with NaN/Inf in input
-                auto special_input = input.clone();
-                if (special_input.numel() > 0) {
-                    special_input.view(-1)[0] = std::numeric_limits<float>::quiet_NaN();
-                    if (special_input.numel() > 1) {
-                        special_input.view(-1)[1] = std::numeric_limits<float>::infinity();
-                    }
-                    
-                    torch::Tensor special_output = torch::batch_norm(
-                        special_input,
-                        weight.defined() ? weight : torch::Tensor(),
-                        bias.defined() ? bias : torch::Tensor(),
-                        running_mean.defined() ? running_mean : torch::Tensor(),
-                        running_var.defined() ? running_var : torch::Tensor(),
-                        training,
-                        momentum,
-                        epsilon,
-                        cudnn_enabled
-                    );
-                }
-            }
-            
-        } catch (const c10::Error& e) {
-            // PyTorch-specific errors are expected for invalid configurations
-            // Continue fuzzing
-        } catch (const std::exception& e) {
-            // Log but continue for other exceptions
-            std::cerr << "batch_norm exception: " << e.what() << std::endl;
         }
         
+        if (offset < Size && input.dim() >= 4) {
+            try {
+                auto input_4d = input.view({input.size(0), input.size(1), input.size(2), -1});
+                auto result8 = torch::batch_norm(input_4d, weight, bias, running_mean, running_var, training, momentum, eps);
+            } catch (...) {
+            }
+        }
+        
+        if (offset < Size) {
+            try {
+                double extreme_eps = 1e-20;
+                auto result9 = torch::batch_norm(input, weight, bias, running_mean, running_var, training, momentum, extreme_eps);
+            } catch (...) {
+            }
+        }
+        
+        if (offset < Size) {
+            try {
+                double extreme_momentum = 0.999999;
+                auto result10 = torch::batch_norm(input, weight, bias, running_mean, running_var, training, extreme_momentum, eps);
+            } catch (...) {
+            }
+        }
+
     }
     catch (const std::exception &e)
     {

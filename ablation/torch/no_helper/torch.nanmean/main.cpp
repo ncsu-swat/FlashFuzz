@@ -1,165 +1,122 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstdint>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-// Helper to consume bytes from fuzzer input
-template<typename T>
-bool consumeBytes(const uint8_t*& data, size_t& size, T& out) {
-    if (size < sizeof(T)) return false;
-    std::memcpy(&out, data, sizeof(T));
-    data += sizeof(T);
-    size -= sizeof(T);
-    return true;
-}
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
+        size_t offset = 0;
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    if (size < 8) return 0;
-    
-    try {
-        // Consume configuration bytes
-        uint8_t rank, dtype_idx, keepdim, use_dim, use_out, add_nans;
-        if (!consumeBytes(data, size, rank)) return 0;
-        if (!consumeBytes(data, size, dtype_idx)) return 0;
-        if (!consumeBytes(data, size, keepdim)) return 0;
-        if (!consumeBytes(data, size, use_dim)) return 0;
-        if (!consumeBytes(data, size, use_out)) return 0;
-        if (!consumeBytes(data, size, add_nans)) return 0;
-        
-        // Limit rank to reasonable value
-        rank = (rank % 5) + 1;
-        
-        // Build shape
-        std::vector<int64_t> shape;
-        for (int i = 0; i < rank; i++) {
-            uint8_t dim_size;
-            if (!consumeBytes(data, size, dim_size)) {
-                shape.push_back(1);
-            } else {
-                shape.push_back((dim_size % 8) + 1);  // Keep dimensions small
+        // Generate input tensor with various shapes and data types
+        auto input_tensor = generate_tensor(Data, Size, offset);
+        if (input_tensor.numel() == 0) {
+            return 0; // Skip empty tensors
+        }
+
+        // Introduce NaN values randomly in the tensor
+        if (input_tensor.dtype() == torch::kFloat32 || input_tensor.dtype() == torch::kFloat64) {
+            auto flat_tensor = input_tensor.flatten();
+            for (int64_t i = 0; i < flat_tensor.numel(); i++) {
+                if (get_random_bool(Data, Size, offset)) {
+                    if (input_tensor.dtype() == torch::kFloat32) {
+                        flat_tensor[i] = std::numeric_limits<float>::quiet_NaN();
+                    } else {
+                        flat_tensor[i] = std::numeric_limits<double>::quiet_NaN();
+                    }
+                }
             }
         }
-        
-        // Select dtype
-        std::vector<torch::ScalarType> dtypes = {
-            torch::kFloat32, torch::kFloat64, torch::kFloat16,
-            torch::kInt32, torch::kInt64, torch::kInt8, torch::kUInt8
-        };
-        torch::ScalarType dtype = dtypes[dtype_idx % dtypes.size()];
-        
-        // Create tensor with random data
-        torch::Tensor input;
-        int64_t numel = 1;
-        for (auto d : shape) numel *= d;
-        
-        if (dtype == torch::kFloat32 || dtype == torch::kFloat64 || dtype == torch::kFloat16) {
-            // For floating point types, create with randn and optionally add NaNs
-            input = torch::randn(shape, torch::dtype(dtype));
+
+        // Test 1: Basic nanmean without dimensions
+        auto result1 = torch::nanmean(input_tensor);
+
+        // Test 2: nanmean with random dimension
+        if (input_tensor.dim() > 0) {
+            int64_t dim = get_random_int(Data, Size, offset) % input_tensor.dim();
+            auto result2 = torch::nanmean(input_tensor, dim);
             
-            if (add_nans % 3 == 0 && numel > 0) {
-                // Add some NaN values
-                auto flat = input.flatten();
-                int num_nans = (add_nans % numel) + 1;
-                for (int i = 0; i < num_nans && i < numel; i++) {
-                    uint8_t nan_idx;
-                    if (consumeBytes(data, size, nan_idx)) {
-                        flat[nan_idx % numel] = std::numeric_limits<float>::quiet_NaN();
-                    }
+            // Test with keepdim=true
+            auto result3 = torch::nanmean(input_tensor, dim, /*keepdim=*/true);
+        }
+
+        // Test 3: nanmean with multiple dimensions
+        if (input_tensor.dim() > 1) {
+            std::vector<int64_t> dims;
+            int num_dims = (get_random_int(Data, Size, offset) % input_tensor.dim()) + 1;
+            for (int i = 0; i < num_dims; i++) {
+                int64_t dim = get_random_int(Data, Size, offset) % input_tensor.dim();
+                if (std::find(dims.begin(), dims.end(), dim) == dims.end()) {
+                    dims.push_back(dim);
                 }
             }
-        } else {
-            // For integer types
-            input = torch::randint(0, 100, shape, torch::dtype(dtype));
+            if (!dims.empty()) {
+                auto result4 = torch::nanmean(input_tensor, dims);
+                auto result5 = torch::nanmean(input_tensor, dims, /*keepdim=*/true);
+            }
         }
-        
-        // Prepare optional dim argument
-        torch::OptionalIntArrayRef dim_arg;
-        std::vector<int64_t> dims;
-        if (use_dim % 2 == 0) {
-            uint8_t num_dims;
-            if (consumeBytes(data, size, num_dims)) {
-                num_dims = (num_dims % rank) + 1;
-                for (int i = 0; i < num_dims; i++) {
-                    uint8_t d;
-                    if (consumeBytes(data, size, d)) {
-                        dims.push_back(d % rank);
-                    }
+
+        // Test 4: nanmean with dtype conversion
+        if (input_tensor.dtype() != torch::kFloat64) {
+            auto result6 = torch::nanmean(input_tensor, c10::nullopt, false, torch::kFloat64);
+        }
+
+        // Test 5: nanmean with output tensor
+        if (input_tensor.dtype() == torch::kFloat32 || input_tensor.dtype() == torch::kFloat64) {
+            auto out_tensor = torch::empty({}, input_tensor.options());
+            torch::nanmean_out(out_tensor, input_tensor);
+        }
+
+        // Test 6: Edge cases - all NaN tensor
+        if (input_tensor.dtype() == torch::kFloat32 || input_tensor.dtype() == torch::kFloat64) {
+            auto all_nan_tensor = torch::full_like(input_tensor, std::numeric_limits<float>::quiet_NaN());
+            auto result7 = torch::nanmean(all_nan_tensor);
+        }
+
+        // Test 7: Edge cases - no NaN tensor (should behave like regular mean)
+        auto no_nan_tensor = torch::randn_like(input_tensor);
+        if (no_nan_tensor.dtype() == torch::kFloat32 || no_nan_tensor.dtype() == torch::kFloat64) {
+            auto nanmean_result = torch::nanmean(no_nan_tensor);
+            auto mean_result = torch::mean(no_nan_tensor);
+        }
+
+        // Test 8: Test with negative dimensions
+        if (input_tensor.dim() > 0) {
+            int64_t neg_dim = -(get_random_int(Data, Size, offset) % input_tensor.dim() + 1);
+            auto result8 = torch::nanmean(input_tensor, neg_dim);
+        }
+
+        // Test 9: Test with very large and very small values mixed with NaN
+        if (input_tensor.dtype() == torch::kFloat32 || input_tensor.dtype() == torch::kFloat64) {
+            auto extreme_tensor = input_tensor.clone();
+            auto flat_extreme = extreme_tensor.flatten();
+            for (int64_t i = 0; i < flat_extreme.numel(); i++) {
+                uint8_t choice = get_random_int(Data, Size, offset) % 4;
+                if (choice == 0) {
+                    flat_extreme[i] = std::numeric_limits<float>::max();
+                } else if (choice == 1) {
+                    flat_extreme[i] = std::numeric_limits<float>::lowest();
+                } else if (choice == 2) {
+                    flat_extreme[i] = std::numeric_limits<float>::quiet_NaN();
+                } else if (choice == 3) {
+                    flat_extreme[i] = std::numeric_limits<float>::infinity();
                 }
-                if (!dims.empty()) {
-                    dim_arg = dims;
-                }
             }
+            auto result9 = torch::nanmean(extreme_tensor);
         }
-        
-        // Prepare optional output tensor
-        torch::Tensor out;
-        bool has_out = (use_out % 3 == 0);
-        if (has_out && dim_arg.has_value()) {
-            // Calculate output shape
-            std::vector<int64_t> out_shape = shape;
-            if (keepdim % 2 == 0) {
-                for (auto d : dims) {
-                    if (d >= 0 && d < rank) {
-                        out_shape[d] = 1;
-                    }
-                }
-            } else {
-                // Remove dimensions (complex to calculate, just create empty)
-                out = torch::empty({}, torch::dtype(torch::kFloat32));
-            }
-            if (!out.defined()) {
-                out = torch::empty(out_shape, torch::dtype(torch::kFloat32));
-            }
+
+        // Test 10: Test with different tensor layouts (contiguous vs non-contiguous)
+        if (input_tensor.dim() >= 2) {
+            auto transposed = input_tensor.transpose(0, 1);
+            auto result10 = torch::nanmean(transposed);
         }
-        
-        // Call nanmean with various configurations
-        torch::Tensor result;
-        
-        if (has_out && out.defined()) {
-            if (dim_arg.has_value()) {
-                result = torch::nanmean_out(out, input, dim_arg.value(), keepdim % 2 == 0);
-            } else {
-                // nanmean with output but no dim (reduce all)
-                result = input.nanmean();
-                out.resize_as_(result);
-                out.copy_(result);
-            }
-        } else {
-            if (dim_arg.has_value()) {
-                result = torch::nanmean(input, dim_arg.value(), keepdim % 2 == 0);
-            } else {
-                result = input.nanmean();
-            }
-        }
-        
-        // Also test with dtype conversion
-        uint8_t test_dtype_conv;
-        if (consumeBytes(data, size, test_dtype_conv) && test_dtype_conv % 4 == 0) {
-            if (dtype != torch::kFloat64) {
-                auto result2 = torch::nanmean(input.to(torch::kFloat64), dim_arg, keepdim % 2 == 0);
-            }
-        }
-        
-        // Test edge cases
-        if (numel == 0) {
-            // Empty tensor
-            auto empty_result = torch::nanmean(torch::empty({0}));
-        }
-        
-        // Test all-NaN tensor
-        if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-            auto all_nan = torch::full(shape, std::numeric_limits<float>::quiet_NaN(), torch::dtype(dtype));
-            auto nan_result = torch::nanmean(all_nan);
-        }
-        
-    } catch (const c10::Error& e) {
-        // PyTorch errors are expected for invalid operations
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

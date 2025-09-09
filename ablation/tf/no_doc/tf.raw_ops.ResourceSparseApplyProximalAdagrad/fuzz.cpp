@@ -1,0 +1,293 @@
+#include <cstdint>
+#include <iostream>
+#include <cstring>
+#include <tensorflow/core/framework/tensor.h>
+#include <tensorflow/core/framework/tensor_shape.h>
+#include <tensorflow/core/framework/types.h>
+#include <tensorflow/core/framework/resource_mgr.h>
+#include <tensorflow/core/framework/resource_var.h>
+#include <tensorflow/core/kernels/training_ops.h>
+#include <tensorflow/core/platform/env.h>
+#include <tensorflow/core/public/session.h>
+#include <tensorflow/core/graph/default_device.h>
+#include <tensorflow/core/graph/graph_def_builder.h>
+#include <tensorflow/core/lib/core/threadpool.h>
+#include <tensorflow/core/framework/op_kernel.h>
+#include <tensorflow/core/common_runtime/device_factory.h>
+#include <tensorflow/core/common_runtime/device_mgr.h>
+#include <tensorflow/core/framework/device_base.h>
+#include <tensorflow/core/framework/op_def_builder.h>
+#include <tensorflow/core/framework/node_def_builder.h>
+#include <tensorflow/core/kernels/resource_variable_ops.h>
+
+constexpr uint8_t MIN_RANK = 0;
+constexpr uint8_t MAX_RANK = 4;
+constexpr int64_t MIN_TENSOR_SHAPE_DIMS_TF = 1;
+constexpr int64_t MAX_TENSOR_SHAPE_DIMS_TF = 10;
+
+tensorflow::DataType parseDataType(uint8_t selector) {
+    tensorflow::DataType dtype;
+    switch (selector % 3) {
+        case 0:
+            dtype = tensorflow::DT_FLOAT;
+            break;
+        case 1:
+            dtype = tensorflow::DT_DOUBLE;
+            break;
+        case 2:
+            dtype = tensorflow::DT_HALF;
+            break;
+        default:
+            dtype = tensorflow::DT_FLOAT;
+            break;
+    }
+    return dtype;
+}
+
+uint8_t parseRank(uint8_t byte) {
+    constexpr uint8_t range = MAX_RANK - MIN_RANK + 1;
+    uint8_t rank = byte % range + MIN_RANK;
+    return rank;
+}
+
+std::vector<int64_t> parseShape(const uint8_t* data, size_t& offset, size_t total_size, uint8_t rank) {
+    if (rank == 0) {
+        return {};
+    }
+
+    std::vector<int64_t> shape;
+    shape.reserve(rank);
+    const auto sizeof_dim = sizeof(int64_t);
+
+    for (uint8_t i = 0; i < rank; ++i) {
+        if (offset + sizeof_dim <= total_size) {
+            int64_t dim_val;
+            std::memcpy(&dim_val, data + offset, sizeof_dim);
+            offset += sizeof_dim;
+            
+            dim_val = MIN_TENSOR_SHAPE_DIMS_TF +
+                    static_cast<int64_t>((static_cast<uint64_t>(std::abs(dim_val)) %
+                                        static_cast<uint64_t>(MAX_TENSOR_SHAPE_DIMS_TF - MIN_TENSOR_SHAPE_DIMS_TF + 1)));
+
+            shape.push_back(dim_val);
+        } else {
+             shape.push_back(1);
+        }
+    }
+
+    return shape;
+}
+
+template <typename T>
+void fillTensorWithData(tensorflow::Tensor& tensor, const uint8_t* data,
+                        size_t& offset, size_t total_size) {
+  auto flat = tensor.flat<T>();
+  const size_t num_elements = flat.size();
+  const size_t element_size = sizeof(T);
+
+  for (size_t i = 0; i < num_elements; ++i) {
+    if (offset + element_size <= total_size) {
+      T value;
+      std::memcpy(&value, data + offset, element_size);
+      offset += element_size;
+      flat(i) = value;
+    } else {
+      flat(i) = T{};
+    }
+  }
+}
+
+void fillTensorWithDataByType(tensorflow::Tensor& tensor,
+                              tensorflow::DataType dtype, const uint8_t* data,
+                              size_t& offset, size_t total_size) {
+  switch (dtype) {
+    case tensorflow::DT_FLOAT:
+      fillTensorWithData<float>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_DOUBLE:
+      fillTensorWithData<double>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_INT32:
+      fillTensorWithData<int32_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_UINT8:
+      fillTensorWithData<uint8_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_INT16:
+      fillTensorWithData<int16_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_INT8:
+      fillTensorWithData<int8_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_INT64:
+      fillTensorWithData<int64_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_BOOL:
+      fillTensorWithData<bool>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_UINT16:
+      fillTensorWithData<uint16_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_UINT32:
+      fillTensorWithData<uint32_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_UINT64:
+      fillTensorWithData<uint64_t>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_BFLOAT16:
+      fillTensorWithData<tensorflow::bfloat16>(tensor, data, offset,
+                                               total_size);
+      break;
+    case tensorflow::DT_HALF:
+      fillTensorWithData<Eigen::half>(tensor, data, offset, total_size);
+      break;
+    case tensorflow::DT_COMPLEX64:
+      fillTensorWithData<tensorflow::complex64>(tensor, data, offset,
+                                                total_size);
+      break;
+    case tensorflow::DT_COMPLEX128:
+      fillTensorWithData<tensorflow::complex128>(tensor, data, offset,
+                                                 total_size);
+      break;
+
+    default:
+      return;
+  }
+}
+
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    try {
+        size_t offset = 0;
+        
+        if (size < 20) {
+            return 0;
+        }
+
+        tensorflow::DataType var_dtype = parseDataType(data[offset++]);
+        uint8_t var_rank = parseRank(data[offset++]);
+        std::vector<int64_t> var_shape = parseShape(data, offset, size, var_rank);
+        
+        tensorflow::DataType accum_dtype = var_dtype;
+        uint8_t accum_rank = var_rank;
+        std::vector<int64_t> accum_shape = var_shape;
+
+        uint8_t lr_rank = parseRank(data[offset++]);
+        std::vector<int64_t> lr_shape = parseShape(data, offset, size, lr_rank);
+
+        uint8_t l1_rank = parseRank(data[offset++]);
+        std::vector<int64_t> l1_shape = parseShape(data, offset, size, l1_rank);
+
+        uint8_t l2_rank = parseRank(data[offset++]);
+        std::vector<int64_t> l2_shape = parseShape(data, offset, size, l2_rank);
+
+        uint8_t grad_rank = var_rank;
+        std::vector<int64_t> grad_shape = var_shape;
+
+        uint8_t indices_rank = 1;
+        std::vector<int64_t> indices_shape = {var_shape.empty() ? 1 : var_shape[0]};
+
+        if (offset >= size) {
+            return 0;
+        }
+
+        tensorflow::TensorShape var_tensor_shape;
+        for (int64_t dim : var_shape) {
+            var_tensor_shape.AddDim(dim);
+        }
+
+        tensorflow::TensorShape accum_tensor_shape;
+        for (int64_t dim : accum_shape) {
+            accum_tensor_shape.AddDim(dim);
+        }
+
+        tensorflow::TensorShape lr_tensor_shape;
+        for (int64_t dim : lr_shape) {
+            lr_tensor_shape.AddDim(dim);
+        }
+
+        tensorflow::TensorShape l1_tensor_shape;
+        for (int64_t dim : l1_shape) {
+            l1_tensor_shape.AddDim(dim);
+        }
+
+        tensorflow::TensorShape l2_tensor_shape;
+        for (int64_t dim : l2_shape) {
+            l2_tensor_shape.AddDim(dim);
+        }
+
+        tensorflow::TensorShape grad_tensor_shape;
+        for (int64_t dim : grad_shape) {
+            grad_tensor_shape.AddDim(dim);
+        }
+
+        tensorflow::TensorShape indices_tensor_shape;
+        for (int64_t dim : indices_shape) {
+            indices_tensor_shape.AddDim(dim);
+        }
+
+        tensorflow::Tensor var_tensor(var_dtype, var_tensor_shape);
+        tensorflow::Tensor accum_tensor(accum_dtype, accum_tensor_shape);
+        tensorflow::Tensor lr_tensor(var_dtype, lr_tensor_shape);
+        tensorflow::Tensor l1_tensor(var_dtype, l1_tensor_shape);
+        tensorflow::Tensor l2_tensor(var_dtype, l2_tensor_shape);
+        tensorflow::Tensor grad_tensor(var_dtype, grad_tensor_shape);
+        tensorflow::Tensor indices_tensor(tensorflow::DT_INT32, indices_tensor_shape);
+
+        fillTensorWithDataByType(var_tensor, var_dtype, data, offset, size);
+        fillTensorWithDataByType(accum_tensor, accum_dtype, data, offset, size);
+        fillTensorWithDataByType(lr_tensor, var_dtype, data, offset, size);
+        fillTensorWithDataByType(l1_tensor, var_dtype, data, offset, size);
+        fillTensorWithDataByType(l2_tensor, var_dtype, data, offset, size);
+        fillTensorWithDataByType(grad_tensor, var_dtype, data, offset, size);
+        fillTensorWithDataByType(indices_tensor, tensorflow::DT_INT32, data, offset, size);
+
+        std::cout << "var_tensor shape: ";
+        for (int i = 0; i < var_tensor.shape().dims(); ++i) {
+            std::cout << var_tensor.shape().dim_size(i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "accum_tensor shape: ";
+        for (int i = 0; i < accum_tensor.shape().dims(); ++i) {
+            std::cout << accum_tensor.shape().dim_size(i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "lr_tensor shape: ";
+        for (int i = 0; i < lr_tensor.shape().dims(); ++i) {
+            std::cout << lr_tensor.shape().dim_size(i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "l1_tensor shape: ";
+        for (int i = 0; i < l1_tensor.shape().dims(); ++i) {
+            std::cout << l1_tensor.shape().dim_size(i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "l2_tensor shape: ";
+        for (int i = 0; i < l2_tensor.shape().dims(); ++i) {
+            std::cout << l2_tensor.shape().dim_size(i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "grad_tensor shape: ";
+        for (int i = 0; i < grad_tensor.shape().dims(); ++i) {
+            std::cout << grad_tensor.shape().dim_size(i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "indices_tensor shape: ";
+        for (int i = 0; i < indices_tensor.shape().dims(); ++i) {
+            std::cout << indices_tensor.shape().dim_size(i) << " ";
+        }
+        std::cout << std::endl;
+
+        std::cout << "Data type: " << tensorflow::DataTypeString(var_dtype) << std::endl;
+
+    } catch (const std::exception& e) {
+        std::cout << "Exception caught: " << e.what() << std::endl;
+        return -1;
+    }
+    return 0;
+}

@@ -1,169 +1,116 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    if (size < 4) {
-        return 0;
-    }
-
-    try {
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
-        
-        // Extract basic parameters from fuzzer input
-        uint8_t rank = (size > offset) ? data[offset++] % 5 : 0; // Limit rank to 0-4
-        uint8_t dtype_idx = (size > offset) ? data[offset++] % 6 : 0;
-        bool requires_grad = (size > offset) ? (data[offset++] & 1) : false;
-        bool use_out_tensor = (size > offset) ? (data[offset++] & 1) : false;
-        
-        // Determine dtype
-        torch::ScalarType dtype;
-        switch (dtype_idx) {
-            case 0: dtype = torch::kFloat32; break;
-            case 1: dtype = torch::kFloat64; break;
-            case 2: dtype = torch::kFloat16; break;
-            case 3: dtype = torch::kBFloat16; break;
-            case 4: dtype = torch::kComplex64; break;
-            case 5: dtype = torch::kComplex128; break;
-            default: dtype = torch::kFloat32; break;
+
+        // Generate input tensor with various shapes and dtypes
+        auto input_tensor = generate_tensor(Data, Size, offset);
+        if (input_tensor.numel() == 0) {
+            return 0; // Skip empty tensors
         }
-        
-        // Build shape vector
-        std::vector<int64_t> shape;
-        for (uint8_t i = 0; i < rank && offset < size; ++i) {
-            int64_t dim = data[offset++] % 10; // Keep dimensions small
-            shape.push_back(dim);
+
+        // Test basic asin operation
+        auto result1 = torch::asin(input_tensor);
+
+        // Test asin with output tensor
+        auto out_tensor = torch::empty_like(result1);
+        torch::asin_out(out_tensor, input_tensor);
+
+        // Test with different input ranges to explore edge cases
+        // Values in [-1, 1] for valid asin domain
+        auto clamped_input = torch::clamp(input_tensor, -1.0, 1.0);
+        auto result2 = torch::asin(clamped_input);
+
+        // Test with values outside [-1, 1] domain (should produce NaN)
+        auto large_input = input_tensor * 2.0 + 3.0; // Values outside [-1, 1]
+        auto result3 = torch::asin(large_input);
+
+        // Test with special values
+        if (input_tensor.numel() > 0) {
+            // Test with zeros
+            auto zero_tensor = torch::zeros_like(input_tensor);
+            auto zero_result = torch::asin(zero_tensor);
+
+            // Test with ones and negative ones (boundary values)
+            auto ones_tensor = torch::ones_like(input_tensor);
+            auto ones_result = torch::asin(ones_tensor);
+            
+            auto neg_ones_tensor = torch::full_like(input_tensor, -1.0);
+            auto neg_ones_result = torch::asin(neg_ones_tensor);
+
+            // Test with small values near zero
+            auto small_tensor = input_tensor * 1e-6;
+            auto small_result = torch::asin(small_tensor);
         }
-        
-        // Calculate total elements
-        int64_t num_elements = 1;
-        for (auto dim : shape) {
-            num_elements *= dim;
-        }
-        
-        // Limit total elements to prevent OOM
-        if (num_elements > 10000) {
-            num_elements = 10000;
-            if (!shape.empty()) {
-                shape[0] = std::min(shape[0], (int64_t)10000);
-            }
-        }
-        
-        // Create input tensor
-        torch::Tensor input;
-        
-        if (num_elements == 0 || shape.empty()) {
-            // Handle empty tensor case
-            input = torch::empty({0}, torch::TensorOptions().dtype(dtype).requires_grad(requires_grad));
-        } else {
-            // Fill tensor with values from fuzzer data
-            std::vector<float> values;
-            values.reserve(num_elements);
-            
-            for (int64_t i = 0; i < num_elements && offset < size; ++i) {
-                // Map byte to range [-1.5, 1.5] to include valid and invalid asin inputs
-                float val = (data[offset++] / 127.5f) - 1.0f;
-                val *= 1.5f; // Extend range to include values outside [-1, 1]
-                values.push_back(val);
-            }
-            
-            // Fill remaining with random valid/invalid values
-            while (values.size() < num_elements) {
-                float val = ((offset < size ? data[offset++] : rand() % 256) / 127.5f) - 1.0f;
-                val *= 1.5f;
-                values.push_back(val);
-            }
-            
-            // Create tensor from values
-            auto options = torch::TensorOptions().dtype(torch::kFloat32).requires_grad(requires_grad);
-            input = torch::from_blob(values.data(), {num_elements}, options).clone();
-            
-            if (!shape.empty()) {
-                input = input.reshape(shape);
-            }
-            
-            // Convert to target dtype
-            if (dtype != torch::kFloat32) {
-                input = input.to(dtype);
+
+        // Test with different tensor properties
+        if (input_tensor.dim() > 0) {
+            // Test with reshaped tensor
+            auto flat_input = input_tensor.flatten();
+            auto flat_result = torch::asin(flat_input);
+
+            // Test with transposed tensor (if 2D or higher)
+            if (input_tensor.dim() >= 2) {
+                auto transposed_input = input_tensor.transpose(0, 1);
+                auto transposed_result = torch::asin(transposed_input);
             }
         }
-        
-        // Test different tensor layouts
-        if (offset < size && (data[offset++] & 1) && input.numel() > 0) {
-            // Make tensor non-contiguous
-            if (input.dim() >= 2) {
-                input = input.transpose(0, input.dim() - 1);
+
+        // Test with different dtypes if possible
+        if (input_tensor.dtype() != torch::kFloat64) {
+            auto double_input = input_tensor.to(torch::kFloat64);
+            auto double_result = torch::asin(double_input);
+        }
+
+        if (input_tensor.dtype() != torch::kFloat32) {
+            auto float_input = input_tensor.to(torch::kFloat32);
+            auto float_result = torch::asin(float_input);
+        }
+
+        // Test gradient computation if input requires grad
+        if (input_tensor.requires_grad()) {
+            auto grad_input = input_tensor.clone().detach().requires_grad_(true);
+            // Clamp to valid domain for gradient computation
+            grad_input = torch::clamp(grad_input, -0.99, 0.99);
+            auto grad_result = torch::asin(grad_input);
+            
+            if (grad_result.numel() > 0) {
+                auto grad_output = torch::ones_like(grad_result);
+                grad_result.backward(grad_output);
             }
         }
-        
-        // Apply torch.asin
-        torch::Tensor result;
-        
-        if (use_out_tensor && offset < size) {
-            // Test with out parameter
-            torch::Tensor out;
-            
-            // Decide out tensor configuration
-            uint8_t out_config = data[offset++] % 4;
-            switch (out_config) {
-                case 0:
-                    // Same shape and dtype
-                    out = torch::empty_like(input);
-                    break;
-                case 1:
-                    // Different dtype
-                    out = torch::empty_like(input, torch::TensorOptions().dtype(torch::kFloat64));
-                    break;
-                case 2:
-                    // Wrong shape (should trigger error)
-                    if (input.numel() > 1) {
-                        out = torch::empty({input.numel() + 1}, input.options());
-                    } else {
-                        out = torch::empty_like(input);
-                    }
-                    break;
-                default:
-                    out = torch::empty_like(input);
-                    break;
-            }
-            
-            result = torch::asin_out(out, input);
-        } else {
-            result = torch::asin(input);
+
+        // Test in-place operation if input is not const
+        auto inplace_input = input_tensor.clone();
+        inplace_input = torch::clamp(inplace_input, -1.0, 1.0);
+        inplace_input.asin_();
+
+        // Test with complex numbers if supported
+        if (input_tensor.is_floating_point()) {
+            auto complex_input = torch::complex(input_tensor, torch::zeros_like(input_tensor));
+            auto complex_result = torch::asin(complex_input);
         }
+
+        // Force evaluation of all results to catch any lazy evaluation issues
+        result1.sum().item<double>();
+        result2.sum().item<double>();
         
-        // Exercise the result tensor
-        if (result.numel() > 0) {
-            // Check for NaN values (expected for inputs outside [-1, 1])
-            auto has_nan = torch::isnan(result).any().item<bool>();
-            
-            // Try backward pass if gradients enabled
-            if (requires_grad && input.requires_grad() && result.requires_grad()) {
-                try {
-                    auto grad_output = torch::ones_like(result);
-                    result.backward(grad_output);
-                } catch (...) {
-                    // Backward might fail for NaN values, which is expected
-                }
-            }
-            
-            // Access some elements to ensure computation completed
-            if (result.numel() > 0) {
-                result.flatten()[0];
-            }
+        // Handle potential NaN results from result3
+        if (torch::isfinite(result3).any().item<bool>()) {
+            result3.sum().item<double>();
         }
-        
-    } catch (const c10::Error& e) {
-        // PyTorch-specific errors are expected for invalid operations
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
-    } catch (...) {
-        // Unknown exception
-        return -1;
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

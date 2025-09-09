@@ -1,6 +1,8 @@
 import argparse
 import dataclasses
 import inspect
+import io
+import contextlib
 import os
 import re
 import shutil
@@ -26,6 +28,7 @@ VARIANTS: list[Variant] = [
     Variant("original", use_docs=True, use_helpers=True),
     Variant("no_doc", use_docs=False, use_helpers=True),
     Variant("no_helper", use_docs=True, use_helpers=False),
+    Variant("no_helper_no_doc", use_docs=False, use_helpers=False),
 ]
 
 
@@ -60,7 +63,9 @@ def minimal_main_skeleton() -> str:
         "extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {\n"
         "    try {\n"
         "        size_t offset = 0;\n"
-        "    } catch (const std::exception&) {\n"
+        "    } catch (const std::exception& e) {\n"
+        "        // Handle exceptions thrown during fuzzing\n"
+        "        std::cout << \"Exception caught: \" << e.what() << std::endl;\n"
         "        return -1;\n"
         "    }\n"
         "    return 0;\n"
@@ -69,10 +74,34 @@ def minimal_main_skeleton() -> str:
 
 
 def get_api_docstring(api_name: str) -> Optional[str]:
+    """Best-effort to obtain documentation text for a given API name.
+
+    Attempts, in order:
+    - Call `obj.docs()` and capture its stdout, if available.
+    - Fallback to `inspect.getdoc(obj)`.
+    """
     try:
         obj = eval(api_name)
     except Exception:
         return None
+
+    # Try calling `.docs()` and capture printed output
+    try:
+        docs_attr = getattr(obj, "docs", None)
+        if callable(docs_attr):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                try:
+                    docs_attr()
+                except Exception:
+                    pass
+            out = buf.getvalue().strip()
+            if out:
+                return out
+    except Exception:
+        pass
+
+    # Fallback to Python docstring
     try:
         doc = inspect.getdoc(obj)
         return doc
@@ -81,59 +110,94 @@ def get_api_docstring(api_name: str) -> Optional[str]:
 
 
 def build_prompt(api_name: str, variant: Variant) -> str:
-    # Always provide main.cpp skeleton for context across variants
+    """Build the exact prompt text as requested, allowing only variant-driven changes.
+
+    - Keeps the instruction wording identical to the user's specification.
+    - Inserts API docs when `use_docs` is True; otherwise omits the docs block.
+    - Includes fuzzer_utils in the prompt only when `use_helpers` is True.
+    """
     main_cpp, fuzzer_cpp, fuzzer_h = load_helper_texts()
 
-    doc_section = ""
-    if variant.use_docs:
-        doc = get_api_docstring(api_name)
-        if doc:
-            doc_section = (
-                "\nAPI Reference (for context):\n\n" + doc + "\n"
-            )
-        else:
-            doc_section = "\nAPI Reference (not available).\n"
-
-    if variant.use_helpers:
-        skeleton_block = (
-            "```main.cpp\n" + main_cpp + "\n```\n\n"
-            "```fuzzer_utils.cpp\n" + fuzzer_cpp + "\n```\n\n"
-            "```fuzzer_utils.h\n" + fuzzer_h + "\n```\n"
-        )
-        constraints = (
-            "- Include `\"fuzzer_utils.h\"` and you may use its APIs.\n"
-        )
-        helper_note = "The utility helpers declared in `fuzzer_utils.h` are available.\n"
-    else:
-        # Keep the main.cpp skeleton as structural context, but forbid using helpers.
-        skeleton_block = (
-            "```main.cpp\n" + main_cpp + "\n```\n"
-        )
-        constraints = (
-            "- Do not include or reference `fuzzer_utils.*`. Implement without helpers.\n"
-            "- The provided main.cpp skeleton references helpers; treat it as layout only and remove such dependencies.\n"
-        )
-        helper_note = "Do NOT rely on project-specific helpers; re-implement needed logic inline.\n"
-
-    prompt = (
-        f"Generate a complete C++ fuzz target (main.cpp) for the PyTorch C++ op `{api_name}`.\n"
-        "The target is compiled with libFuzzer.\n"
-        + doc_section
-        + "\nOutput requirements:\n"
-        "- Provide only one fenced code block with language `cpp`.\n"
-        "- The code must be self-contained in a single `main.cpp`.\n"
-        + constraints
-        + "\nImplementation guidance:\n"
-        "- Implement `extern \"C\" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size)`.\n"
-        "- Construct diverse tensors from raw fuzzer bytes: shapes (including 0/1 dims), dtypes, strides.\n"
-        f"- Invoke `{api_name}`.\n"
-        "- Prefer breadth over validation; avoid early checks that prevent edge cases.\n"
-        "- Catch exceptions narrowly; keep the harness running. Return 0/-1 suitably.\n"
-        + "\n\nStarter skeleton(s):\n\n"
-        + skeleton_block
-        + "\n" + helper_note
+    dep_line = (
+        '    * The utility functions from `fuzzer_utils.h` are available via `#include "fuzzer_utils.h"`.'
+        if variant.use_helpers
+        else ''
     )
-    return prompt
+
+    Instructions = f"""
+    **Instructions for `main.cpp` content:**
+
+1.  **Complete `LLVMFuzzerTestOneInput`:** Implement the `LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)` function.
+2.  **Tensor Creation:**
+    * Create input tensor(s) for the `{api_name}`.
+    * Explore diverse tensor properties: different ranks, dimensions (including 0 and 1), shapes, and data types.
+3.  **Operation Application:** Apply the `{api_name}` operation to the created tensor(s).
+4.  **Focus on Coverage and Crashes:**
+    * Prioritize inputs that might lead to crashes or uncover edge cases.
+    * Consider "dangerous" inputs: negative values where positive are expected (e.g., dimensions), very large or small numbers leading to overflow/underflow, empty tensors, tensors with conflicting shapes for the operation.
+5.  **No Premature Sanity Checks:**
+    * **Crucially, do NOT add overly defensive sanity checks** in the fuzzer code that would prevent testing edge cases (e.g., checking `if (dim_size > 0)` before creating a tensor). Let the PyTorch API handle invalid inputs. The fuzzer aims to find how the API behaves with such inputs.
+    * If the PyTorch C++ API itself throws an exception for invalid setup *before* the operation can be called (e.g. `torch::tensor` creation with invalid parameters), that's acceptable. The focus is on testing the `{api_name}` operation itself.
+6.  **Self-Contained `main.cpp`:** The generated code should be the complete content for `main.cpp`.
+7.  **No Comments or Prints:** Remove ALL C-style (`/* ... */`, `// ...`) and C++-style comments, and any `std::cout` or `printf` statements from the final C++ code.
+8.  **Dependencies:**
+{dep_line}
+"""
+
+    docs_text = ''
+    if variant.use_docs:
+        dt = get_api_docstring(api_name)
+        if dt:
+            docs_text = dt
+
+    # Prepare variant-dependent insertions first to avoid complex f-string expressions
+    header_block = (
+        f"""Here is the header file you can use:
+
+    ```fuzzer_utils.cpp
+    {fuzzer_cpp}
+    ```
+
+    ```fuzzer_utils.h
+    {fuzzer_h}
+    ```
+"""
+        if variant.use_helpers
+        else ""
+    )
+
+    # Base prompt prefix and instructions (exact phrasing)
+    prompt_prefix = f"""
+I need to write a C++ testharness for the PyTorch C++ frontend operation `{api_name}`.
+The testharness will be compiled with a fuzzer like libFuzzer.
+Your primary goal is to generate C++ code for the `main.cpp` file.
+
+The document of the API is as follows:
+
+{docs_text if docs_text else ''}
+
+
+
+{Instructions if variant.use_helpers else ''}
+
+
+    Here is the skeleton of the file:
+
+    ```main.cpp
+    {main_cpp}
+    ```
+
+    {header_block}
+
+
+Please complete the implementation with C++ code that properly tests the {api_name} functionality. Answer in pure string quote with ```cpp ```
+
+    """
+
+    print(prompt_prefix)
+
+    # Prompt is fully constructed via f-string above
+    return prompt_prefix
 
 
 def extract_cpp_from_response(response_text: str) -> Optional[str]:
@@ -156,37 +220,66 @@ def anthropic_client() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
 
-def call_llm(api_name: str, variant: Variant, *, model: str, max_tokens: int, temperature: float) -> Optional[str]:
+def call_llm(
+    api_name: str,
+    variant: Variant,
+    *,
+    retries: int = 0,
+    retry_backoff: float = 2.0,
+) -> Optional[str]:
     client = anthropic_client()
     prompt = build_prompt(api_name, variant)
+    # Exact system message per request
     system_msg = (
-        "You are a senior C++ engineer specializing in libFuzzer targets for"
-        " PyTorch C++ frontend ops. Produce a single, compilable main.cpp that"
-        " maximizes path coverage and robustness, adhering strictly to format."
+        "You are an expert C++ programmer specializing in writing fuzz targets for PyTorch C++ frontend operations. "
+        "Your task is to generate complete, compilable `main.cpp` files based on the provided skeletons and instructions. "
+        "Focus on creating code that maximizes test coverage and identifies potential crashes by exploring edge cases. "
+        "Adhere strictly to output format requirements."
     )
-    try:
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system_msg,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        time.sleep(0.5)
 
-        # Concatenate all text blocks
-        content_blocks = getattr(resp, "content", [])
-        content_text = "\n".join(
-            (block.text if hasattr(block, "text") else (block.get("text", "") if isinstance(block, dict) else str(block)))
-            for block in content_blocks
+    attempts = retries + 1
+    last_err: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            resp = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=15000,
+                temperature=0,
+                system=system_msg,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            time.sleep(1)
+
+            # Concatenate all text blocks
+            content_blocks = getattr(resp, "content", [])
+            content_text = "\n".join(
+                (
+                    block.text
+                    if hasattr(block, "text")
+                    else (block.get("text", "") if isinstance(block, dict) else str(block))
+                )
+                for block in content_blocks
+            )
+            cpp = extract_cpp_from_response(content_text)
+            if not cpp:
+                raise RuntimeError("Could not extract cpp code block from response")
+            return cpp
+        except Exception as e:
+            last_err = e
+            print(
+                f"[ERROR] LLM call failed for {api_name} ({variant.name}) attempt {attempt}/{attempts}: {e}"
+            )
+            if attempt < attempts:
+                sleep_s = retry_backoff ** (attempt - 1)
+                time.sleep(sleep_s)
+            else:
+                break
+    # All attempts failed
+    if last_err is not None:
+        print(
+            f"[ERROR] Exhausted retries for {api_name} ({variant.name}): {last_err}"
         )
-        cpp = extract_cpp_from_response(content_text)
-        if not cpp:
-            raise RuntimeError("Could not extract cpp code block from response")
-        return cpp
-    except Exception as e:
-        print(f"[ERROR] LLM call failed for {api_name} ({variant.name}): {e}")
-        return None
+    return None
 
 
 def write_variant_output(base_out_dir: str, api_name: str, variant: Variant, cpp_code: str, *, overwrite: bool) -> None:
@@ -224,9 +317,10 @@ def main() -> None:
     parser.add_argument("--out-dir", default=".", help="Base output directory for generated variants")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing outputs")
     parser.add_argument("--variants", nargs="*", choices=[v.name for v in VARIANTS], help="Subset of variants to run")
-    parser.add_argument("--model", default=os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-1-20250805"))
-    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("LLM_MAX_TOKENS", 3000)))
-    parser.add_argument("--temperature", type=float, default=float(os.environ.get("LLM_TEMPERATURE", 0.3)))
+    parser.add_argument("--model", default=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"))
+    parser.add_argument("--max-tokens", type=int, default=int(os.environ.get("LLM_MAX_TOKENS", 15000)))
+    parser.add_argument("--temperature", type=float, default=float(os.environ.get("LLM_TEMPERATURE",1)))
+    parser.add_argument("--retries", type=int, default=int(os.environ.get("LLM_RETRIES", 3)), help="LLM call retry attempts on failure")
     args = parser.parse_args()
 
     apis = read_api_list(args.api_file)
@@ -238,10 +332,23 @@ def main() -> None:
 
     for api_name in apis:
         for v in selected_variants:
+            # Skip generation if output already exists and overwrite is disabled
+            variant_dir = os.path.join(args.out_dir, v.name, api_name)
+            main_cpp_path = os.path.join(variant_dir, "main.cpp")
+            if not args.overwrite and os.path.isfile(main_cpp_path):
+                print(f"[SKIP] {variant_dir} exists (overwrite disabled); skipping LLM generation")
+                continue
+
             print(f"[GEN] {api_name} -> {v.name}")
-            cpp = call_llm(api_name, v, model=args.model, max_tokens=args.max_tokens, temperature=args.temperature)
+            cpp = call_llm(
+                api_name,
+                v,
+                retries=args.retries,
+            )
             if not cpp:
-                print(f"[WARN] Skipping write for {api_name} ({v.name}) due to missing code")
+                print(
+                    f"[WARN] Skipping write for {api_name} ({v.name}) due to missing code after retries"
+                )
                 continue
             write_variant_output(args.out_dir, api_name, v, cpp, overwrite=args.overwrite)
 

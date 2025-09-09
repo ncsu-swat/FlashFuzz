@@ -1,9 +1,6 @@
 FROM ncsuswat/flashfuzz:tf2.16-base
 
 
-# Copy the test harness
-COPY testharness/tf_cpu /root/tensorflow/fuzz
-
 # Build the test harness
 ENV PYTHON_BIN_PATH=/usr/bin/python3
 ENV USE_DEFAULT_PYTHON_LIB_PATH=1
@@ -36,6 +33,10 @@ RUN  cd /root/tensorflow/bazel-bin/tensorflow && \
     ln -s libtensorflow_framework.so.2.16.1 libtensorflow_framework.so
 
 WORKDIR /root/tensorflow/fuzz
+
+# Copy the test harness
+COPY testharness/tf_cpu /root/tensorflow/fuzz
+
 COPY scripts/ .
 
 RUN  python3 -u build_test_harness.py --dll tf --mode cov --no-compile

@@ -1,154 +1,155 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstdint>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-// Helper to consume bytes from the fuzzer input
-template<typename T>
-bool consumeBytes(const uint8_t* data, size_t size, size_t& offset, T& value) {
-    if (offset + sizeof(T) > size) return false;
-    std::memcpy(&value, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return true;
-}
-
-// Create tensor from fuzzer input
-torch::Tensor createTensorFromBytes(const uint8_t* data, size_t size, size_t& offset) {
-    if (offset >= size) return torch::empty({0});
-    
-    // Consume dtype selector
-    uint8_t dtype_selector = 0;
-    if (!consumeBytes(data, size, offset, dtype_selector)) return torch::empty({0});
-    
-    // Consume rank
-    uint8_t rank = 0;
-    if (!consumeBytes(data, size, offset, rank)) return torch::empty({0});
-    rank = (rank % 5) + 1; // Limit rank to 1-5
-    
-    // Consume shape
-    std::vector<int64_t> shape;
-    for (int i = 0; i < rank; i++) {
-        uint8_t dim = 0;
-        if (!consumeBytes(data, size, offset, dim)) break;
-        shape.push_back((dim % 10) + 1); // Limit dimensions to 1-10
-    }
-    
-    if (shape.empty()) shape.push_back(1);
-    
-    // Select dtype based on selector
-    torch::ScalarType dtype;
-    switch (dtype_selector % 6) {
-        case 0: dtype = torch::kFloat32; break;
-        case 1: dtype = torch::kFloat64; break;
-        case 2: dtype = torch::kInt32; break;
-        case 3: dtype = torch::kInt64; break;
-        case 4: dtype = torch::kInt8; break;
-        case 5: dtype = torch::kInt16; break;
-        default: dtype = torch::kFloat32;
-    }
-    
-    // Create tensor with random data
-    torch::Tensor tensor = torch::empty(shape, torch::dtype(dtype));
-    
-    // Fill tensor with fuzzer data
-    size_t num_elements = tensor.numel();
-    if (num_elements > 0) {
-        if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-            // For floating point, create some special values
-            uint8_t special_val = 0;
-            if (consumeBytes(data, size, offset, special_val)) {
-                switch (special_val % 5) {
-                    case 0: tensor.fill_(0.0); break;
-                    case 1: tensor.fill_(1.0); break;
-                    case 2: tensor.fill_(-1.0); break;
-                    case 3: tensor.fill_(std::numeric_limits<float>::infinity()); break;
-                    case 4: tensor.fill_(std::numeric_limits<float>::quiet_NaN()); break;
-                }
-            }
-            
-            // Optionally add some random values
-            for (int64_t i = 0; i < std::min((int64_t)10, num_elements); i++) {
-                float val = 0;
-                if (consumeBytes(data, size, offset, val)) {
-                    tensor.view({-1})[i] = val;
-                }
-            }
-        } else {
-            // For integer types
-            for (int64_t i = 0; i < std::min((int64_t)10, num_elements); i++) {
-                int32_t val = 0;
-                if (consumeBytes(data, size, offset, val)) {
-                    tensor.view({-1})[i] = val;
-                }
-            }
-        }
-    }
-    
-    return tensor;
-}
-
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    if (size < 4) return 0;
-    
-    try {
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
-        
-        // Create input tensor
-        torch::Tensor input = createTensorFromBytes(data, size, offset);
-        
+
+        // Generate input tensor
+        auto input_tensor = generate_tensor(Data, Size, offset);
+        if (input_tensor.numel() == 0) {
+            return 0; // Skip empty tensors
+        }
+
         // Decide whether to use tensor or scalar for 'other'
-        uint8_t use_scalar = 0;
-        consumeBytes(data, size, offset, use_scalar);
+        bool use_scalar = get_bool(Data, Size, offset);
         
-        torch::Tensor result;
-        
-        if (use_scalar % 2 == 0) {
-            // Use scalar value
-            float scalar_value = 0;
-            consumeBytes(data, size, offset, scalar_value);
+        if (use_scalar) {
+            // Test with scalar divisor
+            auto scalar_val = get_float(Data, Size, offset);
             
-            // Handle special scalar values
-            uint8_t special_scalar = 0;
-            if (consumeBytes(data, size, offset, special_scalar)) {
-                switch (special_scalar % 6) {
-                    case 0: scalar_value = 0.0f; break;
-                    case 1: scalar_value = 1.0f; break;
-                    case 2: scalar_value = -1.0f; break;
-                    case 3: scalar_value = 0.5f; break;
-                    case 4: scalar_value = std::numeric_limits<float>::infinity(); break;
-                    case 5: scalar_value = std::numeric_limits<float>::quiet_NaN(); break;
+            // Test basic fmod operation
+            auto result1 = torch::fmod(input_tensor, scalar_val);
+            
+            // Test with out parameter
+            auto out_tensor = torch::empty_like(result1);
+            torch::fmod_out(out_tensor, input_tensor, scalar_val);
+            
+            // Test edge cases with special scalar values
+            if (get_bool(Data, Size, offset)) {
+                // Test with zero divisor (should return NaN for float, may throw for int)
+                try {
+                    auto result_zero = torch::fmod(input_tensor, 0.0);
+                } catch (...) {
+                    // Expected for integer types
                 }
             }
             
-            // Test fmod with scalar
-            result = torch::fmod(input, scalar_value);
-        } else {
-            // Use tensor for 'other'
-            torch::Tensor other = createTensorFromBytes(data, size, offset);
+            if (get_bool(Data, Size, offset)) {
+                // Test with infinity
+                auto result_inf = torch::fmod(input_tensor, std::numeric_limits<double>::infinity());
+            }
             
-            // Test fmod with tensor
-            result = torch::fmod(input, other);
+            if (get_bool(Data, Size, offset)) {
+                // Test with negative infinity
+                auto result_neg_inf = torch::fmod(input_tensor, -std::numeric_limits<double>::infinity());
+            }
+            
+            if (get_bool(Data, Size, offset)) {
+                // Test with NaN
+                auto result_nan = torch::fmod(input_tensor, std::numeric_limits<double>::quiet_NaN());
+            }
+            
+        } else {
+            // Test with tensor divisor
+            auto other_tensor = generate_tensor(Data, Size, offset);
+            if (other_tensor.numel() == 0) {
+                return 0; // Skip empty tensors
+            }
+            
+            try {
+                // Test basic fmod operation with broadcasting
+                auto result1 = torch::fmod(input_tensor, other_tensor);
+                
+                // Test with out parameter
+                auto out_tensor = torch::empty_like(result1);
+                torch::fmod_out(out_tensor, input_tensor, other_tensor);
+                
+                // Test with swapped operands to test different broadcasting scenarios
+                if (get_bool(Data, Size, offset)) {
+                    auto result_swapped = torch::fmod(other_tensor, input_tensor);
+                }
+                
+            } catch (const std::runtime_error& e) {
+                // Expected for incompatible shapes or division by zero
+            }
         }
         
-        // Optionally test with out parameter
-        uint8_t use_out = 0;
-        if (consumeBytes(data, size, offset, use_out) && (use_out % 4 == 0)) {
-            torch::Tensor out = torch::empty_like(result);
-            torch::fmod_out(out, input, result);
+        // Test with different tensor types if possible
+        if (get_bool(Data, Size, offset)) {
+            try {
+                // Convert to different dtypes and test
+                auto float_tensor = input_tensor.to(torch::kFloat32);
+                auto double_tensor = input_tensor.to(torch::kFloat64);
+                
+                auto result_float = torch::fmod(float_tensor, 2.5f);
+                auto result_double = torch::fmod(double_tensor, 2.5);
+                
+                // Test integer types
+                if (input_tensor.dtype().isIntegralType(false)) {
+                    auto int_tensor = input_tensor.to(torch::kInt32);
+                    auto long_tensor = input_tensor.to(torch::kInt64);
+                    
+                    auto result_int = torch::fmod(int_tensor, 3);
+                    auto result_long = torch::fmod(long_tensor, 5L);
+                }
+                
+            } catch (...) {
+                // Type conversion might fail for some inputs
+            }
         }
         
-        // Force computation
-        if (result.numel() > 0) {
-            result.sum().item<float>();
+        // Test edge cases with special tensor values
+        if (get_bool(Data, Size, offset)) {
+            try {
+                // Create tensors with special values
+                auto shape = input_tensor.sizes().vec();
+                if (!shape.empty()) {
+                    auto zeros = torch::zeros(shape, input_tensor.options());
+                    auto ones = torch::ones(shape, input_tensor.options());
+                    auto neg_ones = torch::full(shape, -1.0, input_tensor.options());
+                    
+                    // Test fmod with zeros, ones, and negative ones
+                    auto result_zeros = torch::fmod(input_tensor, ones);  // Avoid division by zero
+                    auto result_ones = torch::fmod(ones, input_tensor);
+                    auto result_neg = torch::fmod(input_tensor, neg_ones);
+                    
+                    // Test with very small and very large values
+                    if (input_tensor.dtype().isFloatingType()) {
+                        auto small_vals = torch::full(shape, 1e-10, input_tensor.options());
+                        auto large_vals = torch::full(shape, 1e10, input_tensor.options());
+                        
+                        auto result_small = torch::fmod(input_tensor, small_vals);
+                        auto result_large = torch::fmod(large_vals, input_tensor);
+                    }
+                }
+            } catch (...) {
+                // Some operations might fail with certain tensor configurations
+            }
         }
         
-    } catch (const c10::Error& e) {
-        // PyTorch errors are expected for invalid operations
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+        // Test in-place operation if available
+        if (get_bool(Data, Size, offset)) {
+            try {
+                auto temp_tensor = input_tensor.clone();
+                auto divisor = get_float(Data, Size, offset);
+                if (divisor != 0.0) {  // Avoid division by zero for in-place
+                    temp_tensor.fmod_(divisor);
+                }
+            } catch (...) {
+                // In-place operations might fail
+            }
+        }
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

@@ -1,175 +1,160 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-// Helper to consume bytes from the fuzzer input
-template<typename T>
-bool consumeBytes(const uint8_t* data, size_t& offset, size_t size, T& out) {
-    if (offset + sizeof(T) > size) return false;
-    std::memcpy(&out, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return true;
-}
-
-// Helper to create a tensor from fuzzer input
-torch::Tensor createTensorFromBytes(const uint8_t* data, size_t& offset, size_t size) {
-    // Consume dtype selector
-    uint8_t dtype_selector = 0;
-    if (!consumeBytes(data, offset, size, dtype_selector)) {
-        return torch::empty({0});
-    }
-    
-    // Map to actual dtype
-    torch::ScalarType dtype;
-    switch (dtype_selector % 10) {
-        case 0: dtype = torch::kFloat32; break;
-        case 1: dtype = torch::kFloat64; break;
-        case 2: dtype = torch::kInt32; break;
-        case 3: dtype = torch::kInt64; break;
-        case 4: dtype = torch::kInt16; break;
-        case 5: dtype = torch::kInt8; break;
-        case 6: dtype = torch::kUInt8; break;
-        case 7: dtype = torch::kBool; break;
-        case 8: dtype = torch::kFloat16; break;
-        default: dtype = torch::kFloat32; break;
-    }
-    
-    // Consume number of dimensions
-    uint8_t num_dims = 0;
-    if (!consumeBytes(data, offset, size, num_dims)) {
-        return torch::empty({0}, torch::dtype(dtype));
-    }
-    num_dims = (num_dims % 5) + 1; // 1 to 5 dimensions
-    
-    // Consume shape
-    std::vector<int64_t> shape;
-    for (int i = 0; i < num_dims; i++) {
-        uint8_t dim_size = 0;
-        if (!consumeBytes(data, offset, size, dim_size)) {
-            shape.push_back(1);
-        } else {
-            shape.push_back((dim_size % 10) + 1); // 1 to 10 per dimension
-        }
-    }
-    
-    // Create tensor with random data
-    torch::Tensor tensor = torch::empty(shape, torch::dtype(dtype));
-    
-    // Fill with some fuzzer-controlled values
-    int64_t numel = tensor.numel();
-    if (numel > 0 && numel < 1000) { // Limit to avoid excessive memory
-        if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-            float val = 0.0f;
-            if (consumeBytes(data, offset, size, val)) {
-                tensor.fill_(val);
-            }
-        } else {
-            int32_t val = 0;
-            if (consumeBytes(data, offset, size, val)) {
-                tensor.fill_(val);
-            }
-        }
-    }
-    
-    return tensor;
-}
-
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (size < 10) return 0; // Need minimum bytes
-    
-    try {
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
+
+        // Need at least basic data for tensor dimensions and parameters
+        if (Size < 32) {
+            return 0;
+        }
+
+        // Parse input tensor dimensions and properties
+        auto input_shape = parse_random_shape(Data, Size, offset, 1, 4, 1, 100);
+        auto input_dtype = parse_random_dtype(Data, Size, offset);
         
         // Create input tensor
-        torch::Tensor input = createTensorFromBytes(data, offset, size);
+        auto input_tensor = create_random_tensor(input_shape, input_dtype, Data, Size, offset);
         
-        // Create index tensor - should be 1D long tensor
-        uint8_t index_size = 0;
-        if (!consumeBytes(data, offset, size, index_size)) {
-            index_size = 1;
-        }
-        index_size = (index_size % 20) + 1; // 1 to 20 indices
+        // Parse indices tensor - should be 1D with integer type
+        auto indices_size = parse_range(Data, Size, offset, 1, std::min(static_cast<size_t>(1000), input_tensor.numel()));
+        std::vector<int64_t> indices_shape = {static_cast<int64_t>(indices_size)};
         
-        std::vector<int64_t> indices;
-        for (int i = 0; i < index_size; i++) {
-            int32_t idx = 0;
-            if (consumeBytes(data, offset, size, idx)) {
-                // Allow negative indices and out-of-bounds for edge cases
-                indices.push_back(idx);
+        // Create indices tensor with valid indices for the input tensor
+        auto indices_tensor = torch::randint(0, input_tensor.numel(), indices_shape, torch::kLong);
+        
+        // Parse source tensor dimensions - should be compatible with indices
+        std::vector<int64_t> source_shape;
+        if (indices_size == 1) {
+            // For single index, source can be scalar or have same shape as input except first dim
+            bool use_scalar = parse_bool(Data, Size, offset);
+            if (use_scalar) {
+                source_shape = {};  // scalar
             } else {
-                indices.push_back(i);
+                source_shape = input_shape;
+                if (source_shape.size() > 0) {
+                    source_shape[0] = 1;  // single element in first dimension
+                }
             }
-        }
-        torch::Tensor index = torch::tensor(indices, torch::kInt64);
-        
-        // Create source tensor (values to put)
-        torch::Tensor source = createTensorFromBytes(data, offset, size);
-        
-        // Consume accumulate flag
-        uint8_t accumulate_byte = 0;
-        bool accumulate = false;
-        if (consumeBytes(data, offset, size, accumulate_byte)) {
-            accumulate = (accumulate_byte % 2) == 1;
-        }
-        
-        // Try different variations of put operation
-        uint8_t operation_type = 0;
-        if (consumeBytes(data, offset, size, operation_type)) {
-            operation_type = operation_type % 4;
-        }
-        
-        torch::Tensor result;
-        
-        switch (operation_type) {
-            case 0:
-                // Basic put operation
-                result = input.put(index, source, accumulate);
-                break;
-            case 1:
-                // In-place put operation
-                result = input.clone();
-                result.put_(index, source, accumulate);
-                break;
-            case 2:
-                // Put with flattened input
-                if (input.numel() > 0) {
-                    result = input.flatten().put(index, source, accumulate);
-                }
-                break;
-            case 3:
-                // Put with reshaped source
-                if (source.numel() > 0 && index.numel() > 0) {
-                    torch::Tensor reshaped_source = source.flatten();
-                    if (reshaped_source.numel() >= index.numel()) {
-                        reshaped_source = reshaped_source.narrow(0, 0, index.numel());
-                    }
-                    result = input.put(index, reshaped_source, accumulate);
-                }
-                break;
-        }
-        
-        // Additional operations to increase coverage
-        if (result.defined() && result.numel() > 0) {
-            // Try accessing result
-            auto shape = result.sizes();
-            auto dtype = result.dtype();
-            auto device = result.device();
-            
-            // Try some tensor operations on result
-            if (result.numel() < 1000) {
-                auto sum = result.sum();
-                auto mean = result.to(torch::kFloat32).mean();
+        } else {
+            // For multiple indices, source should have shape [indices_size, ...] matching input shape
+            source_shape = input_shape;
+            if (source_shape.size() > 0) {
+                source_shape[0] = indices_size;
+            } else {
+                source_shape = {indices_size};
             }
         }
         
-    } catch (const c10::Error& e) {
-        // PyTorch-specific errors are expected for invalid operations
-        return 0;
-    } catch (const std::exception &e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+        auto source_tensor = create_random_tensor(source_shape, input_dtype, Data, Size, offset);
+        
+        // Test basic put operation
+        auto result1 = input_tensor.clone();
+        result1.put_(indices_tensor, source_tensor);
+        
+        // Test with accumulate parameter
+        bool accumulate = parse_bool(Data, Size, offset);
+        auto result2 = input_tensor.clone();
+        result2.put_(indices_tensor, source_tensor, accumulate);
+        
+        // Test non-inplace version
+        auto result3 = torch::put(input_tensor, indices_tensor, source_tensor);
+        auto result4 = torch::put(input_tensor, indices_tensor, source_tensor, accumulate);
+        
+        // Test edge cases with different tensor configurations
+        
+        // Test with empty indices
+        if (parse_bool(Data, Size, offset)) {
+            auto empty_indices = torch::empty({0}, torch::kLong);
+            auto empty_source = torch::empty({0}, input_dtype);
+            auto result_empty = input_tensor.clone();
+            result_empty.put_(empty_indices, empty_source);
+        }
+        
+        // Test with scalar source
+        if (parse_bool(Data, Size, offset) && source_tensor.numel() > 0) {
+            auto scalar_source = source_tensor.flatten()[0];
+            auto result_scalar = input_tensor.clone();
+            result_scalar.put_(indices_tensor, scalar_source);
+        }
+        
+        // Test with different index ranges
+        if (parse_bool(Data, Size, offset) && input_tensor.numel() > 1) {
+            // Test with negative indices (should wrap around)
+            auto neg_indices = torch::randint(-static_cast<int64_t>(input_tensor.numel()), 0, {indices_size}, torch::kLong);
+            auto result_neg = input_tensor.clone();
+            result_neg.put_(neg_indices, source_tensor);
+        }
+        
+        // Test with repeated indices
+        if (parse_bool(Data, Size, offset) && indices_size > 1) {
+            auto repeated_indices = torch::zeros({indices_size}, torch::kLong);  // All zeros
+            auto result_repeated = input_tensor.clone();
+            result_repeated.put_(repeated_indices, source_tensor, true);  // Use accumulate for repeated indices
+        }
+        
+        // Test with different device configurations if CUDA is available
+        if (torch::cuda::is_available() && parse_bool(Data, Size, offset)) {
+            try {
+                auto cuda_input = input_tensor.to(torch::kCUDA);
+                auto cuda_indices = indices_tensor.to(torch::kCUDA);
+                auto cuda_source = source_tensor.to(torch::kCUDA);
+                
+                auto cuda_result = cuda_input.clone();
+                cuda_result.put_(cuda_indices, cuda_source);
+                
+                // Test mixed device scenarios (should fail gracefully)
+                try {
+                    auto mixed_result = input_tensor.clone();  // CPU tensor
+                    mixed_result.put_(cuda_indices, source_tensor);  // CUDA indices, CPU source
+                } catch (...) {
+                    // Expected to fail, ignore
+                }
+            } catch (...) {
+                // CUDA operations might fail, ignore
+            }
+        }
+        
+        // Test with different data types for source (should handle type promotion)
+        if (parse_bool(Data, Size, offset)) {
+            auto different_dtype = (input_dtype == torch::kFloat) ? torch::kDouble : torch::kFloat;
+            try {
+                auto diff_source = source_tensor.to(different_dtype);
+                auto result_diff_type = input_tensor.clone();
+                result_diff_type.put_(indices_tensor, diff_source);
+            } catch (...) {
+                // Type conversion might fail for some combinations
+            }
+        }
+        
+        // Test boundary conditions
+        if (input_tensor.numel() > 0) {
+            // Test with maximum valid index
+            auto max_idx = torch::tensor({input_tensor.numel() - 1}, torch::kLong);
+            auto boundary_source = create_random_tensor({1}, input_dtype, Data, Size, offset);
+            auto result_boundary = input_tensor.clone();
+            result_boundary.put_(max_idx, boundary_source);
+        }
+        
+        // Verify results have correct shapes and properties
+        if (result1.sizes() != input_tensor.sizes()) {
+            throw std::runtime_error("Result shape mismatch");
+        }
+        
+        if (result1.dtype() != input_tensor.dtype()) {
+            throw std::runtime_error("Result dtype mismatch");
+        }
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

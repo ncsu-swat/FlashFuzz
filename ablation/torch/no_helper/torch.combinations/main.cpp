@@ -1,196 +1,191 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <cstdint>
-#include <cstring>
-#include <vector>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (size < 8) {
-        return 0;  // Need minimum bytes for configuration
-    }
-
-    try {
-        // Parse configuration from fuzzer input
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
-        
-        // Extract parameters for combinations
-        uint8_t r_value = data[offset++] % 10 + 1;  // r in range [1, 10]
-        bool with_replacement = data[offset++] & 1;
-        
-        // Extract tensor configuration
-        uint8_t dtype_selector = data[offset++] % 6;
-        uint8_t device_selector = data[offset++] % 2;
-        size_t tensor_size = (data[offset++] % 20) + 1;  // Size in range [1, 20]
-        
-        // Ensure we have enough data for tensor values
-        if (offset + tensor_size * sizeof(float) > size) {
-            tensor_size = (size - offset) / sizeof(float);
-            if (tensor_size == 0) {
-                return 0;
-            }
+
+        // Need at least some bytes for tensor size, r value, and with_replacement flag
+        if (Size < 6) {
+            return 0;
         }
-        
-        // Select dtype
-        torch::ScalarType dtype;
-        switch (dtype_selector) {
-            case 0: dtype = torch::kFloat32; break;
-            case 1: dtype = torch::kFloat64; break;
-            case 2: dtype = torch::kInt32; break;
-            case 3: dtype = torch::kInt64; break;
-            case 4: dtype = torch::kInt8; break;
-            case 5: dtype = torch::kInt16; break;
-            default: dtype = torch::kFloat32; break;
-        }
-        
-        // Select device
-        torch::Device device = device_selector == 0 ? torch::kCPU : torch::kCPU;
-        if (device_selector == 1 && torch::cuda::is_available()) {
-            device = torch::kCUDA;
-        }
-        
-        // Create input tensor
+
+        // Extract tensor size (1-20 elements to keep combinations manageable)
+        uint8_t tensor_size_raw = Data[offset++];
+        int tensor_size = (tensor_size_raw % 20) + 1;
+
+        // Extract r value (0 to tensor_size + 2 to test edge cases)
+        uint8_t r_raw = Data[offset++];
+        int r = r_raw % (tensor_size + 3);
+
+        // Extract with_replacement flag
+        bool with_replacement = (Data[offset++] % 2) == 1;
+
+        // Extract data type choice
+        uint8_t dtype_choice = Data[offset++] % 6;
+
+        // Create input tensor based on available data
         torch::Tensor input;
         
-        if (dtype == torch::kFloat32 || dtype == torch::kFloat64) {
-            // For floating point types
-            std::vector<float> values;
-            for (size_t i = 0; i < tensor_size; ++i) {
-                if (offset + sizeof(float) <= size) {
-                    float val;
-                    std::memcpy(&val, data + offset, sizeof(float));
-                    offset += sizeof(float);
-                    // Clamp to reasonable range to avoid inf/nan issues
-                    if (std::isfinite(val)) {
-                        values.push_back(val);
-                    } else {
-                        values.push_back(static_cast<float>(i));
+        switch (dtype_choice) {
+            case 0: { // int32
+                std::vector<int32_t> values;
+                for (int i = 0; i < tensor_size && offset < Size; ++i) {
+                    int32_t val = static_cast<int32_t>(Data[offset++]);
+                    if (offset < Size) {
+                        val |= (static_cast<int32_t>(Data[offset++]) << 8);
                     }
-                } else {
-                    values.push_back(static_cast<float>(i));
+                    values.push_back(val);
                 }
-            }
-            input = torch::tensor(values, torch::TensorOptions().dtype(dtype).device(device));
-        } else {
-            // For integer types
-            std::vector<int64_t> values;
-            for (size_t i = 0; i < tensor_size; ++i) {
-                if (offset + sizeof(int32_t) <= size) {
-                    int32_t val;
-                    std::memcpy(&val, data + offset, sizeof(int32_t));
-                    offset += sizeof(int32_t);
-                    values.push_back(static_cast<int64_t>(val % 1000));  // Limit range
-                } else {
-                    values.push_back(static_cast<int64_t>(i));
+                // Fill remaining with zeros if not enough data
+                while (values.size() < tensor_size) {
+                    values.push_back(0);
                 }
+                input = torch::tensor(values, torch::kInt32);
+                break;
             }
-            input = torch::tensor(values, torch::TensorOptions().dtype(dtype).device(device));
-        }
-        
-        // Ensure input is 1D
-        if (input.dim() != 1) {
-            input = input.flatten();
-        }
-        
-        // Adjust r to be valid for the tensor size
-        int64_t actual_r = static_cast<int64_t>(r_value);
-        if (!with_replacement && actual_r > input.size(0)) {
-            actual_r = input.size(0);
-        }
-        
-        // Test edge cases
-        if (offset < size) {
-            uint8_t edge_case = data[offset++] % 5;
-            switch (edge_case) {
-                case 0:  // Empty tensor
-                    input = torch::empty({0}, torch::TensorOptions().dtype(dtype).device(device));
-                    break;
-                case 1:  // Single element
-                    input = torch::ones({1}, torch::TensorOptions().dtype(dtype).device(device));
-                    break;
-                case 2:  // r = 0
-                    actual_r = 0;
-                    break;
-                case 3:  // r = tensor_size
-                    actual_r = input.size(0);
-                    break;
-                case 4:  // r > tensor_size (for with_replacement=true)
-                    if (with_replacement) {
-                        actual_r = input.size(0) + 1;
-                    }
-                    break;
+            case 1: { // int64
+                std::vector<int64_t> values;
+                for (int i = 0; i < tensor_size && offset < Size; ++i) {
+                    int64_t val = static_cast<int64_t>(Data[offset++]);
+                    values.push_back(val);
+                }
+                while (values.size() < tensor_size) {
+                    values.push_back(0);
+                }
+                input = torch::tensor(values, torch::kInt64);
+                break;
+            }
+            case 2: { // float32
+                std::vector<float> values;
+                for (int i = 0; i < tensor_size && offset < Size; ++i) {
+                    float val = static_cast<float>(Data[offset++]) / 255.0f;
+                    values.push_back(val);
+                }
+                while (values.size() < tensor_size) {
+                    values.push_back(0.0f);
+                }
+                input = torch::tensor(values, torch::kFloat32);
+                break;
+            }
+            case 3: { // double
+                std::vector<double> values;
+                for (int i = 0; i < tensor_size && offset < Size; ++i) {
+                    double val = static_cast<double>(Data[offset++]) / 255.0;
+                    values.push_back(val);
+                }
+                while (values.size() < tensor_size) {
+                    values.push_back(0.0);
+                }
+                input = torch::tensor(values, torch::kFloat64);
+                break;
+            }
+            case 4: { // bool
+                std::vector<bool> values;
+                for (int i = 0; i < tensor_size && offset < Size; ++i) {
+                    bool val = (Data[offset++] % 2) == 1;
+                    values.push_back(val);
+                }
+                while (values.size() < tensor_size) {
+                    values.push_back(false);
+                }
+                input = torch::tensor(values, torch::kBool);
+                break;
+            }
+            default: { // int8
+                std::vector<int8_t> values;
+                for (int i = 0; i < tensor_size && offset < Size; ++i) {
+                    int8_t val = static_cast<int8_t>(Data[offset++]);
+                    values.push_back(val);
+                }
+                while (values.size() < tensor_size) {
+                    values.push_back(0);
+                }
+                input = torch::tensor(values, torch::kInt8);
+                break;
             }
         }
+
+        // Test different combinations calls
         
-        // Call torch.combinations
-        torch::Tensor result;
+        // Test 1: Default parameters (r=2, with_replacement=False)
+        auto result1 = torch::combinations(input);
         
-        // Test different overloads
-        if (offset < size && data[offset++] % 3 == 0) {
-            // Call with default parameters
-            result = torch::combinations(input);
-        } else if (offset < size && data[offset++] % 2 == 0) {
-            // Call with r parameter only
-            result = torch::combinations(input, actual_r);
-        } else {
-            // Call with all parameters
-            result = torch::combinations(input, actual_r, with_replacement);
+        // Test 2: With specified r value
+        auto result2 = torch::combinations(input, r);
+        
+        // Test 3: With specified r and with_replacement
+        auto result3 = torch::combinations(input, r, with_replacement);
+        
+        // Test 4: Edge cases
+        if (r == 0) {
+            auto result4 = torch::combinations(input, 0, with_replacement);
         }
         
-        // Perform some basic operations on result to ensure it's valid
-        if (result.numel() > 0) {
-            auto sum = result.sum();
-            auto mean = result.mean();
-            auto shape = result.sizes();
+        if (r == 1) {
+            auto result5 = torch::combinations(input, 1, with_replacement);
+        }
+        
+        // Test 5: r larger than input size (should return empty tensor)
+        if (tensor_size > 0) {
+            auto result6 = torch::combinations(input, tensor_size + 1, false);
+        }
+        
+        // Test 6: Empty tensor edge case
+        if (offset < Size && (Data[offset++] % 10) == 0) {
+            auto empty_input = torch::tensor({}, input.dtype());
+            auto empty_result = torch::combinations(empty_input, r, with_replacement);
+        }
+        
+        // Test 7: Single element tensor
+        if (offset < Size && (Data[offset++] % 10) == 1) {
+            auto single_input = input.slice(0, 0, 1);
+            auto single_result = torch::combinations(single_input, r, with_replacement);
+        }
+        
+        // Test 8: Large r with replacement (test memory limits)
+        if (with_replacement && tensor_size <= 5 && r <= 10) {
+            auto large_r_result = torch::combinations(input, r, true);
+        }
+        
+        // Test 9: Verify output properties
+        if (result1.numel() > 0) {
+            // Check that result has correct number of dimensions
+            if (result1.dim() != 2) {
+                throw std::runtime_error("Result should be 2D");
+            }
             
-            // Test result tensor properties
-            if (result.dim() == 2) {
-                auto num_combinations = result.size(0);
-                auto combination_size = result.size(1);
-                
-                // Verify combination size matches r
-                if (combination_size != actual_r && actual_r > 0) {
-                    // This might indicate an issue, but we don't crash
-                }
+            // Check that second dimension equals r (default 2)
+            if (result1.size(1) != 2) {
+                throw std::runtime_error("Second dimension should equal r");
             }
         }
         
-        // Test with different memory layouts if we have more data
-        if (offset + 1 < size) {
-            uint8_t layout_test = data[offset++] % 3;
-            switch (layout_test) {
-                case 0:  // Contiguous
-                    if (!input.is_contiguous()) {
-                        input = input.contiguous();
-                        result = torch::combinations(input, actual_r, with_replacement);
-                    }
-                    break;
-                case 1:  // Non-contiguous via transpose (if applicable)
-                    if (input.size(0) > 1) {
-                        auto reshaped = input.view({-1, 1}).t().squeeze();
-                        if (reshaped.size(0) == input.size(0)) {
-                            result = torch::combinations(reshaped, actual_r, with_replacement);
-                        }
-                    }
-                    break;
-                case 2:  // Different stride
-                    if (input.size(0) > 2) {
-                        auto strided = input.slice(0, 0, -1, 2);
-                        result = torch::combinations(strided, std::min(actual_r, strided.size(0)), with_replacement);
-                    }
-                    break;
+        if (result2.numel() > 0 && r > 0) {
+            if (result2.dim() != 2) {
+                throw std::runtime_error("Result2 should be 2D");
+            }
+            
+            if (result2.size(1) != r) {
+                throw std::runtime_error("Second dimension should equal r");
             }
         }
         
-    } catch (const c10::Error& e) {
-        // PyTorch-specific errors
-        return 0;  // Continue fuzzing
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;  // Discard input for unexpected errors
-    } catch (...) {
-        // Unknown errors
-        return -1;
+        // Test 10: Different tensor layouts/strides
+        if (offset < Size && (Data[offset++] % 5) == 0) {
+            auto contiguous_input = input.contiguous();
+            auto contiguous_result = torch::combinations(contiguous_input, r, with_replacement);
+        }
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

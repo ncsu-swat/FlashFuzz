@@ -1,233 +1,172 @@
 #include "fuzzer_utils.h"
-#include <torch/torch.h>
 #include <iostream>
-#include <cstring>
+#include <tuple>
 
-// Helper to consume a value from fuzzer data
-template<typename T>
-T consumeValue(const uint8_t* data, size_t& offset, size_t size, T default_val) {
-    if (offset + sizeof(T) > size) {
-        return default_val;
-    }
-    T value;
-    std::memcpy(&value, data + offset, sizeof(T));
-    offset += sizeof(T);
-    return value;
-}
-
-// Helper to consume a float in range [min, max]
-float consumeFloatInRange(const uint8_t* data, size_t& offset, size_t size, float min_val, float max_val) {
-    uint32_t raw = consumeValue<uint32_t>(data, offset, size, 0);
-    float normalized = (raw % 10000) / 10000.0f;
-    return min_val + normalized * (max_val - min_val);
-}
-
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    try {
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
         
-        // Minimum size check for basic parameters
-        if (size < 20) {
+        if (Size < 20) {
             return 0;
         }
 
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(data, size, offset);
+        auto input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Ensure input is floating point for quantization ops
-        if (!input.is_floating_point()) {
-            input = input.to(torch::kFloat32);
+        if (offset >= Size) {
+            return 0;
         }
         
-        // Create observer min/max tensors (typically scalars or per-channel)
-        uint8_t observer_type = consumeValue<uint8_t>(data, offset, size, 0) % 3;
-        torch::Tensor observer_min, observer_max;
+        auto scale = fuzzer_utils::createTensor(Data, Size, offset);
         
-        if (observer_type == 0) {
-            // Scalar observers
-            float min_val = consumeFloatInRange(data, offset, size, -100.0f, 0.0f);
-            float max_val = consumeFloatInRange(data, offset, size, 0.0f, 100.0f);
-            observer_min = torch::tensor(min_val);
-            observer_max = torch::tensor(max_val);
-        } else if (observer_type == 1 && input.dim() > 0) {
-            // Per-channel observers (match first dimension)
-            int64_t channels = input.size(0);
-            observer_min = torch::randn({channels}) * consumeFloatInRange(data, offset, size, 0.1f, 10.0f);
-            observer_max = torch::abs(torch::randn({channels})) * consumeFloatInRange(data, offset, size, 0.1f, 10.0f);
+        if (offset >= Size) {
+            return 0;
+        }
+        
+        auto zero_point = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        if (offset >= Size) {
+            return 0;
+        }
+        
+        auto running_min = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        if (offset >= Size) {
+            return 0;
+        }
+        
+        auto running_max = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        if (offset + 16 > Size) {
+            return 0;
+        }
+        
+        double averaging_const;
+        std::memcpy(&averaging_const, Data + offset, sizeof(double));
+        offset += sizeof(double);
+        
+        int64_t quant_min_raw;
+        std::memcpy(&quant_min_raw, Data + offset, sizeof(int64_t));
+        offset += sizeof(int64_t);
+        int64_t quant_min = quant_min_raw % 256;
+        
+        int64_t quant_max_raw;
+        if (offset + sizeof(int64_t) <= Size) {
+            std::memcpy(&quant_max_raw, Data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
         } else {
-            // Try to create from fuzzer data
-            observer_min = fuzzer_utils::createTensor(data, size, offset);
-            observer_max = fuzzer_utils::createTensor(data, size, offset);
+            quant_max_raw = quant_min_raw + 1;
+        }
+        int64_t quant_max = quant_max_raw % 256;
+        if (quant_max <= quant_min) {
+            quant_max = quant_min + 1;
+        }
+        
+        uint8_t flags = 0;
+        if (offset < Size) {
+            flags = Data[offset++];
+        }
+        
+        bool per_row_fake_quant = (flags & 0x01) != 0;
+        bool symmetric_quant = (flags & 0x02) != 0;
+        
+        try {
+            auto result = torch::fused_moving_avg_obs_fake_quant(
+                input_tensor,
+                running_min,
+                running_max,
+                scale,
+                zero_point,
+                averaging_const,
+                quant_min,
+                quant_max,
+                per_row_fake_quant,
+                symmetric_quant
+            );
             
-            // Ensure they're float tensors
-            if (!observer_min.is_floating_point()) {
-                observer_min = observer_min.to(torch::kFloat32);
-            }
-            if (!observer_max.is_floating_point()) {
-                observer_max = observer_max.to(torch::kFloat32);
-            }
-            
-            // Ensure max > min
-            observer_max = torch::abs(observer_max) + 0.01f;
-            observer_min = -torch::abs(observer_min) - 0.01f;
-        }
-        
-        // Averaging constant (momentum for moving average)
-        float averaging_const = consumeFloatInRange(data, offset, size, 0.0f, 1.0f);
-        
-        // Quantization parameters
-        int quant_min = consumeValue<uint8_t>(data, offset, size, 0);
-        int quant_max = consumeValue<uint8_t>(data, offset, size, 255);
-        
-        // Ensure quant_max > quant_min
-        if (quant_min >= quant_max) {
-            int temp = quant_min;
-            quant_min = quant_max;
-            quant_max = temp;
-            if (quant_min == quant_max) {
-                quant_max = quant_min + 1;
-            }
-        }
-        
-        // Channel axis for per-channel quantization (-1 for per-tensor)
-        int ch_axis = consumeValue<int8_t>(data, offset, size, 0);
-        if (ch_axis >= input.dim()) {
-            ch_axis = -1; // Fall back to per-tensor
-        }
-        
-        // Per-channel vs per-tensor flag
-        bool per_channel = (consumeValue<uint8_t>(data, offset, size, 0) % 2) == 1;
-        if (per_channel && ch_axis < 0) {
-            ch_axis = 0; // Default to first dimension
-        }
-        if (!per_channel) {
-            ch_axis = -1;
-        }
-        
-        // Symmetric quantization flag
-        bool symmetric = (consumeValue<uint8_t>(data, offset, size, 0) % 2) == 1;
-        
-        // Try different invocation patterns
-        uint8_t invocation_type = consumeValue<uint8_t>(data, offset, size, 0) % 4;
-        
-        torch::Tensor output;
-        
-        switch (invocation_type) {
-            case 0: {
-                // Basic invocation with minimal parameters
-                output = torch::fused_moving_avg_obs_fake_quant(
-                    input,
-                    observer_min,
-                    observer_max,
-                    averaging_const,
-                    quant_min,
-                    quant_max,
-                    ch_axis,
-                    per_channel,
-                    symmetric
-                );
-                break;
-            }
-            case 1: {
-                // Try with different tensor shapes for observers
-                if (observer_min.numel() > 1) {
-                    observer_min = observer_min.flatten()[0];
-                    observer_max = observer_max.flatten()[0];
-                }
-                output = torch::fused_moving_avg_obs_fake_quant(
-                    input,
-                    observer_min,
-                    observer_max,
-                    averaging_const,
-                    quant_min,
-                    quant_max,
-                    ch_axis,
-                    per_channel,
-                    symmetric
-                );
-                break;
-            }
-            case 2: {
-                // Try with extreme averaging constants
-                averaging_const = (consumeValue<uint8_t>(data, offset, size, 0) % 2) ? 0.0f : 1.0f;
-                output = torch::fused_moving_avg_obs_fake_quant(
-                    input,
-                    observer_min,
-                    observer_max,
-                    averaging_const,
-                    quant_min,
-                    quant_max,
-                    ch_axis,
-                    per_channel,
-                    symmetric
-                );
-                break;
-            }
-            case 3: {
-                // Try with different quantization ranges
-                quant_min = -128;
-                quant_max = 127;
-                symmetric = true;
-                output = torch::fused_moving_avg_obs_fake_quant(
-                    input,
-                    observer_min,
-                    observer_max,
-                    averaging_const,
-                    quant_min,
-                    quant_max,
-                    ch_axis,
-                    per_channel,
-                    symmetric
-                );
-                break;
-            }
-        }
-        
-        // Additional operations to increase coverage
-        if (output.defined()) {
-            // Check output properties
-            bool is_same_shape = (output.sizes() == input.sizes());
-            bool is_same_dtype = (output.dtype() == input.dtype());
-            
-            // Try backward pass if gradients are enabled
-            if (input.requires_grad() && output.requires_grad()) {
-                try {
-                    auto loss = output.sum();
-                    loss.backward();
-                } catch (...) {
-                    // Ignore backward errors
+            if (result.numel() > 0) {
+                auto sum = torch::sum(result);
+                if (torch::isfinite(sum).item<bool>()) {
+                    volatile float dummy = sum.item<float>();
+                    (void)dummy;
                 }
             }
-            
-            // Try additional quantization-related operations
+        } catch (const c10::Error& e) {
+            return 0;
+        }
+        
+        try {
+            auto result2 = torch::fused_moving_avg_obs_fake_quant(
+                input_tensor,
+                running_min,
+                running_max,
+                scale,
+                zero_point,
+                -averaging_const,
+                quant_max,
+                quant_min,
+                !per_row_fake_quant,
+                !symmetric_quant
+            );
+        } catch (const c10::Error& e) {
+            return 0;
+        }
+        
+        if (input_tensor.numel() > 0) {
             try {
-                auto scale = (observer_max - observer_min) / (quant_max - quant_min);
-                auto zero_point = quant_min - observer_min / scale;
+                auto empty_scale = torch::empty({0});
+                auto empty_zp = torch::empty({0});
+                auto empty_min = torch::empty({0});
+                auto empty_max = torch::empty({0});
                 
-                // Verify fake quantization properties
-                auto dequantized = output;
-                auto quantized = torch::fake_quantize_per_tensor_affine(
-                    input,
-                    scale.item<float>(),
-                    zero_point.item<float>(),
-                    quant_min,
-                    quant_max
+                auto result3 = torch::fused_moving_avg_obs_fake_quant(
+                    input_tensor,
+                    empty_min,
+                    empty_max,
+                    empty_scale,
+                    empty_zp,
+                    0.0,
+                    0,
+                    255,
+                    false,
+                    false
                 );
-            } catch (...) {
-                // Ignore errors in verification
+            } catch (const c10::Error& e) {
+                return 0;
             }
         }
         
-    } catch (const c10::Error& e) {
-        // PyTorch-specific errors are expected during fuzzing
-        return 0;
-    } catch (const std::exception& e) {
+        try {
+            auto large_tensor = torch::ones({1000, 1000});
+            auto large_scale = torch::ones({1000});
+            auto large_zp = torch::zeros({1000});
+            auto large_min = torch::full({1000}, -1000.0);
+            auto large_max = torch::full({1000}, 1000.0);
+            
+            auto result4 = torch::fused_moving_avg_obs_fake_quant(
+                large_tensor,
+                large_min,
+                large_max,
+                large_scale,
+                large_zp,
+                1e-10,
+                -128,
+                127,
+                true,
+                true
+            );
+        } catch (const c10::Error& e) {
+            return 0;
+        } catch (const std::bad_alloc& e) {
+            return 0;
+        }
+
+    }
+    catch (const std::exception &e)
+    {
         std::cout << "Exception caught: " << e.what() << std::endl;
         return -1;
-    } catch (...) {
-        // Catch any other exceptions
-        return -1;
     }
-    
     return 0;
 }

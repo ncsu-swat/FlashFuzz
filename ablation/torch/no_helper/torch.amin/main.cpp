@@ -1,175 +1,160 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
-    if (size < 16) {
-        return 0;  // Need minimum bytes for basic parameters
-    }
-
-    try {
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
         size_t offset = 0;
-        
-        // Extract basic parameters from fuzzer input
-        uint8_t rank = data[offset++] % 5 + 1;  // Tensor rank 1-5
-        uint8_t dtype_selector = data[offset++] % 4;  // Select dtype
-        bool keepdim = data[offset++] & 1;
-        uint8_t dim_count = data[offset++] % rank + 1;  // Number of dims to reduce
-        
-        // Build tensor shape
-        std::vector<int64_t> shape;
-        for (size_t i = 0; i < rank && offset < size; ++i) {
-            int64_t dim_size = (data[offset++] % 10) + 1;  // Dimension size 1-10
-            shape.push_back(dim_size);
+
+        // Generate input tensor with various shapes and dtypes
+        auto input_tensor = generateTensor(Data, Size, offset);
+        if (input_tensor.numel() == 0) {
+            return 0; // Skip empty tensors
         }
-        
-        // If we ran out of data, use default shape
-        while (shape.size() < rank) {
-            shape.push_back(2);
+
+        // Get tensor dimensions
+        int64_t ndim = input_tensor.dim();
+        if (ndim == 0) {
+            // For scalar tensors, test without dim parameter
+            auto result = torch::amin(input_tensor);
+            return 0;
         }
-        
-        // Build dimensions to reduce
-        std::vector<int64_t> dims;
-        std::vector<bool> used_dims(rank, false);
-        for (size_t i = 0; i < dim_count && offset < size; ++i) {
-            int64_t dim = data[offset++] % rank;
-            if (!used_dims[dim]) {
-                dims.push_back(dim);
-                used_dims[dim] = true;
+
+        // Test case 1: Single dimension reduction
+        if (offset < Size) {
+            int64_t dim = static_cast<int64_t>(Data[offset]) % ndim;
+            offset++;
+            
+            bool keepdim = false;
+            if (offset < Size) {
+                keepdim = (Data[offset] % 2) == 1;
+                offset++;
             }
+
+            auto result1 = torch::amin(input_tensor, dim, keepdim);
+            
+            // Test with negative dimension
+            int64_t neg_dim = dim - ndim;
+            auto result1_neg = torch::amin(input_tensor, neg_dim, keepdim);
         }
-        
-        // Ensure we have at least one dimension
-        if (dims.empty()) {
-            dims.push_back(0);
-        }
-        
-        // Create tensor with appropriate dtype
-        torch::Tensor input;
-        torch::TensorOptions options;
-        
-        switch (dtype_selector) {
-            case 0:
-                options = torch::TensorOptions().dtype(torch::kFloat32);
-                break;
-            case 1:
-                options = torch::TensorOptions().dtype(torch::kFloat64);
-                break;
-            case 2:
-                options = torch::TensorOptions().dtype(torch::kInt32);
-                break;
-            case 3:
-                options = torch::TensorOptions().dtype(torch::kInt64);
-                break;
-        }
-        
-        // Calculate total elements needed
-        int64_t total_elements = 1;
-        for (auto s : shape) {
-            total_elements *= s;
-        }
-        
-        // Fill tensor with fuzzer data
-        if (dtype_selector <= 1) {  // Floating point types
-            std::vector<float> values;
-            for (int64_t i = 0; i < total_elements && offset < size; ++i) {
-                // Create various float values including special cases
-                uint8_t val_type = data[offset++];
-                float val;
-                if (val_type < 200) {
-                    val = static_cast<float>(val_type - 100) / 10.0f;
-                } else if (val_type < 210) {
-                    val = std::numeric_limits<float>::infinity();
-                } else if (val_type < 220) {
-                    val = -std::numeric_limits<float>::infinity();
-                } else if (val_type < 230) {
-                    val = std::numeric_limits<float>::quiet_NaN();
-                } else {
-                    val = 0.0f;
+
+        // Test case 2: Multiple dimensions reduction
+        if (offset + 1 < Size && ndim > 1) {
+            std::vector<int64_t> dims;
+            int num_dims = std::min(static_cast<int>(Data[offset] % ndim) + 1, static_cast<int>(ndim));
+            offset++;
+            
+            for (int i = 0; i < num_dims && offset < Size; i++) {
+                int64_t dim = static_cast<int64_t>(Data[offset]) % ndim;
+                // Avoid duplicate dimensions
+                if (std::find(dims.begin(), dims.end(), dim) == dims.end()) {
+                    dims.push_back(dim);
                 }
-                values.push_back(val);
+                offset++;
             }
             
-            // Pad with zeros if needed
-            while (values.size() < total_elements) {
-                values.push_back(0.0f);
-            }
-            
-            input = torch::from_blob(values.data(), shape, torch::kFloat32).clone();
-            if (dtype_selector == 1) {
-                input = input.to(torch::kFloat64);
-            }
-        } else {  // Integer types
-            std::vector<int32_t> values;
-            for (int64_t i = 0; i < total_elements && offset < size; ++i) {
-                int32_t val = static_cast<int32_t>(data[offset++]) - 128;
-                values.push_back(val);
-            }
-            
-            // Pad with zeros if needed
-            while (values.size() < total_elements) {
-                values.push_back(0);
-            }
-            
-            input = torch::from_blob(values.data(), shape, torch::kInt32).clone();
-            if (dtype_selector == 3) {
-                input = input.to(torch::kInt64);
-            }
-        }
-        
-        // Test with single dimension
-        if (offset < size && (data[offset++] & 1)) {
-            int64_t single_dim = dims[0];
-            torch::Tensor result1 = torch::amin(input, single_dim, keepdim);
-            
-            // Also test with optional out tensor
-            if (offset < size && (data[offset++] & 1)) {
-                auto out_shape = input.sizes().vec();
-                if (keepdim) {
-                    out_shape[single_dim] = 1;
-                } else {
-                    out_shape.erase(out_shape.begin() + single_dim);
+            if (!dims.empty()) {
+                bool keepdim = false;
+                if (offset < Size) {
+                    keepdim = (Data[offset] % 2) == 1;
+                    offset++;
                 }
-                torch::Tensor out = torch::empty(out_shape, options);
-                torch::amin_out(out, input, single_dim, keepdim);
+                
+                auto result2 = torch::amin(input_tensor, dims, keepdim);
             }
         }
-        
-        // Test with multiple dimensions
-        torch::Tensor result2 = torch::amin(input, dims, keepdim);
-        
-        // Test edge cases
-        if (offset < size && (data[offset++] & 1)) {
-            // Test with negative dimensions
-            std::vector<int64_t> neg_dims;
-            for (auto d : dims) {
-                neg_dims.push_back(d - rank);
+
+        // Test case 3: All dimensions (equivalent to global min)
+        if (ndim > 0) {
+            std::vector<int64_t> all_dims;
+            for (int64_t i = 0; i < ndim; i++) {
+                all_dims.push_back(i);
             }
-            torch::Tensor result3 = torch::amin(input, neg_dims, keepdim);
+            auto result3 = torch::amin(input_tensor, all_dims, false);
+            auto result3_keepdim = torch::amin(input_tensor, all_dims, true);
         }
-        
-        // Test with empty tensor
-        if (offset < size && (data[offset++] & 1)) {
-            torch::Tensor empty_tensor = torch::empty({0, 3, 4}, options);
-            if (!empty_tensor.numel()) {
-                torch::Tensor empty_result = torch::amin(empty_tensor, {1}, keepdim);
+
+        // Test case 4: Edge cases with special values
+        if (input_tensor.dtype() == torch::kFloat32 || input_tensor.dtype() == torch::kFloat64) {
+            // Create tensor with special float values
+            auto special_tensor = input_tensor.clone();
+            if (special_tensor.numel() > 0) {
+                auto flat = special_tensor.flatten();
+                if (offset < Size && flat.numel() > 0) {
+                    int idx = Data[offset] % flat.numel();
+                    if (offset + 1 < Size) {
+                        uint8_t special_val = Data[offset + 1] % 4;
+                        if (special_val == 0) {
+                            flat[idx] = std::numeric_limits<float>::infinity();
+                        } else if (special_val == 1) {
+                            flat[idx] = -std::numeric_limits<float>::infinity();
+                        } else if (special_val == 2) {
+                            flat[idx] = std::numeric_limits<float>::quiet_NaN();
+                        }
+                        // special_val == 3: keep original value
+                    }
+                    offset += 2;
+                }
+                
+                if (ndim > 0) {
+                    int64_t dim = 0;
+                    auto result_special = torch::amin(special_tensor, dim);
+                }
             }
         }
-        
-        // Test with scalar tensor
-        if (offset < size && (data[offset++] & 1)) {
-            torch::Tensor scalar = torch::tensor(3.14f);
-            torch::Tensor scalar_result = torch::amin(scalar, {}, keepdim);
+
+        // Test case 5: Different tensor layouts and memory formats
+        if (input_tensor.dim() >= 2) {
+            auto transposed = input_tensor.transpose(0, 1);
+            auto result_transposed = torch::amin(transposed, 0);
+            
+            if (input_tensor.dim() == 4) {
+                // Test with channels_last format if applicable
+                try {
+                    auto channels_last = input_tensor.to(torch::MemoryFormat::ChannelsLast);
+                    auto result_cl = torch::amin(channels_last, 1);
+                } catch (...) {
+                    // Ignore if channels_last conversion fails
+                }
+            }
         }
-        
-    } catch (const c10::Error& e) {
-        // PyTorch-specific errors are expected for invalid operations
-        return 0;
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+
+        // Test case 6: Very large and very small dimensions
+        if (ndim > 0) {
+            // Test with the last dimension
+            auto result_last = torch::amin(input_tensor, ndim - 1);
+            
+            // Test with dimension 0
+            auto result_first = torch::amin(input_tensor, 0);
+        }
+
+        // Test case 7: Output tensor parameter
+        if (ndim > 0 && offset < Size) {
+            int64_t dim = static_cast<int64_t>(Data[offset]) % ndim;
+            
+            // Create output tensor with correct shape
+            auto input_shape = input_tensor.sizes().vec();
+            input_shape[dim] = 1;  // keepdim=true case
+            auto out_tensor = torch::empty(input_shape, input_tensor.options());
+            
+            torch::amin_out(out_tensor, input_tensor, dim, true);
+            
+            // Test without keepdim
+            input_shape.erase(input_shape.begin() + dim);
+            if (!input_shape.empty()) {
+                auto out_tensor2 = torch::empty(input_shape, input_tensor.options());
+                torch::amin_out(out_tensor2, input_tensor, dim, false);
+            }
+        }
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }

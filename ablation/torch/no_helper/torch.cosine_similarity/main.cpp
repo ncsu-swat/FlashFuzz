@@ -1,189 +1,259 @@
-#include <torch/torch.h>
-#include <iostream>
-#include <vector>
-#include <cstring>
+#include "fuzzer_utils.h" // General fuzzing utilities
+#include <iostream>       // For cerr
+#include <tuple>          // For std::get with lu_unpack result
 
-// Helper to consume bytes from the fuzzer input
-template<typename T>
-bool consumeBytes(const uint8_t*& data, size_t& size, T& value) {
-    if (size < sizeof(T)) return false;
-    std::memcpy(&value, data, sizeof(T));
-    data += sizeof(T);
-    size -= sizeof(T);
-    return true;
-}
+// --- Fuzzer Entry Point ---
+extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
+{
+    try
+    {
+        size_t offset = 0;
 
-// Helper to create tensor from fuzzer input
-torch::Tensor createTensorFromBytes(const uint8_t*& data, size_t& size) {
-    // Consume parameters for tensor creation
-    uint8_t rank;
-    if (!consumeBytes(data, size, rank)) {
-        return torch::empty({0});
-    }
-    rank = (rank % 5) + 1; // Limit rank to 1-5 dimensions
-    
-    std::vector<int64_t> shape;
-    for (int i = 0; i < rank; ++i) {
-        uint8_t dim_size;
-        if (!consumeBytes(data, size, dim_size)) {
-            shape.push_back(1);
-        } else {
-            // Allow 0-sized dimensions and various sizes
-            shape.push_back(dim_size % 10); // Limit individual dimension size
+        // Need at least basic data for tensor creation and parameters
+        if (Size < 32) {
+            return 0;
         }
-    }
-    
-    // Consume dtype choice
-    uint8_t dtype_choice;
-    if (!consumeBytes(data, size, dtype_choice)) {
-        dtype_choice = 0;
-    }
-    
-    torch::ScalarType dtype;
-    switch (dtype_choice % 4) {
-        case 0: dtype = torch::kFloat32; break;
-        case 1: dtype = torch::kFloat64; break;
-        case 2: dtype = torch::kFloat16; break;
-        case 3: dtype = torch::kBFloat16; break;
-        default: dtype = torch::kFloat32;
-    }
-    
-    // Create tensor with random values or specific patterns
-    uint8_t pattern;
-    if (!consumeBytes(data, size, pattern)) {
-        pattern = 0;
-    }
-    
-    torch::Tensor tensor;
-    try {
-        switch (pattern % 6) {
-            case 0:
-                tensor = torch::randn(shape, torch::dtype(dtype));
-                break;
-            case 1:
-                tensor = torch::zeros(shape, torch::dtype(dtype));
-                break;
-            case 2:
-                tensor = torch::ones(shape, torch::dtype(dtype));
-                break;
-            case 3:
-                tensor = torch::full(shape, std::numeric_limits<float>::quiet_NaN(), torch::dtype(dtype));
-                break;
-            case 4:
-                tensor = torch::full(shape, std::numeric_limits<float>::infinity(), torch::dtype(dtype));
-                break;
-            case 5:
-                tensor = torch::full(shape, -std::numeric_limits<float>::infinity(), torch::dtype(dtype));
-                break;
-        }
-    } catch (...) {
-        tensor = torch::empty({0});
-    }
-    
-    return tensor;
-}
 
-extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    if (size < 4) return 0; // Need minimum bytes for basic parameters
-    
-    try {
-        // Create two input tensors
-        torch::Tensor x1 = createTensorFromBytes(data, size);
-        torch::Tensor x2 = createTensorFromBytes(data, size);
+        // Extract tensor shapes and parameters
+        auto shape1 = extract_tensor_shape(Data, Size, offset, 1, 6);
+        auto shape2 = extract_tensor_shape(Data, Size, offset, 1, 6);
         
-        // Consume dimension parameter
-        int64_t dim = 1;
-        uint8_t dim_byte;
-        if (consumeBytes(data, size, dim_byte)) {
-            // Allow negative dimensions too
-            dim = static_cast<int64_t>(dim_byte % 10) - 5;
-        }
+        // Extract dimension parameter
+        int64_t dim = extract_int(Data, Size, offset, -static_cast<int64_t>(shape1.size()), 
+                                 static_cast<int64_t>(shape1.size()) - 1);
         
-        // Consume epsilon parameter
-        double eps = 1e-8;
-        uint8_t eps_choice;
-        if (consumeBytes(data, size, eps_choice)) {
-            switch (eps_choice % 6) {
-                case 0: eps = 1e-8; break;
-                case 1: eps = 0.0; break;
-                case 2: eps = 1e-16; break;
-                case 3: eps = 1.0; break;
-                case 4: eps = -1e-8; break; // Negative epsilon
-                case 5: eps = std::numeric_limits<double>::quiet_NaN(); break;
+        // Extract eps parameter
+        double eps = extract_double(Data, Size, offset, 1e-12, 1e-4);
+        
+        // Extract dtype
+        auto dtype = extract_dtype(Data, Size, offset);
+        
+        // Create tensors with different strategies
+        torch::Tensor x1, x2;
+        
+        // Strategy selection
+        uint8_t strategy = extract_uint8(Data, Size, offset) % 8;
+        
+        switch (strategy) {
+            case 0: {
+                // Normal random tensors
+                x1 = torch::randn(shape1, torch::dtype(dtype));
+                x2 = torch::randn(shape2, torch::dtype(dtype));
+                break;
+            }
+            case 1: {
+                // Zero tensors (edge case for division by zero)
+                x1 = torch::zeros(shape1, torch::dtype(dtype));
+                x2 = torch::zeros(shape2, torch::dtype(dtype));
+                break;
+            }
+            case 2: {
+                // One zero, one non-zero
+                x1 = torch::zeros(shape1, torch::dtype(dtype));
+                x2 = torch::randn(shape2, torch::dtype(dtype));
+                break;
+            }
+            case 3: {
+                // Very small values (near eps)
+                x1 = torch::full(shape1, eps * 0.1, torch::dtype(dtype));
+                x2 = torch::full(shape2, eps * 0.1, torch::dtype(dtype));
+                break;
+            }
+            case 4: {
+                // Large values
+                x1 = torch::full(shape1, 1e6, torch::dtype(dtype));
+                x2 = torch::full(shape2, 1e6, torch::dtype(dtype));
+                break;
+            }
+            case 5: {
+                // Mixed positive and negative
+                x1 = torch::randn(shape1, torch::dtype(dtype));
+                x2 = -torch::randn(shape2, torch::dtype(dtype));
+                break;
+            }
+            case 6: {
+                // Identical tensors (should give similarity of 1)
+                x1 = torch::randn(shape1, torch::dtype(dtype));
+                x2 = x1.expand(shape2);
+                break;
+            }
+            case 7: {
+                // Orthogonal-like tensors
+                x1 = torch::ones(shape1, torch::dtype(dtype));
+                x2 = torch::full(shape2, -1.0, torch::dtype(dtype));
+                break;
             }
         }
         
-        // Try to make tensors broadcastable by adjusting shapes
-        uint8_t broadcast_strategy;
-        if (consumeBytes(data, size, broadcast_strategy)) {
-            switch (broadcast_strategy % 4) {
-                case 0:
-                    // Keep as is
-                    break;
-                case 1:
-                    // Make x2 same shape as x1
-                    if (x1.defined() && x1.numel() > 0) {
-                        try {
-                            x2 = x2.reshape_as(x1);
-                        } catch (...) {
-                            // Ignore reshape failures
-                        }
+        // Test different broadcasting scenarios
+        uint8_t broadcast_strategy = extract_uint8(Data, Size, offset) % 4;
+        
+        switch (broadcast_strategy) {
+            case 0: {
+                // No modification - test as is
+                break;
+            }
+            case 1: {
+                // Add singleton dimensions
+                if (x1.dim() > 0) {
+                    x1 = x1.unsqueeze(0);
+                }
+                break;
+            }
+            case 2: {
+                // Expand one tensor
+                if (x1.numel() == 1) {
+                    x1 = x1.expand_as(x2);
+                }
+                break;
+            }
+            case 3: {
+                // Create broadcastable shapes
+                if (x1.dim() > 0 && x2.dim() > 0) {
+                    auto new_shape1 = x1.sizes().vec();
+                    auto new_shape2 = x2.sizes().vec();
+                    
+                    // Make them broadcastable by setting some dims to 1
+                    if (new_shape1.size() > 1) {
+                        new_shape1[0] = 1;
+                        x1 = x1.view(new_shape1);
                     }
-                    break;
-                case 2:
-                    // Add singleton dimensions
-                    if (x1.dim() > 0 && x2.dim() > 0) {
-                        x2 = x2.unsqueeze(0);
-                    }
-                    break;
-                case 3:
-                    // Expand dimensions
-                    if (x1.dim() > 0 && x2.dim() > 0) {
-                        try {
-                            auto max_dim = std::max(x1.dim(), x2.dim());
-                            if (x1.dim() < max_dim) {
-                                for (int i = x1.dim(); i < max_dim; ++i) {
-                                    x1 = x1.unsqueeze(0);
-                                }
-                            }
-                            if (x2.dim() < max_dim) {
-                                for (int i = x2.dim(); i < max_dim; ++i) {
-                                    x2 = x2.unsqueeze(0);
-                                }
-                            }
-                        } catch (...) {
-                            // Ignore expansion failures
-                        }
-                    }
-                    break;
+                }
+                break;
             }
         }
         
-        // Call cosine_similarity
+        // Test edge cases for dim parameter
+        uint8_t dim_strategy = extract_uint8(Data, Size, offset) % 3;
+        
+        // Determine valid dimension range after potential broadcasting
+        torch::Tensor temp_result;
         try {
-            torch::Tensor result = torch::cosine_similarity(x1, x2, dim, eps);
-            
-            // Perform some basic operations on result to increase coverage
-            if (result.defined() && result.numel() > 0) {
-                auto sum = result.sum();
-                auto mean = result.mean();
-                auto max_val = result.max();
-                auto min_val = result.min();
-                
-                // Check for special values
-                bool has_nan = result.isnan().any().item<bool>();
-                bool has_inf = result.isinf().any().item<bool>();
-            }
-        } catch (const c10::Error& e) {
-            // Expected errors from invalid inputs - continue fuzzing
-        } catch (const std::runtime_error& e) {
-            // Expected errors from invalid inputs - continue fuzzing
+            temp_result = torch::broadcast_tensors({x1, x2})[0];
+        } catch (...) {
+            // If broadcasting fails, use original tensors
+            temp_result = x1;
         }
         
-    } catch (const std::exception& e) {
-        std::cout << "Exception caught: " << e.what() << std::endl;
-        return -1;
+        int64_t max_dim = temp_result.dim() - 1;
+        int64_t min_dim = -temp_result.dim();
+        
+        switch (dim_strategy) {
+            case 0: {
+                // Use extracted dim, clamped to valid range
+                dim = std::max(min_dim, std::min(max_dim, dim));
+                break;
+            }
+            case 1: {
+                // Use last dimension
+                dim = max_dim;
+                break;
+            }
+            case 2: {
+                // Use first dimension
+                dim = 0;
+                break;
+            }
+        }
+        
+        // Test different eps values
+        uint8_t eps_strategy = extract_uint8(Data, Size, offset) % 4;
+        
+        switch (eps_strategy) {
+            case 0: {
+                // Use extracted eps
+                break;
+            }
+            case 1: {
+                // Very small eps
+                eps = 1e-12;
+                break;
+            }
+            case 2: {
+                // Large eps
+                eps = 1e-2;
+                break;
+            }
+            case 3: {
+                // Zero eps (edge case)
+                eps = 0.0;
+                break;
+            }
+        }
+        
+        // Call cosine_similarity with different parameter combinations
+        torch::Tensor result;
+        
+        // Test with all parameters
+        result = torch::cosine_similarity(x1, x2, dim, eps);
+        
+        // Verify result properties
+        if (result.defined()) {
+            // Check that result has correct number of dimensions
+            auto expected_dims = std::max(x1.dim(), x2.dim()) - 1;
+            if (result.dim() != expected_dims && expected_dims >= 0) {
+                // This might be expected behavior, just continue
+            }
+            
+            // Check for NaN or Inf values
+            auto has_nan = torch::any(torch::isnan(result));
+            auto has_inf = torch::any(torch::isinf(result));
+            
+            // Force evaluation
+            if (has_nan.defined()) has_nan.item<bool>();
+            if (has_inf.defined()) has_inf.item<bool>();
+            
+            // Check value range (cosine similarity should be in [-1, 1])
+            if (result.numel() > 0) {
+                auto min_val = torch::min(result);
+                auto max_val = torch::max(result);
+                
+                if (min_val.defined()) min_val.item<double>();
+                if (max_val.defined()) max_val.item<double>();
+            }
+        }
+        
+        // Test with default parameters
+        result = torch::cosine_similarity(x1, x2);
+        
+        // Test with only dim specified
+        result = torch::cosine_similarity(x1, x2, dim);
+        
+        // Test special cases
+        if (x1.dim() > 0 && x2.dim() > 0) {
+            // Test with negative dimension
+            int64_t neg_dim = -1;
+            if (neg_dim >= -std::max(x1.dim(), x2.dim())) {
+                result = torch::cosine_similarity(x1, x2, neg_dim, eps);
+            }
+        }
+        
+        // Test type promotion by mixing dtypes
+        if (dtype != torch::kFloat32) {
+            auto x1_float = x1.to(torch::kFloat32);
+            result = torch::cosine_similarity(x1_float, x2, dim, eps);
+        }
+        
+        // Test with requires_grad
+        if (x1.dtype().is_floating_point() && x2.dtype().is_floating_point()) {
+            auto x1_grad = x1.clone().requires_grad_(true);
+            auto x2_grad = x2.clone().requires_grad_(true);
+            
+            result = torch::cosine_similarity(x1_grad, x2_grad, dim, eps);
+            
+            if (result.defined() && result.numel() > 0) {
+                auto loss = torch::sum(result);
+                if (loss.defined() && loss.requires_grad()) {
+                    loss.backward();
+                }
+            }
+        }
+
     }
-    
-    return 0;
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return -1; // discard the input
+    }
+    return 0; // keep the input
 }
