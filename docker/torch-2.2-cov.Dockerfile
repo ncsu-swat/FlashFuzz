@@ -2,8 +2,7 @@ FROM ncsuswat/flashfuzz:torch2.2-base
 
 WORKDIR /root/fuzz
 
-# Copy the test harness
-COPY testharness/torch_cpu /root/fuzz
+
 
 WORKDIR /root/pytorch
 
@@ -26,6 +25,9 @@ RUN pip install -r requirements.txt  && \
 COPY scripts /root/fuzz/
 
 WORKDIR /root/fuzz
+
+# Copy the test harness
+COPY testharness/torch_cpu /root/fuzz
 
 RUN  python3 -u build_test_harness.py --dll torch --mode fuzz --no-compile
 
