@@ -223,3 +223,6 @@ testharness_generation/torch_cpu/run.sh
 testharness_generation/torch_cpu/run1.sh
 _pytorch_abb
 _tf_abb
+
+old_fuzz_result
+_fuzz_result_original

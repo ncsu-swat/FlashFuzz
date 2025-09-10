@@ -5,12 +5,12 @@ import random
 
 
 def main():
-    for i in range(100):
+    for i in range(50):
         # Build the main blob
         blob = bytearray()
 
         # Fill the tensor data with some random bytes
-        for _ in range(5000):
+        for _ in range(500):
             blob.append(random.randint(0, 255))
 
         # Write the seed file

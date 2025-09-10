@@ -26,7 +26,7 @@ import glob
 from typing import Iterator, List, Tuple, Dict
 
 
-INVALID_MARKERS = ("Exception caught:", "CPU Execution error", "operation failed")
+INVALID_MARKERS = ("Exception caught:", "CPU Execution error", "INVALID_ARGUMENT")
 
 
 def find_api_dirs(base: str) -> Iterator[str]:
