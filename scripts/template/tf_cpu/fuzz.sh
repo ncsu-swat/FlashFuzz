@@ -19,7 +19,7 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export TF_NUM_INTRAOP_THREADS=1
 export TF_NUM_INTEROP_THREADS=1
-export TF_CPP_MIN_LOG_LEVEL=2   # quiet TF
+# export TF_CPP_MIN_LOG_LEVEL=2   # quiet TF
 # # # Optional for speed if acceptable:
 export ASAN_OPTIONS=detect_leaks=0           # skip LSan
 export UBSAN_OPTIONS=print_stacktrace=0

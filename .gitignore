@@ -226,3 +226,8 @@ _tf_abb
 
 old_fuzz_result
 _fuzz_result_original
+t2_fuzz_result
+_cov_result_no_doc
+_tmp
+__tmp
+___tmp
