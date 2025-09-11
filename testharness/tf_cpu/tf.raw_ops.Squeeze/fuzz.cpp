@@ -210,6 +210,7 @@ std::vector<int32_t> parseAxis(const uint8_t* data, size_t& offset, size_t total
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    std::cout << "Start Fuzzing" << std::endl;
     if (size < 3) {
         return 0;
     }

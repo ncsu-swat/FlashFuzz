@@ -207,6 +207,7 @@ REGISTER_OP("GlobalIterId")
     .Output("id: int64");
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    std::cout << "Start Fuzzing" << std::endl;
     if (size < 1) {
         return 0;
     }

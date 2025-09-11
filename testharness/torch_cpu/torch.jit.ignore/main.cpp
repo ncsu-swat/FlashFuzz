@@ -31,6 +31,7 @@ class TestModule(torch.nn.Module):
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
+    std::cout << "Start Fuzzing" << std::endl;
     try
     {
         size_t offset = 0;

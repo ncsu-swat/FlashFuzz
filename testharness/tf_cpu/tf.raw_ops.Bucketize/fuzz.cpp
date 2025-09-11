@@ -140,6 +140,7 @@ std::vector<float> parseBoundaries(const uint8_t* data, size_t& offset, size_t t
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
+    std::cout << "Start Fuzzing" << std::endl;
     if (size < 10) {
         return 0;
     }
