@@ -63,7 +63,8 @@ RUN wget https://apt.llvm.org/llvm.sh && \
     rm -rf /var/lib/apt/lists/* && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100 && \
-    update-alternatives --install /usr/bin/ld ld /usr/bin/lld-20 100
+    update-alternatives --install /usr/bin/ld ld /usr/bin/lld-20 100 && \
+    update-alternatives --install /usr/bin/clangd clangd /usr/bin/clangd-20 100
 
 # Install CUDA and cuDNN dependencies
 RUN wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb && \

@@ -32,7 +32,8 @@ def build_one_tf_api(tf_dir: str) -> tuple[str, int, str]:
     """Build a single TensorFlow API and return the result."""
     api_name = os.path.basename(tf_dir)
     print(f"Building TensorFlow API: {api_name}")
-    cmd = "bash build.sh > build.log"
+    # Capture both stdout and stderr into build.log so failures are actionable.
+    cmd = "bash build.sh > build.log 2>&1"
     ret_code, output = run_command(cmd, tf_dir)
     return api_name, ret_code, output
 
@@ -180,7 +181,8 @@ def build_tf_cov(time_budget: int=180, no_compile: bool=False) -> None:
 def build_one_torch_api(torch_dir: str) -> tuple[str, int, str]:
     api_name = os.path.basename(torch_dir)
     print(f"Building PyTorch API: {api_name}")
-    cmd = "bash build.sh > build.log"
+    # Capture both stdout and stderr into build.log so failures are actionable.
+    cmd = "bash build.sh > build.log 2>&1"
     ret_code, output = run_command(cmd, torch_dir)
     return api_name, ret_code, output
 

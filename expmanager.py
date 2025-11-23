@@ -294,6 +294,16 @@ class Experiment():
             print(f"Copied results from {src} to {dest}.")
         except Exception:
             pass
+
+    def copy_from_container(self, src: str, dest: str):
+        """Copy a single file or directory from container to host, creating parent dirs."""
+        os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+        cmd = f"docker cp {self.container_name}:{src} {dest}"
+        try:
+            subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+            print(f"Copied {src} -> {dest}")
+        except subprocess.CalledProcessError as e:
+            print(f"Failed to copy {src}: {e.stderr.strip() if e.stderr else e}")
     
     def copy_files_to_container(self, src: str, dest: str):
         cmd = f"docker cp {src} {self.container_name}:{dest}"
@@ -330,6 +340,7 @@ class Experiment():
         try:
             self.check_image()
             self.start_docker_container()
+            loop_until_ctrl_c()
             self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 -u build_test_harness.py --dll {self.dll} --mode {self.mode} --check_build > check.log")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}", f"{self.result_dir}/{self.api}")
             os.makedirs(f"{self.result_dir}/build_status", exist_ok=True)
@@ -337,6 +348,9 @@ class Experiment():
             self.copy_results_from_container(f"/root/tensorflow/fuzz/fail_apis.txt", f"{self.result_dir}/build_status/")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/build_summary.txt", f"{self.result_dir}/build_status/")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/check.log", f"{self.result_dir}/build_status/")
+            fail_file = f"{self.result_dir}/build_status/fail_apis.txt"
+            fail_apis = self._load_fail_api_list(fail_file)
+            self._copy_build_logs("/root/tensorflow/fuzz", fail_apis)
             with open(f"{self.result_dir}/build_status/build_summary.txt", "r") as f:
                 summary = f.read()
                 print(f"Build Summary: {summary}")
@@ -388,6 +402,9 @@ class Experiment():
             self.copy_results_from_container(f"/root/fuzz/fail_apis.txt", f"{self.result_dir}/build_status/")
             self.copy_results_from_container(f"/root/fuzz/build_summary.txt", f"{self.result_dir}/build_status/")
             self.copy_results_from_container(f"/root/fuzz/check.log", f"{self.result_dir}/build_status/")
+            fail_file = f"{self.result_dir}/build_status/fail_apis.txt"
+            fail_apis = self._load_fail_api_list(fail_file)
+            self._copy_build_logs("/root/fuzz", fail_apis)
             with open(f"{self.result_dir}/build_status/build_summary.txt", "r") as f:
                 summary = f.read()
                 print(f"Build Summary: {summary}")
@@ -598,6 +615,39 @@ class Experiment():
                 sf.write("\n".join(lines) + "\n")
         except Exception as e:
             print(f"Failed to write stats file {stat_path}: {e}")
+
+    def _load_fail_api_list(self, fail_file: str) -> list[str]:
+        """Parse fail_apis.txt and return API names."""
+        apis: list[str] = []
+        try:
+            with open(fail_file, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    api = line.split(":", 1)[0].strip()
+                    if api:
+                        apis.append(api)
+        except FileNotFoundError:
+            print(f"Fail file not found: {fail_file}")
+        except Exception as e:
+            print(f"Error reading fail file {fail_file}: {e}")
+        return apis
+
+    def _copy_build_logs(self, base_remote: str, apis: list[str], log_name: str = "build.log"):
+        """Copy per-API build logs out of the container."""
+        if not apis:
+            return
+        out_base = os.path.join(self.result_dir, "build_logs")
+        for api in apis:
+            dest_dir = os.path.join(out_base, api)
+            dest = os.path.join(dest_dir, log_name)
+            remote = f"{base_remote}/{api}/{log_name}"
+            try:
+                self.copy_from_container(remote, dest)
+            except Exception:
+                # Best effort; keep going
+                pass
 
 
     def run(self):

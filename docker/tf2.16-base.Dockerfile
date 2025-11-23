@@ -65,7 +65,8 @@ RUN wget https://apt.llvm.org/llvm.sh && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100 && \
     update-alternatives --install /usr/bin/ld ld /usr/bin/lld-20 100 && \
     update-alternatives --install /usr/bin/llvm-profdata llvm-profdata /usr/bin/llvm-profdata-20 100 && \
-    update-alternatives --install /usr/bin/llvm-cov llvm-cov /usr/bin/llvm-cov-20 100
+    update-alternatives --install /usr/bin/llvm-cov llvm-cov /usr/bin/llvm-cov-20 100 && \
+    update-alternatives --install /usr/bin/clangd clangd /usr/bin/clangd-20 100 
 
 # Set up Python virtual environment
 RUN python3 -m venv /venv
