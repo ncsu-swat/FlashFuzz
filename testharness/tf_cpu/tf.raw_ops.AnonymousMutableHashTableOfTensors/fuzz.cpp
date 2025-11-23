@@ -4,6 +4,7 @@
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/data_flow_ops.h"
+#include "tensorflow/cc/ops/lookup_ops_internal.h"
 #include "tensorflow/core/framework/types.h"
 #include <iostream>
 #include <cstring>
@@ -155,19 +156,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         // Create a unique key for the hash table
         auto key = tensorflow::ops::Const(root, std::string("anonymous_hash_table"));
         
-        // Create a MutableHashTableOfTensors with the specified key and value types
-        auto hash_table_op = tensorflow::ops::MutableHashTableOfTensors(
+        // Create an anonymous hash table of tensors with optional value shape.
+        auto hash_table_op = tensorflow::ops::internal::AnonymousMutableHashTableOfTensors(
             root, key_dtype, value_dtype);
-        
-        // Set value shape if provided
         if (!value_shape.empty()) {
-            tensorflow::TensorShape tensor_shape;
-            for (int64_t dim : value_shape) {
-                tensor_shape.AddDim(dim);
-            }
-            hash_table_op = tensorflow::ops::MutableHashTableOfTensors(
-                root, key_dtype, value_dtype, 
-                tensorflow::ops::MutableHashTableOfTensors::ValueShape(tensor_shape));
+            tensorflow::PartialTensorShape tensor_shape(value_shape);
+            hash_table_op = tensorflow::ops::internal::AnonymousMutableHashTableOfTensors(
+                root, key_dtype, value_dtype,
+                tensorflow::ops::internal::AnonymousMutableHashTableOfTensors::ValueShape(tensor_shape));
         }
 
         std::cout << "Created MutableHashTableOfTensors operation" << std::endl;

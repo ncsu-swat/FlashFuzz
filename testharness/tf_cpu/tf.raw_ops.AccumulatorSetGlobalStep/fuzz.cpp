@@ -231,45 +231,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::Output handle_tensor;
-        tensorflow::Output new_global_step_tensor;
-        
-        if (offset + 1 > size) return 0;
-        uint8_t handle_rank = parseRank(data[offset++]);
-        std::vector<int64_t> handle_shape = parseShape(data, offset, size, handle_rank);
-        
-        tensorflow::TensorShape handle_tensor_shape;
-        for (int64_t dim : handle_shape) {
-            handle_tensor_shape.AddDim(dim);
+        // Create a real accumulator to obtain a valid handle instead of crafting an
+        // arbitrary string tensor that fails shape checks at graph build time.
+        auto accumulator = tensorflow::ops::ConditionalAccumulator(
+            root, tensorflow::DT_FLOAT, tensorflow::PartialTensorShape({}));
+
+        int64_t new_global_step_value = 0;
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&new_global_step_value, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
         }
-        
-        tensorflow::Tensor handle_input(tensorflow::DT_STRING, handle_tensor_shape);
-        fillTensorWithDataByType(handle_input, tensorflow::DT_STRING, data, offset, size);
-        
-        handle_tensor = tensorflow::ops::Const(root, handle_input);
-        
-        if (offset + 1 > size) return 0;
-        uint8_t new_global_step_rank = parseRank(data[offset++]);
-        std::vector<int64_t> new_global_step_shape = parseShape(data, offset, size, new_global_step_rank);
-        
-        tensorflow::TensorShape new_global_step_tensor_shape;
-        for (int64_t dim : new_global_step_shape) {
-            new_global_step_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::Tensor new_global_step_input(tensorflow::DT_INT64, new_global_step_tensor_shape);
-        fillTensorWithDataByType(new_global_step_input, tensorflow::DT_INT64, data, offset, size);
-        
-        new_global_step_tensor = tensorflow::ops::Const(root, new_global_step_input);
-        
+        new_global_step_value = std::abs(new_global_step_value) % 1000000;
+
+        auto new_global_step_tensor = tensorflow::ops::Const(root, new_global_step_value);
+
         auto accumulator_set_global_step_op = tensorflow::ops::AccumulatorSetGlobalStep(
-            root, handle_tensor, new_global_step_tensor);
+            root, accumulator.handle, new_global_step_tensor);
         
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        std::vector<tensorflow::Output> fetch_outputs = {accumulator_set_global_step_op};
-        tensorflow::Status status = session.Run(fetch_outputs, &outputs);
+        tensorflow::Status status = session.Run({}, {}, {accumulator_set_global_step_op.operation}, &outputs);
         if (!status.ok()) {
             return -1;
         }

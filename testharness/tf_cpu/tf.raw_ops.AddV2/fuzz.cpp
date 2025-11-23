@@ -198,7 +198,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto input_x = tensorflow::ops::Const(root, tensor_x);
         auto input_y = tensorflow::ops::Const(root, tensor_y);
 
-        auto add_op = tensorflow::ops::Add(root, input_x, input_y);
+        auto add_op = tensorflow::ops::AddV2(root, input_x, input_y);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;

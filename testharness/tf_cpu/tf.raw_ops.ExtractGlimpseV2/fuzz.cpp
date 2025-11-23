@@ -141,6 +141,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         uint8_t input_rank = parseRank(data[offset++]);
         if (input_rank != 4) {
             input_rank = 4;

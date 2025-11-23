@@ -227,6 +227,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         tensorflow::DataType value_dtype = parseDataType(data[offset++]);
         uint8_t value_rank = parseRank(data[offset++]);
         std::vector<int64_t> value_shape = parseShape(data, offset, size, value_rank);

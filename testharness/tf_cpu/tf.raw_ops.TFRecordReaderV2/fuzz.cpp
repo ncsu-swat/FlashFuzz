@@ -50,6 +50,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         std::string container = parseString(data, offset, size, 20);
         std::string shared_name = parseString(data, offset, size, 20);
         std::string compression_type = parseString(data, offset, size, 20);

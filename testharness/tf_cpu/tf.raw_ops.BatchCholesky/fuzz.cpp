@@ -134,8 +134,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         fillTensorWithDataByType(input_tensor, dtype, data, offset, size);
         
         auto input_placeholder = tensorflow::ops::Placeholder(root, dtype);
-        
-        auto batch_cholesky_op = tensorflow::ops::Cholesky(root, input_placeholder);
+
+        // Build the deprecated BatchCholesky op directly so the fuzz harness
+        // targets the raw API name.
+        auto input_node_out = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        tensorflow::Node* cholesky_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchCholesky"), "BatchCholesky")
+                           .Input(input_node_out);
+        root.UpdateStatus(builder.Finalize(root.graph(), &cholesky_node));
+        if (!root.ok() || cholesky_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_cholesky_op(cholesky_node, 0);
         
         tensorflow::ClientSession session(root);
         

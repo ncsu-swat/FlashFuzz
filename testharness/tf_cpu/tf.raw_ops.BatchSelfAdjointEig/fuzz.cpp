@@ -133,14 +133,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
         auto input_placeholder = tensorflow::ops::Placeholder(root, dtype);
         
-        auto batch_self_adjoint_eig = tensorflow::ops::SelfAdjointEig(root, input_placeholder);
+        auto input_node = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        tensorflow::Node* eig_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchSelfAdjointEig"), "BatchSelfAdjointEig")
+                           .Input(input_node);
+        root.UpdateStatus(builder.Finalize(root.graph(), &eig_node));
+        if (!root.ok() || eig_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_self_adjoint_eig(eig_node, 0);
 
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({{input_placeholder, input_tensor}}, 
-                                               {batch_self_adjoint_eig}, 
-                                               &outputs);
+        tensorflow::ClientSession::FeedType feeds;
+        feeds.emplace(input_placeholder, input_tensor);
+        tensorflow::Status status = session.Run(feeds, {batch_self_adjoint_eig}, &outputs);
         
         if (!status.ok()) {
             return -1;

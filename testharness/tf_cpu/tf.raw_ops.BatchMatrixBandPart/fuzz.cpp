@@ -231,8 +231,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto num_lower_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
         auto num_upper_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
         
-        auto batch_matrix_band_part = tensorflow::ops::MatrixBandPart(
-            root, input_placeholder, num_lower_placeholder, num_upper_placeholder);
+        // Build the deprecated BatchMatrixBandPart op directly to target the raw API.
+        auto input_node = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        auto lower_node = tensorflow::ops::AsNodeOut(root, num_lower_placeholder);
+        auto upper_node = tensorflow::ops::AsNodeOut(root, num_upper_placeholder);
+        tensorflow::Node* band_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchMatrixBandPart"), "BatchMatrixBandPart")
+                           .Input(input_node)
+                           .Input(lower_node)
+                           .Input(upper_node);
+        root.UpdateStatus(builder.Finalize(root.graph(), &band_node));
+        if (!root.ok() || band_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_matrix_band_part(band_node, 0);
         
         tensorflow::ClientSession session(root);
         
