@@ -1,6 +1,6 @@
 clang++ -fsanitize=fuzzer \
          -fno-omit-frame-pointer \
-         -O0 -g -Werror \
+         -O0 -g  \
          -I/root/pytorch/build-fuzz/include \
          -I/root/pytorch/aten/src \
          -I/root/pytorch/c10/core \
