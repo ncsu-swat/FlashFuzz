@@ -340,7 +340,6 @@ class Experiment():
         try:
             self.check_image()
             self.start_docker_container()
-            loop_until_ctrl_c()
             self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 -u build_test_harness.py --dll {self.dll} --mode {self.mode} --check_build > check.log")
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}", f"{self.result_dir}/{self.api}")
             os.makedirs(f"{self.result_dir}/build_status", exist_ok=True)
