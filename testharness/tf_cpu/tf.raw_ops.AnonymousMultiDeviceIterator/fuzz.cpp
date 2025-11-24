@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/dataset_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -209,6 +210,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::vector<std::string> devices = parseDevices(data, offset, size);
         std::vector<tensorflow::DataType> output_types = parseOutputTypes(data, offset, size);
         std::vector<tensorflow::TensorShape> output_shapes = parseOutputShapes(data, offset, size, output_types.size());
+        std::vector<tensorflow::PartialTensorShape> partial_shapes;
+        for (const auto& shape : output_shapes) {
+            partial_shapes.emplace_back(shape);
+        }
         
         std::cout << "Devices: ";
         for (const auto& device : devices) {
@@ -219,50 +224,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::cout << "Output types count: " << output_types.size() << std::endl;
         std::cout << "Output shapes count: " << output_shapes.size() << std::endl;
         
-        // Convert vector of strings to tensorflow::gtl::ArraySlice<string>
-        tensorflow::gtl::ArraySlice<std::string> devices_slice(devices);
-        
-        // Convert vector of DataType to tensorflow::DataTypeVector
-        tensorflow::DataTypeVector output_types_vector(output_types.begin(), output_types.end());
-        
-        // Convert vector of TensorShape to tensorflow::gtl::ArraySlice<PartialTensorShape>
-        std::vector<tensorflow::PartialTensorShape> partial_shapes;
-        for (const auto& shape : output_shapes) {
-            partial_shapes.push_back(tensorflow::PartialTensorShape(shape));
+        tensorflow::Node* iterator_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                root.GetUniqueNameForOp("AnonymousMultiDeviceIterator"),
+                "AnonymousMultiDeviceIterator")
+                           .Attr("devices", devices)
+                           .Attr("output_types", output_types)
+                           .Attr("output_shapes", partial_shapes);
+        root.UpdateStatus(builder.Finalize(root.graph(), &iterator_node));
+        if (!root.ok() || iterator_node == nullptr) {
+            tf_fuzzer_utils::logError("Failed to build AnonymousMultiDeviceIterator node", data, size);
+            return -1;
         }
-        tensorflow::gtl::ArraySlice<tensorflow::PartialTensorShape> output_shapes_slice(partial_shapes);
-        
-        // Create the AnonymousMultiDeviceIterator op
-        tensorflow::Output iterator_handle = tensorflow::Operation(
-            root.WithOpName("AnonymousMultiDeviceIterator"),
-            "AnonymousMultiDeviceIterator",
-            {},
-            tensorflow::OutputTypeList(),
-            2,  // number of outputs
-            &root.WithDevice("/cpu:0"),
-            {{"devices", devices_slice}, 
-             {"output_types", output_types_vector}, 
-             {"output_shapes", output_shapes_slice}}
-        ).output(0);
-        
-        tensorflow::Output deleter = tensorflow::Operation(
-            root.WithOpName("AnonymousMultiDeviceIterator"),
-            "AnonymousMultiDeviceIterator",
-            {},
-            tensorflow::OutputTypeList(),
-            2,  // number of outputs
-            &root.WithDevice("/cpu:0"),
-            {{"devices", devices_slice}, 
-             {"output_types", output_types_vector}, 
-             {"output_shapes", output_shapes_slice}}
-        ).output(1);
-        
-        std::cout << "AnonymousMultiDeviceIterator created successfully" << std::endl;
+
+        tensorflow::Output iterator_handle(iterator_node, 0);
+        tensorflow::Output deleter(iterator_node, 1);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({iterator_handle, deleter}, &outputs);
+        tensorflow::Status status = session.Run({}, {iterator_handle, deleter}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

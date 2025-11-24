@@ -24,7 +24,7 @@ void logError(const std::string& message, const uint8_t* data, size_t size) {
 
 tensorflow::DataType parseDataType(uint8_t selector) {
     tensorflow::DataType dtype;
-    switch (selector % 17) {
+    switch (selector % 4) {
         case 0:
             dtype = tensorflow::DT_FLOAT;
             break;
@@ -32,49 +32,10 @@ tensorflow::DataType parseDataType(uint8_t selector) {
             dtype = tensorflow::DT_DOUBLE;
             break;
         case 2:
-            dtype = tensorflow::DT_INT32;
+            dtype = tensorflow::DT_HALF;
             break;
         case 3:
-            dtype = tensorflow::DT_UINT8;
-            break;
-        case 4:
-            dtype = tensorflow::DT_INT16;
-            break;
-        case 5:
-            dtype = tensorflow::DT_INT8;
-            break;
-        case 6:
-            dtype = tensorflow::DT_COMPLEX64;
-            break;
-        case 7:
-            dtype = tensorflow::DT_INT64;
-            break;
-        case 8:
-            dtype = tensorflow::DT_QINT8;
-            break;
-        case 9:
-            dtype = tensorflow::DT_QUINT8;
-            break;
-        case 10:
-            dtype = tensorflow::DT_QINT32;
-            break;
-        case 11:
             dtype = tensorflow::DT_BFLOAT16;
-            break;
-        case 12:
-            dtype = tensorflow::DT_QINT16;
-            break;
-        case 13:
-            dtype = tensorflow::DT_QUINT16;
-            break;
-        case 14:
-            dtype = tensorflow::DT_UINT16;
-            break;
-        case 15:
-            dtype = tensorflow::DT_COMPLEX128;
-            break;
-        case 16:
-            dtype = tensorflow::DT_HALF;
             break;
         default:
             dtype = tensorflow::DT_FLOAT;
@@ -226,6 +187,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         tensorflow::Tensor m_tensor(dtype, var_tensor_shape);
         fillTensorWithDataByType(m_tensor, dtype, data, offset, size);
+
+        tensorflow::Tensor grad_tensor(dtype, var_tensor_shape);
+        fillTensorWithDataByType(grad_tensor, dtype, data, offset, size);
         
         tensorflow::TensorShape scalar_shape;
         
@@ -241,34 +205,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::Tensor beta_tensor(dtype, scalar_shape);
         fillTensorWithDataByType(beta_tensor, dtype, data, offset, size);
         
-        tensorflow::Tensor grad_tensor(dtype, var_tensor_shape);
-        fillTensorWithDataByType(grad_tensor, dtype, data, offset, size);
-        
-        auto var_input = tensorflow::ops::Placeholder(root, dtype, tensorflow::ops::Placeholder::Shape(var_tensor_shape));
-        auto m_input = tensorflow::ops::Placeholder(root, dtype, tensorflow::ops::Placeholder::Shape(var_tensor_shape));
+        bool use_locking = (offset < size) ? (data[offset++] % 2 == 1) : false;
+
+        auto var_ref = tensorflow::ops::Variable(root, var_tensor_shape, dtype);
+        auto m_ref = tensorflow::ops::Variable(root, var_tensor_shape, dtype);
+
+        auto init_var = tensorflow::ops::Assign(root, var_ref, var_tensor);
+        auto init_m = tensorflow::ops::Assign(root, m_ref, m_tensor);
+
         auto lr_input = tensorflow::ops::Const(root, lr_tensor);
         auto logbase_input = tensorflow::ops::Const(root, logbase_tensor);
         auto sign_decay_input = tensorflow::ops::Const(root, sign_decay_tensor);
         auto beta_input = tensorflow::ops::Const(root, beta_tensor);
         auto grad_input = tensorflow::ops::Const(root, grad_tensor);
         
-        bool use_locking = (offset < size) ? (data[offset++] % 2 == 1) : false;
-        
         auto apply_power_sign = tensorflow::ops::ApplyPowerSign(
-            root, var_input, m_input, lr_input, logbase_input, 
+            root, var_ref, m_ref, lr_input, logbase_input, 
             sign_decay_input, beta_input, grad_input,
             tensorflow::ops::ApplyPowerSign::UseLocking(use_locking)
         );
         
         tensorflow::ClientSession session(root);
         
-        std::vector<std::pair<tensorflow::Output, tensorflow::Tensor>> inputs = {
-            {var_input, var_tensor},
-            {m_input, m_tensor}
-        };
-        
-        std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run(inputs, {apply_power_sign}, &outputs);
+        std::vector<tensorflow::Operation> init_ops = {init_var.operation, init_m.operation};
+        tensorflow::Status init_status = session.Run({}, {}, init_ops, nullptr);
+        if (!init_status.ok()) {
+            return -1;
+        }
+
+        std::vector<tensorflow::Operation> run_ops = {apply_power_sign.operation};
+        tensorflow::Status status = session.Run({}, {}, run_ops, nullptr);
         if (!status.ok()) {
             return -1;
         }

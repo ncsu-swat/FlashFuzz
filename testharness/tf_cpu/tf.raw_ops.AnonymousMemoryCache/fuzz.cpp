@@ -6,6 +6,7 @@
 #include "tensorflow/cc/ops/data_flow_ops.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -228,13 +229,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        // Create AnonymousMemoryCache operation using raw_ops
-        auto anonymous_memory_cache_op = tensorflow::ops::_AnonymousMemoryCache(root);
+        tensorflow::Node* cache_node = nullptr;
+        auto cache_builder = tensorflow::NodeBuilder(
+            root.GetUniqueNameForOp("AnonymousMemoryCache"),
+            "AnonymousMemoryCache");
+        root.UpdateStatus(cache_builder.Finalize(root.graph(), &cache_node));
+        if (!root.ok() || cache_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output cache_handle(cache_node, 0);
+        tensorflow::Output cache_deleter(cache_node, 1);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({anonymous_memory_cache_op.handle, anonymous_memory_cache_op.deleter}, &outputs);
+        tensorflow::Status status = session.Run({}, {cache_handle, cache_deleter}, &outputs);
         if (!status.ok()) {
             tf_fuzzer_utils::logError("Error running session: " + status.ToString(), data, size);
             return -1;

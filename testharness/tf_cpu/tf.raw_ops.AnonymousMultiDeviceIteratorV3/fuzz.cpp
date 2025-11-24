@@ -2,6 +2,7 @@
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/dataset_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -224,77 +225,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
         std::cout << std::endl;
 
-        // Convert output_types to a tensorflow::DataTypeVector
-        tensorflow::DataTypeVector output_types_vec(output_types.begin(), output_types.end());
-        
-        // Create a tensor for devices
-        tensorflow::Tensor devices_tensor(tensorflow::DT_STRING, {static_cast<int64_t>(devices.size())});
-        auto devices_flat = devices_tensor.flat<tensorflow::tstring>();
-        for (size_t i = 0; i < devices.size(); i++) {
-            devices_flat(i) = devices[i];
-        }
-        
-        // Create the operation using raw_ops
-        auto anonymous_iterator_op = tensorflow::ops::Placeholder(root, tensorflow::DT_RESOURCE);
-        
-        // Create the operation attributes
-        tensorflow::ops::Placeholder::Attrs attrs;
-        
-        // Build the node def for AnonymousMultiDeviceIteratorV3
-        tensorflow::NodeDef node_def;
-        node_def.set_name("AnonymousMultiDeviceIteratorV3");
-        node_def.set_op("AnonymousMultiDeviceIteratorV3");
-        
-        // Add attributes to the node def
-        auto* attr_map = node_def.mutable_attr();
-        
-        // Add output_types attribute
-        tensorflow::AttrValue output_types_attr;
-        for (auto dtype : output_types) {
-            output_types_attr.mutable_list()->add_type(dtype);
-        }
-        (*attr_map)["output_types"] = output_types_attr;
-        
-        // Add output_shapes attribute
-        tensorflow::AttrValue output_shapes_attr;
+        std::vector<tensorflow::PartialTensorShape> partial_shapes;
         for (const auto& shape : output_shapes) {
-            auto* shape_proto = output_shapes_attr.mutable_list()->add_shape();
-            shape.AsProto(shape_proto);
+            partial_shapes.emplace_back(shape);
         }
-        (*attr_map)["output_shapes"] = output_shapes_attr;
-        
-        // Add devices attribute
-        tensorflow::AttrValue devices_attr;
-        for (const auto& device : devices) {
-            devices_attr.mutable_list()->add_s(device);
-        }
-        (*attr_map)["devices"] = devices_attr;
-        
-        // Create the operation using the node def
-        tensorflow::Status status;
-        auto op = root.AddNode(node_def, &status);
-        
-        if (!status.ok()) {
-            std::cout << "Error creating AnonymousMultiDeviceIteratorV3 operation: " << status.ToString() << std::endl;
+
+        tensorflow::Node* iterator_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                root.GetUniqueNameForOp("AnonymousMultiDeviceIteratorV3"),
+                "AnonymousMultiDeviceIteratorV3")
+                           .Attr("devices", devices)
+                           .Attr("output_types", output_types)
+                           .Attr("output_shapes", partial_shapes);
+        root.UpdateStatus(builder.Finalize(root.graph(), &iterator_node));
+        if (!root.ok() || iterator_node == nullptr) {
+            tf_fuzzer_utils::logError("Failed to build AnonymousMultiDeviceIteratorV3 node", data, size);
             return -1;
         }
-        
-        std::cout << "Created AnonymousMultiDeviceIteratorV3 operation" << std::endl;
+
+        tensorflow::Output iterator_handle(iterator_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        status = session.Run({}, {}, {}, &outputs);
         
+        tensorflow::Status status = session.Run({}, {iterator_handle}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;
         }
-
-        std::cout << "Successfully executed AnonymousMultiDeviceIteratorV3" << std::endl;
-        if (!outputs.empty()) {
-            std::cout << "Output tensor shape: " << outputs[0].shape().DebugString() << std::endl;
-            std::cout << "Output tensor type: " << outputs[0].dtype() << std::endl;
-        }
+        
+        std::cout << "Session run successfully, outputs count: " << outputs.size() << std::endl;
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

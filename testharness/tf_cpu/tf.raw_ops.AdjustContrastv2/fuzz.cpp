@@ -139,6 +139,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto images_placeholder = tensorflow::ops::Placeholder(root, images_dtype);
         auto contrast_factor_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_FLOAT);
         
+        // AdjustContrast wrapper builds the underlying AdjustContrastv2 op.
         auto adjust_contrast_op = tensorflow::ops::AdjustContrast(root, images_placeholder, contrast_factor_placeholder);
         
         tensorflow::ClientSession session(root);

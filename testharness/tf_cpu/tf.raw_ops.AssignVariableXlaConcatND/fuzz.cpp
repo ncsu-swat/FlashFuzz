@@ -6,6 +6,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -167,6 +168,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+        tensorflow::ClientSession session(root);
         tensorflow::DataType dtype = parseDataType(data[offset++]);
         
         uint8_t num_inputs_raw = data[offset++];
@@ -180,15 +182,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             tensor_shape.AddDim(dim);
         }
 
-        auto resource_var = tensorflow::ops::VarHandleOp(root, dtype, tensor_shape);
+        auto resource_var = tensorflow::ops::VarHandleOp(root.WithOpName("resource_var"), dtype, tensor_shape);
 
-        std::vector<tensorflow::Output> input_tensors;
+        std::vector<tensorflow::Output> input_nodes;
         for (int i = 0; i < num_inputs; ++i) {
             tensorflow::Tensor input_tensor(dtype, tensor_shape);
             fillTensorWithDataByType(input_tensor, dtype, data, offset, size);
             
             auto input_op = tensorflow::ops::Const(root.WithOpName("input_" + std::to_string(i)), input_tensor);
-            input_tensors.push_back(input_op);
+            input_nodes.push_back(input_op);
         }
 
         std::vector<int> num_concats;
@@ -211,37 +213,35 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             }
         }
 
-        // Create a tensor for num_concats
-        tensorflow::Tensor num_concats_tensor(tensorflow::DT_INT32, {static_cast<int64_t>(num_concats.size())});
-        auto num_concats_flat = num_concats_tensor.flat<int32_t>();
-        for (size_t i = 0; i < num_concats.size(); ++i) {
-            num_concats_flat(i) = num_concats[i];
-        }
+        std::vector<int64_t> num_concats_attr(num_concats.begin(), num_concats.end());
+        std::vector<int64_t> paddings_attr(paddings.begin(), paddings.end());
 
-        // Create a tensor for paddings
-        tensorflow::Tensor paddings_tensor(tensorflow::DT_INT32, {static_cast<int64_t>(paddings.size())});
-        auto paddings_flat = paddings_tensor.flat<int32_t>();
-        for (size_t i = 0; i < paddings.size(); ++i) {
-            paddings_flat(i) = paddings[i];
-        }
+        auto init_value = input_nodes.front();
+        auto init_op = tensorflow::ops::AssignVariableOp(root.WithOpName("init_assign"), resource_var, init_value);
 
-        // Use raw_ops directly
-        std::vector<tensorflow::Operation> ops;
-        tensorflow::Status status = tensorflow::ops::Raw::AssignVariableXlaConcatND(
-            root.WithOpName("assign_variable_xla_concat_nd"),
-            resource_var,
-            input_tensors,
-            tensorflow::ops::Const(root, num_concats_tensor),
-            tensorflow::ops::Const(root, paddings_tensor),
-            &ops
-        );
+        auto resource_node = tensorflow::ops::AsNodeOut(root, resource_var);
+        auto input_nodeouts = tensorflow::ops::AsNodeOutList(root, input_nodes);
+        tensorflow::Node* assign_concat_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("AssignVariableXlaConcatND"),
+                           "AssignVariableXlaConcatND")
+                           .Input(resource_node)
+                           .Input(input_nodeouts)
+                           .ControlInput(init_op.operation.node())
+                           .Attr("num_concats", num_concats_attr)
+                           .Attr("paddings", paddings_attr)
+                           .Attr("T", dtype)
+                           .Attr("N", static_cast<int64_t>(input_nodes.size()));
+        root.UpdateBuilder(&builder);
+        root.UpdateStatus(builder.Finalize(root.graph(), &assign_concat_node));
 
-        if (!status.ok()) {
+        if (!root.ok() || assign_concat_node == nullptr) {
             return -1;
         }
 
-        tensorflow::ClientSession session(root);
-        status = session.Run({}, nullptr);
+        tensorflow::Operation assign_concat(assign_concat_node);
+        std::vector<tensorflow::Tensor> outputs;
+        tensorflow::Status status = session.Run({}, {}, {assign_concat}, &outputs);
         if (!status.ok()) {
             return -1;
         }

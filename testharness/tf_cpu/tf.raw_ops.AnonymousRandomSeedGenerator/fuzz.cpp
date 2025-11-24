@@ -1,6 +1,8 @@
 #include "tensorflow/cc/client/client_session.h"
+#include "tensorflow/cc/ops/array_ops.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/random_ops.h"
@@ -146,54 +148,56 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t rank1 = parseRank(data[offset++]);
         std::vector<int64_t> shape1 = parseShape(data, offset, size, rank1);
         
-        tensorflow::Tensor seed_tensor(tensorflow::DT_INT64, tensorflow::TensorShape(shape1));
-        fillTensorWithDataByType(seed_tensor, tensorflow::DT_INT64, data, offset, size);
-        
         uint8_t rank2 = parseRank(data[offset++]);
         std::vector<int64_t> shape2 = parseShape(data, offset, size, rank2);
-        
-        tensorflow::Tensor seed2_tensor(tensorflow::DT_INT64, tensorflow::TensorShape(shape2));
+
+        // AnonymousRandomSeedGenerator expects scalar seeds.
+        tensorflow::Tensor seed_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
+        tensorflow::Tensor seed2_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
+        fillTensorWithDataByType(seed_tensor, tensorflow::DT_INT64, data, offset, size);
         fillTensorWithDataByType(seed2_tensor, tensorflow::DT_INT64, data, offset, size);
 
-        auto seed_input = tensorflow::ops::Const(root, seed_tensor);
-        auto seed2_input = tensorflow::ops::Const(root, seed2_tensor);
+        auto seed_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
+        auto seed2_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
+        auto seed_node = tensorflow::ops::AsNodeOut(root, seed_placeholder);
+        auto seed2_node = tensorflow::ops::AsNodeOut(root, seed2_placeholder);
 
-        std::cout << "Seed tensor shape: ";
-        for (int i = 0; i < seed_tensor.shape().dims(); ++i) {
-            std::cout << seed_tensor.shape().dim_size(i) << " ";
-        }
-        std::cout << std::endl;
-
-        std::cout << "Seed2 tensor shape: ";
-        for (int i = 0; i < seed2_tensor.shape().dims(); ++i) {
-            std::cout << seed2_tensor.shape().dim_size(i) << " ";
-        }
-        std::cout << std::endl;
-
-        // Use raw op instead of the non-existent tensorflow::ops::AnonymousRandomSeedGenerator
-        tensorflow::Output handle, deleter;
-        tensorflow::Status status = tensorflow::ops::internal::AnonymousRandomSeedGenerator(
-            root.WithOpName("AnonymousRandomSeedGenerator"), 
-            seed_input, 
-            seed2_input, 
-            &handle, 
-            &deleter);
-        
-        if (!status.ok()) {
-            std::cout << "Error creating op: " << status.ToString() << std::endl;
+        tensorflow::Node* generator_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("AnonymousRandomSeedGenerator"),
+                           "AnonymousRandomSeedGenerator")
+                           .Input(seed_node)
+                           .Input(seed2_node);
+        root.UpdateStatus(builder.Finalize(root.graph(), &generator_node));
+        if (!root.ok() || generator_node == nullptr) {
             return -1;
         }
 
+        tensorflow::Output handle(generator_node, 0);
+        tensorflow::Output deleter(generator_node, 1);
+
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        
-        status = session.Run({handle, deleter}, &outputs);
+
+        tensorflow::Status status =
+            session.Run({{seed_placeholder, seed_tensor}, {seed2_placeholder, seed2_tensor}},
+                        {handle, deleter}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;
         }
 
         std::cout << "Operation completed successfully" << std::endl;
+        std::cout << "Seed tensor parsed dims: ";
+        for (auto dim : shape1) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
+        std::cout << "Seed2 tensor parsed dims: ";
+        for (auto dim : shape2) {
+            std::cout << dim << " ";
+        }
+        std::cout << std::endl;
         std::cout << "Handle tensor type: " << outputs[0].dtype() << std::endl;
         std::cout << "Deleter tensor type: " << outputs[1].dtype() << std::endl;
 

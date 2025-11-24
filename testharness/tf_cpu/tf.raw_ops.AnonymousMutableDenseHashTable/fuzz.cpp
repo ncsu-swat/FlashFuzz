@@ -6,6 +6,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -22,74 +23,56 @@ void logError(const std::string& message, const uint8_t* data, size_t size) {
 }
 }
 
-tensorflow::DataType parseDataType(uint8_t selector) {
-    tensorflow::DataType dtype; 
-    switch (selector % 21) {  
+tensorflow::DataType selectKeyType(uint8_t selector) {
+    switch (selector % 3) {
         case 0:
-            dtype = tensorflow::DT_FLOAT;
-            break;
+            return tensorflow::DT_INT32;
         case 1:
-            dtype = tensorflow::DT_DOUBLE;
-            break;
-        case 2:
-            dtype = tensorflow::DT_INT32;
-            break;
-        case 3:
-            dtype = tensorflow::DT_UINT8;
-            break;
-        case 4:
-            dtype = tensorflow::DT_INT16;
-            break;
-        case 5:
-            dtype = tensorflow::DT_INT8;
-            break;
-        case 6:
-            dtype = tensorflow::DT_STRING;
-            break;
-        case 7:
-            dtype = tensorflow::DT_COMPLEX64;
-            break;
-        case 8:
-            dtype = tensorflow::DT_INT64;
-            break;
-        case 9:
-            dtype = tensorflow::DT_BOOL;
-            break;
-        case 10:
-            dtype = tensorflow::DT_QINT8;
-            break;
-        case 11:
-            dtype = tensorflow::DT_QUINT8;
-            break;
-        case 12:
-            dtype = tensorflow::DT_QINT32;
-            break;
-        case 13:
-            dtype = tensorflow::DT_BFLOAT16;
-            break;
-        case 14:
-            dtype = tensorflow::DT_QINT16;
-            break;
-        case 15:
-            dtype = tensorflow::DT_QUINT16;
-            break;
-        case 16:
-            dtype = tensorflow::DT_UINT16;
-            break;
-        case 17:
-            dtype = tensorflow::DT_COMPLEX128;
-            break;
-        case 18:
-            dtype = tensorflow::DT_HALF;
-            break;
-        case 19:
-            dtype = tensorflow::DT_UINT32;
-            break;
-        case 20:
-            dtype = tensorflow::DT_UINT64;
-            break;
+            return tensorflow::DT_INT64;
+        default:
+            return tensorflow::DT_STRING;
     }
-    return dtype;
+}
+
+tensorflow::DataType selectValueType(uint8_t selector, tensorflow::DataType key_dtype) {
+    if (key_dtype == tensorflow::DT_INT32) {
+        switch (selector % 3) {
+            case 0:
+                return tensorflow::DT_FLOAT;
+            case 1:
+                return tensorflow::DT_DOUBLE;
+            default:
+                return tensorflow::DT_INT32;
+        }
+    }
+
+    if (key_dtype == tensorflow::DT_INT64) {
+        switch (selector % 5) {
+            case 0:
+                return tensorflow::DT_BOOL;
+            case 1:
+                return tensorflow::DT_FLOAT;
+            case 2:
+                return tensorflow::DT_DOUBLE;
+            case 3:
+                return tensorflow::DT_INT32;
+            default:
+                return tensorflow::DT_INT64;
+        }
+    }
+
+    switch (selector % 5) {
+        case 0:
+            return tensorflow::DT_BOOL;
+        case 1:
+            return tensorflow::DT_FLOAT;
+        case 2:
+            return tensorflow::DT_DOUBLE;
+        case 3:
+            return tensorflow::DT_INT32;
+        default:
+            return tensorflow::DT_INT64;
+    }
 }
 
 uint8_t parseRank(uint8_t byte) {
@@ -248,42 +231,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::DataType key_dtype = parseDataType(data[offset++]);
-        
-        uint8_t empty_key_rank = parseRank(data[offset++]);
-        std::vector<int64_t> empty_key_shape = parseShape(data, offset, size, empty_key_rank);
-        
-        tensorflow::TensorShape empty_key_tensor_shape;
-        for (int64_t dim : empty_key_shape) {
-            empty_key_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::Tensor empty_key_tensor(key_dtype, empty_key_tensor_shape);
-        fillTensorWithDataByType(empty_key_tensor, key_dtype, data, offset, size);
-        
-        uint8_t deleted_key_rank = parseRank(data[offset++]);
-        std::vector<int64_t> deleted_key_shape = parseShape(data, offset, size, deleted_key_rank);
-        
-        tensorflow::TensorShape deleted_key_tensor_shape;
-        for (int64_t dim : deleted_key_shape) {
-            deleted_key_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::Tensor deleted_key_tensor(key_dtype, deleted_key_tensor_shape);
-        fillTensorWithDataByType(deleted_key_tensor, key_dtype, data, offset, size);
-        
-        tensorflow::DataType value_dtype = parseDataType(data[offset++]);
-        
+        tensorflow::DataType key_dtype = selectKeyType(data[offset++]);
+        tensorflow::DataType value_dtype = selectValueType(data[offset++], key_dtype);
+
         uint8_t value_shape_rank = parseRank(data[offset++]);
         std::vector<int64_t> value_shape_dims = parseShape(data, offset, size, value_shape_rank);
         
-        int32_t initial_num_buckets = 131072;
+        int64_t initial_num_buckets = 131072;
         if (offset + sizeof(int32_t) <= size) {
-            std::memcpy(&initial_num_buckets, data + offset, sizeof(int32_t));
+            int32_t bucket_bytes;
+            std::memcpy(&bucket_bytes, data + offset, sizeof(int32_t));
             offset += sizeof(int32_t);
-            initial_num_buckets = std::abs(initial_num_buckets) % 1048576 + 1024;
-            int power = 1;
-            while (power < initial_num_buckets) {
+            bucket_bytes = std::abs(bucket_bytes) % 1048576 + 1024;
+            int64_t power = 1;
+            while (power < bucket_bytes) {
                 power *= 2;
             }
             initial_num_buckets = power;
@@ -299,19 +260,50 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             }
         }
 
+        tensorflow::Tensor empty_key_tensor(key_dtype, tensorflow::TensorShape({}));
+        tensorflow::Tensor deleted_key_tensor(key_dtype, tensorflow::TensorShape({}));
+        fillTensorWithDataByType(empty_key_tensor, key_dtype, data, offset, size);
+        fillTensorWithDataByType(deleted_key_tensor, key_dtype, data, offset, size);
+
+        if (key_dtype == tensorflow::DT_INT32) {
+            auto empty_val = empty_key_tensor.scalar<int32_t>()();
+            auto del_val = deleted_key_tensor.scalar<int32_t>()();
+            if (del_val == empty_val) {
+                deleted_key_tensor.scalar<int32_t>()() = empty_val + 1;
+            }
+        } else if (key_dtype == tensorflow::DT_INT64) {
+            auto empty_val = empty_key_tensor.scalar<int64_t>()();
+            auto del_val = deleted_key_tensor.scalar<int64_t>()();
+            if (del_val == empty_val) {
+                deleted_key_tensor.scalar<int64_t>()() = empty_val + 1;
+            }
+        } else if (key_dtype == tensorflow::DT_STRING) {
+            auto empty_val = empty_key_tensor.scalar<tensorflow::tstring>()();
+            auto del_val = deleted_key_tensor.scalar<tensorflow::tstring>()();
+            if (del_val == empty_val) {
+                deleted_key_tensor.scalar<tensorflow::tstring>()() = empty_val + "_del";
+            }
+        }
+
         auto empty_key_op = tensorflow::ops::Const(root, empty_key_tensor);
         auto deleted_key_op = tensorflow::ops::Const(root, deleted_key_tensor);
 
-        // Use raw_ops to create AnonymousMutableDenseHashTable
-        auto hash_table = tensorflow::ops::Raw::AnonymousMutableDenseHashTable(
-            root,
-            empty_key_op,
-            deleted_key_op,
-            value_dtype,
-            tensorflow::PartialTensorShape(value_shape_dims),
-            initial_num_buckets,
-            max_load_factor
-        );
+        tensorflow::Node* table_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("AnonymousMutableDenseHashTable"),
+                           "AnonymousMutableDenseHashTable")
+                           .Input(tensorflow::ops::AsNodeOut(root, empty_key_op))
+                           .Input(tensorflow::ops::AsNodeOut(root, deleted_key_op))
+                           .Attr("key_dtype", key_dtype)
+                           .Attr("value_dtype", value_dtype)
+                           .Attr("value_shape", tensorflow::PartialTensorShape(value_shape_dims))
+                           .Attr("initial_num_buckets", initial_num_buckets)
+                           .Attr("max_load_factor", max_load_factor);
+        root.UpdateStatus(builder.Finalize(root.graph(), &table_node));
+        if (!root.ok() || table_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output hash_table(table_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;

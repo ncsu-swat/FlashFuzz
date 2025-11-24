@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/framework/scope.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -256,29 +257,49 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             num_replicas = data[offset++] % 5;
         }
 
-        tensorflow::Tensor dummy_tensor(output_dtype, tensorflow::TensorShape(output_shape));
-        fillTensorWithDataByType(dummy_tensor, output_dtype, data, offset, size);
-        
-        // Create a tensor to hold the dataset
-        auto tensor_op = tensorflow::ops::Const(root, dummy_tensor);
-        
-        // Create a range dataset as input
-        auto range_dataset = tensorflow::ops::TensorSliceDataset(root, {tensor_op});
+        if (!tensorflow::DataTypeIsInteger(output_dtype) && !tensorflow::DataTypeIsFloating(output_dtype)) {
+            output_dtype = tensorflow::DT_INT64;
+        }
+        std::vector<tensorflow::DataType> output_types = {output_dtype};
+        std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape({})};
+
+        auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
+        auto stop = tensorflow::ops::Const(root, static_cast<int64_t>(10));
+        auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
+
+        tensorflow::Node* range_dataset_node = nullptr;
+        auto range_status = tensorflow::NodeBuilder("range_dataset", "RangeDataset")
+            .Input(start.node())
+            .Input(stop.node())
+            .Input(step.node())
+            .Attr("output_types", output_types)
+            .Attr("output_shapes", output_shapes)
+            .Finalize(root.graph(), &range_dataset_node);
+        if (!range_status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output input_dataset(range_dataset_node);
         
         // Create constants for num_workers and index
         auto num_workers_op = tensorflow::ops::Const(root, num_workers_val);
         auto index_op = tensorflow::ops::Const(root, index_val);
 
-        // Create AutoShardDataset operation
-        auto auto_shard_dataset = tensorflow::ops::experimental::AutoShardDataset(
-            root,
-            range_dataset,
-            num_workers_op,
-            index_op,
-            {output_dtype},
-            {tensorflow::PartialTensorShape(output_shape)},
-            tensorflow::ops::experimental::AutoShardDataset::AutoShardPolicy(auto_shard_policy).NumReplicas(num_replicas)
-        );
+        tensorflow::Node* auto_shard_node = nullptr;
+        auto auto_shard_status = tensorflow::NodeBuilder("AutoShardDataset", "AutoShardDataset")
+            .Input(input_dataset.node())
+            .Input(num_workers_op.node())
+            .Input(index_op.node())
+            .Attr("auto_shard_policy", auto_shard_policy)
+            .Attr("num_replicas", num_replicas)
+            .Attr("output_types", output_types)
+            .Attr("output_shapes", output_shapes)
+            .Finalize(root.graph(), &auto_shard_node);
+        if (!auto_shard_status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output auto_shard_dataset(auto_shard_node);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;

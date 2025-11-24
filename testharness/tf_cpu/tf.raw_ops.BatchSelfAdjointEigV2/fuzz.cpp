@@ -2,6 +2,7 @@
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/linalg_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -134,19 +135,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
         
         auto input_placeholder = tensorflow::ops::Placeholder(root, dtype);
-        
-        auto batch_self_adjoint_eig = tensorflow::ops::SelfAdjointEig(
-            root, input_placeholder, 
-            tensorflow::ops::SelfAdjointEig::ComputeV(compute_v));
-        
+
+        // Build the deprecated raw op directly to ensure we hit BatchSelfAdjointEigV2.
+        auto input_node = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        tensorflow::Node* eig_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("BatchSelfAdjointEigV2"),
+                           "BatchSelfAdjointEigV2")
+                           .Input(input_node)
+                           .Attr("compute_v", compute_v);
+        root.UpdateStatus(builder.Finalize(root.graph(), &eig_node));
+        if (!root.ok() || eig_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output eig_output(eig_node, 0);
+        tensorflow::Output v_output(eig_node, 1);
+
         tensorflow::ClientSession session(root);
-        
+
         std::vector<tensorflow::Tensor> outputs;
         tensorflow::Status status = session.Run(
             {{input_placeholder, input_tensor}},
-            {batch_self_adjoint_eig.e, batch_self_adjoint_eig.v},
+            {eig_output, v_output},
             &outputs);
-            
+
         if (!status.ok()) {
             return -1;
         }

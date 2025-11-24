@@ -1,7 +1,9 @@
 #include "tensorflow/cc/client/client_session.h"
+#include "tensorflow/cc/ops/array_ops.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/random_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -152,60 +154,63 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t reshuffle_rank = parseRank(data[offset++]);
         std::vector<int64_t> reshuffle_shape = parseShape(data, offset, size, reshuffle_rank);
 
-        tensorflow::TensorShape seed_tensor_shape;
-        for (auto dim : seed_shape) {
-            seed_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::TensorShape seed2_tensor_shape;
-        for (auto dim : seed2_shape) {
-            seed2_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::TensorShape reshuffle_tensor_shape;
-        for (auto dim : reshuffle_shape) {
-            reshuffle_tensor_shape.AddDim(dim);
-        }
-
-        tensorflow::Tensor seed_tensor(tensorflow::DT_INT64, seed_tensor_shape);
-        tensorflow::Tensor seed2_tensor(tensorflow::DT_INT64, seed2_tensor_shape);
-        tensorflow::Tensor reshuffle_tensor(tensorflow::DT_BOOL, reshuffle_tensor_shape);
+        tensorflow::Tensor seed_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
+        tensorflow::Tensor seed2_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
+        tensorflow::Tensor reshuffle_tensor(tensorflow::DT_BOOL, tensorflow::TensorShape({}));
 
         fillTensorWithDataByType(seed_tensor, tensorflow::DT_INT64, data, offset, size);
         fillTensorWithDataByType(seed2_tensor, tensorflow::DT_INT64, data, offset, size);
         fillTensorWithDataByType(reshuffle_tensor, tensorflow::DT_BOOL, data, offset, size);
 
-        std::cout << "Seed tensor shape: ";
-        for (int i = 0; i < seed_tensor.shape().dims(); ++i) {
-            std::cout << seed_tensor.shape().dim_size(i) << " ";
+        std::cout << "Seed tensor parsed dims: ";
+        for (auto dim : seed_shape) {
+            std::cout << dim << " ";
         }
         std::cout << std::endl;
 
-        std::cout << "Seed2 tensor shape: ";
-        for (int i = 0; i < seed2_tensor.shape().dims(); ++i) {
-            std::cout << seed2_tensor.shape().dim_size(i) << " ";
+        std::cout << "Seed2 tensor parsed dims: ";
+        for (auto dim : seed2_shape) {
+            std::cout << dim << " ";
         }
         std::cout << std::endl;
 
-        std::cout << "Reshuffle tensor shape: ";
-        for (int i = 0; i < reshuffle_tensor.shape().dims(); ++i) {
-            std::cout << reshuffle_tensor.shape().dim_size(i) << " ";
+        std::cout << "Reshuffle tensor parsed dims: ";
+        for (auto dim : reshuffle_shape) {
+            std::cout << dim << " ";
         }
         std::cout << std::endl;
 
-        auto seed_input = tensorflow::ops::Const(root, seed_tensor);
-        auto seed2_input = tensorflow::ops::Const(root, seed2_tensor);
-        auto reshuffle_input = tensorflow::ops::Const(root, reshuffle_tensor);
+        auto seed_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
+        auto seed2_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
+        auto reshuffle_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_BOOL);
 
-        // Use raw_ops directly since AnonymousSeedGenerator is not in tensorflow::ops namespace
-        auto anonymous_seed_gen = tensorflow::ops::internal::AnonymousSeedGenerator(
-            root.WithOpName("AnonymousSeedGenerator"), 
-            seed_input, seed2_input, reshuffle_input);
+        auto seed_node = tensorflow::ops::AsNodeOut(root, seed_placeholder);
+        auto seed2_node = tensorflow::ops::AsNodeOut(root, seed2_placeholder);
+        auto reshuffle_node = tensorflow::ops::AsNodeOut(root, reshuffle_placeholder);
+
+        tensorflow::Node* generator_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("AnonymousSeedGenerator"),
+                           "AnonymousSeedGenerator")
+                           .Input(seed_node)
+                           .Input(seed2_node)
+                           .Input(reshuffle_node);
+        root.UpdateStatus(builder.Finalize(root.graph(), &generator_node));
+        if (!root.ok() || generator_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output handle(generator_node, 0);
+        tensorflow::Output deleter(generator_node, 1);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({anonymous_seed_gen.handle, anonymous_seed_gen.deleter}, &outputs);
+        tensorflow::Status status = session.Run(
+            {{seed_placeholder, seed_tensor},
+             {seed2_placeholder, seed2_tensor},
+             {reshuffle_placeholder, reshuffle_tensor}},
+            {handle, deleter}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

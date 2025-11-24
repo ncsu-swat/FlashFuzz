@@ -1,11 +1,14 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/dataset_ops.h"
+#include "tensorflow/cc/ops/dataset_ops_internal.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/tensor_shape.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -231,55 +234,75 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::Tensor input_dataset_tensor(tensorflow::DT_VARIANT, tensorflow::TensorShape({}));
-        
+        int64_t start_val = 0;
+        int64_t stop_val = 5;
+        int64_t step_val = 1;
+
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&start_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+        }
+
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&stop_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+        }
+
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&step_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+        }
+
+        start_val = start_val % 5;
+        stop_val = start_val + (std::abs(stop_val) % 20) + 1;
+        step_val = (std::abs(step_val) % 5) + 1;
+
+        auto start_const = tensorflow::ops::Const(root, start_val);
+        auto stop_const = tensorflow::ops::Const(root, stop_val);
+        auto step_const = tensorflow::ops::Const(root, step_val);
+
+        std::vector<tensorflow::DataType> output_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape({})};
+
+        auto input_dataset = tensorflow::ops::internal::RangeDataset(
+            root.WithOpName("range_dataset"),
+            start_const,
+            stop_const,
+            step_const,
+            output_types,
+            output_shapes);
+
         if (offset >= size) return 0;
         uint8_t num_transformations = data[offset] % 5 + 1;
         offset++;
-        
+
         tensorflow::TensorShape transformations_shape({num_transformations});
         tensorflow::Tensor transformations_tensor(tensorflow::DT_STRING, transformations_shape);
         fillStringTensor(transformations_tensor, data, offset, size);
-        
-        if (offset >= size) return 0;
-        uint8_t num_output_types = data[offset] % 3 + 1;
-        offset++;
-        
-        std::vector<tensorflow::DataType> output_types;
-        for (uint8_t i = 0; i < num_output_types && offset < size; ++i) {
-            output_types.push_back(parseDataType(data[offset]));
-            offset++;
+
+        auto transformations_const =
+            tensorflow::ops::Const(root.WithOpName("transformations"), transformations_tensor);
+
+        tensorflow::Node* assert_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+            root.GetUniqueNameForOp("AssertNextDataset"),
+            "AssertNextDataset")
+            .Input(input_dataset.node())
+            .Input(transformations_const.node())
+            .Attr("output_types", output_types)
+            .Attr("output_shapes", output_shapes)
+            .Finalize(root.graph(), &assert_node);
+
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create AssertNextDataset node: " + status.ToString(), data, size);
+            return -1;
         }
-        
-        std::vector<tensorflow::PartialTensorShape> output_shapes;
-        for (uint8_t i = 0; i < num_output_types && offset < size; ++i) {
-            uint8_t rank = parseRank(data[offset]);
-            offset++;
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            output_shapes.push_back(tensorflow::PartialTensorShape(shape));
-        }
-        
-        auto input_dataset = tensorflow::ops::Placeholder(root, tensorflow::DT_VARIANT);
-        auto transformations = tensorflow::ops::Placeholder(root, tensorflow::DT_STRING);
-        
-        // Use raw_ops namespace for AssertNextDataset
-        auto assert_next_dataset_op = tensorflow::ops::internal::AssertNextDataset(
-            root.WithOpName("AssertNextDataset"),
-            input_dataset,
-            transformations,
-            output_types,
-            output_shapes
-        );
-        
+
         tensorflow::ClientSession session(root);
-        
+
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run(
-            {{input_dataset, input_dataset_tensor}, {transformations, transformations_tensor}},
-            {assert_next_dataset_op.output},
-            &outputs
-        );
-        
+        status = session.Run({tensorflow::Output(assert_node)}, &outputs);
+
         if (!status.ok()) {
             return -1;
         }

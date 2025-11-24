@@ -6,6 +6,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -170,7 +171,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
         // Convert output_types to a Tensor
         tensorflow::Tensor output_types_tensor(tensorflow::DT_INT32, {static_cast<int64_t>(output_types.size())});
-        auto output_types_flat = output_types_tensor.flat<int32>();
+        auto output_types_flat = output_types_tensor.flat<int32_t>();
         for (size_t i = 0; i < output_types.size(); ++i) {
             output_types_flat(i) = static_cast<int32_t>(output_types[i]);
         }
@@ -204,16 +205,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             }
         }
 
-        // Use raw ops to create AnonymousIteratorV3
-        auto anonymous_iterator_op = tensorflow::ops::_AnonymousIteratorV3(
-            root,
-            output_types,
-            output_shapes
-        );
+        tensorflow::Node* iterator_node = nullptr;
+        auto iterator_builder = tensorflow::NodeBuilder(
+                                    root.GetUniqueNameForOp("AnonymousIteratorV3"),
+                                    "AnonymousIteratorV3")
+                                    .Attr("output_types", output_types)
+                                    .Attr("output_shapes", output_shapes);
+        root.UpdateStatus(iterator_builder.Finalize(root.graph(), &iterator_node));
+        if (!root.ok() || iterator_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output iterator_handle(iterator_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({anonymous_iterator_op.handle}, &outputs);
+        tensorflow::Status status = session.Run({}, {iterator_handle}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

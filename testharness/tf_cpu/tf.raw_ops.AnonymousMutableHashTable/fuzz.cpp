@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/lookup_ops.h"
 #include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -21,74 +22,32 @@ namespace tf_fuzzer_utils {
     }
 }
 
-tensorflow::DataType parseDataType(uint8_t selector) {
-    tensorflow::DataType dtype; 
-    switch (selector % 21) {  
+tensorflow::DataType parseKeyDataType(uint8_t selector) {
+    switch (selector % 3) {
         case 0:
-            dtype = tensorflow::DT_FLOAT;
-            break;
+            return tensorflow::DT_INT64;
         case 1:
-            dtype = tensorflow::DT_DOUBLE;
-            break;
-        case 2:
-            dtype = tensorflow::DT_INT32;
-            break;
-        case 3:
-            dtype = tensorflow::DT_UINT8;
-            break;
-        case 4:
-            dtype = tensorflow::DT_INT16;
-            break;
-        case 5:
-            dtype = tensorflow::DT_INT8;
-            break;
-        case 6:
-            dtype = tensorflow::DT_STRING;
-            break;
-        case 7:
-            dtype = tensorflow::DT_COMPLEX64;
-            break;
-        case 8:
-            dtype = tensorflow::DT_INT64;
-            break;
-        case 9:
-            dtype = tensorflow::DT_BOOL;
-            break;
-        case 10:
-            dtype = tensorflow::DT_QINT8;
-            break;
-        case 11:
-            dtype = tensorflow::DT_QUINT8;
-            break;
-        case 12:
-            dtype = tensorflow::DT_QINT32;
-            break;
-        case 13:
-            dtype = tensorflow::DT_BFLOAT16;
-            break;
-        case 14:
-            dtype = tensorflow::DT_QINT16;
-            break;
-        case 15:
-            dtype = tensorflow::DT_QUINT16;
-            break;
-        case 16:
-            dtype = tensorflow::DT_UINT16;
-            break;
-        case 17:
-            dtype = tensorflow::DT_COMPLEX128;
-            break;
-        case 18:
-            dtype = tensorflow::DT_HALF;
-            break;
-        case 19:
-            dtype = tensorflow::DT_UINT32;
-            break;
-        case 20:
-            dtype = tensorflow::DT_UINT64;
-            break;
+            return tensorflow::DT_INT32;
+        default:
+            return tensorflow::DT_STRING;
     }
-    return dtype;
+}
+
+tensorflow::DataType parseValueDataType(uint8_t selector) {
+    switch (selector % 6) {
+        case 0:
+            return tensorflow::DT_DOUBLE;
+        case 1:
+            return tensorflow::DT_FLOAT;
+        case 2:
+            return tensorflow::DT_INT32;
+        case 3:
+            return tensorflow::DT_INT64;
+        case 4:
+            return tensorflow::DT_STRING;
+        default:
+            return tensorflow::DT_BOOL;
+    }
 }
 
 uint8_t parseRank(uint8_t byte) {
@@ -227,33 +186,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::DataType key_dtype = parseDataType(data[offset++]);
-        tensorflow::DataType value_dtype = parseDataType(data[offset++]);
+        tensorflow::DataType key_dtype = parseKeyDataType(data[offset++]);
+        tensorflow::DataType value_dtype = parseValueDataType(data[offset++]);
 
-        std::cout << "Key dtype: " << key_dtype << ", Value dtype: " << value_dtype << std::endl;
+        std::cout << "Key dtype: " << tensorflow::DataTypeString(key_dtype)
+                  << ", Value dtype: " << tensorflow::DataTypeString(value_dtype) << std::endl;
 
-        // Create the AnonymousMutableHashTable operation using raw_ops
-        auto hash_table = tensorflow::ops::LookupTableV2(
-            root, 
-            tensorflow::ops::Const(root, "AnonymousMutableHashTable"),  // container
-            tensorflow::ops::Const(root, ""),  // shared_name
-            key_dtype, 
-            value_dtype
-        );
+        tensorflow::Node* node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("AnonymousMutableHashTable"),
+                           "AnonymousMutableHashTable")
+                           .Attr("key_dtype", key_dtype)
+                           .Attr("value_dtype", value_dtype);
+        root.UpdateStatus(builder.Finalize(root.graph(), &node));
+        if (!root.ok() || node == nullptr) {
+            std::cout << "Failed to build AnonymousMutableHashTable node" << std::endl;
+            return -1;
+        }
 
-        std::cout << "Created AnonymousMutableHashTable operation" << std::endl;
+        tensorflow::Output table_handle(node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        
-        tensorflow::Status status = session.Run({hash_table}, &outputs);
+        tensorflow::Status status = session.Run({}, {table_handle}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;
         }
 
         if (!outputs.empty()) {
-            std::cout << "Hash table created successfully, resource handle shape: " 
+            std::cout << "Hash table created successfully, resource handle shape: "
                       << outputs[0].shape().DebugString() << std::endl;
         }
 

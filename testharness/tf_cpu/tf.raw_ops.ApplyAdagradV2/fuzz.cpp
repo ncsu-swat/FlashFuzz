@@ -4,6 +4,7 @@
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/training_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
 #include <cstring>
@@ -231,27 +232,52 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         bool use_locking = (offset < size) ? (data[offset++] % 2 == 1) : false;
         bool update_slots = (offset < size) ? (data[offset++] % 2 == 1) : true;
         
-        auto var_input = tensorflow::ops::Placeholder(root, dtype);
-        auto accum_input = tensorflow::ops::Placeholder(root, dtype);
-        auto lr_input = tensorflow::ops::Placeholder(root, dtype);
-        auto epsilon_input = tensorflow::ops::Placeholder(root, dtype);
-        auto grad_input = tensorflow::ops::Placeholder(root, dtype);
-        
-        auto apply_adagrad = tensorflow::ops::ResourceApplyAdagradV2(
-            root, var_input, accum_input, lr_input, epsilon_input, grad_input,
-            tensorflow::ops::ResourceApplyAdagradV2::UseLocking(use_locking)
-                .UpdateSlots(update_slots));
-        
+        auto var_op = tensorflow::ops::Variable(
+            root.WithOpName("var"), tensorflow::PartialTensorShape(var_shape), dtype);
+        auto accum_op = tensorflow::ops::Variable(
+            root.WithOpName("accum"), tensorflow::PartialTensorShape(var_shape), dtype);
+        auto var_assign = tensorflow::ops::Assign(root.WithOpName("var_assign"), var_op, var_tensor);
+        auto accum_assign = tensorflow::ops::Assign(root.WithOpName("accum_assign"), accum_op, accum_tensor);
+
+        auto lr_const = tensorflow::ops::Const(root.WithOpName("lr"), lr_tensor);
+        auto epsilon_const = tensorflow::ops::Const(root.WithOpName("epsilon"), epsilon_tensor);
+        auto grad_const = tensorflow::ops::Const(root.WithOpName("grad"), grad_tensor);
+
+        auto var_node = tensorflow::ops::AsNodeOut(root, var_op);
+        auto accum_node = tensorflow::ops::AsNodeOut(root, accum_op);
+        auto lr_node = tensorflow::ops::AsNodeOut(root, lr_const);
+        auto epsilon_node = tensorflow::ops::AsNodeOut(root, epsilon_const);
+        auto grad_node = tensorflow::ops::AsNodeOut(root, grad_const);
+
+        tensorflow::Node* apply_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("ApplyAdagradV2"),
+                           "ApplyAdagradV2")
+                           .Input(var_node)
+                           .Input(accum_node)
+                           .Input(lr_node)
+                           .Input(epsilon_node)
+                           .Input(grad_node)
+                           .Attr("T", dtype)
+                           .Attr("use_locking", use_locking)
+                           .Attr("update_slots", update_slots);
+        root.UpdateStatus(builder.Finalize(root.graph(), &apply_node));
+        if (!root.ok() || apply_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output apply_output(apply_node, 0);
+
         tensorflow::ClientSession session(root);
         
+        std::vector<tensorflow::Tensor> init_outputs;
+        tensorflow::Status init_status = session.Run({var_assign, accum_assign}, &init_outputs);
+        if (!init_status.ok()) {
+            return -1;
+        }
+
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({
-            {var_input, var_tensor},
-            {accum_input, accum_tensor},
-            {lr_input, lr_tensor},
-            {epsilon_input, epsilon_tensor},
-            {grad_input, grad_tensor}
-        }, {apply_adagrad}, &outputs);
+        tensorflow::Status status = session.Run({apply_output}, &outputs);
         
         if (!status.ok()) {
             return -1;

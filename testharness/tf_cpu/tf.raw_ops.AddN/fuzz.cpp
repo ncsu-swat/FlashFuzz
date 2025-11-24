@@ -10,6 +10,7 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
+#include <unordered_map>
 
 #define MAX_RANK 4
 #define MIN_RANK 0
@@ -248,15 +249,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
         
         // Convert vector<Output> to InputList
-        tensorflow::InputList inputs(input_placeholders.begin(), input_placeholders.end());
+        tensorflow::InputList inputs(input_placeholders);
         
         auto add_n_op = tensorflow::ops::AddN(root, inputs);
         
         tensorflow::ClientSession session(root);
         
-        std::vector<std::pair<std::string, tensorflow::Tensor>> feed_dict;
+        tensorflow::ClientSession::FeedType feed_dict;
         for (size_t i = 0; i < input_placeholders.size(); ++i) {
-            feed_dict.push_back({input_placeholders[i].node()->name(), input_tensors[i]});
+            feed_dict.insert({input_placeholders[i], input_tensors[i]});
         }
         
         std::vector<tensorflow::Tensor> outputs;

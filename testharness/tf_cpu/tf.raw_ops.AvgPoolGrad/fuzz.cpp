@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/nn_ops.h"
+#include "tensorflow/cc/ops/nn_ops_internal.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -149,27 +150,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             orig_input_flat(i) = static_cast<int32_t>(orig_input_shape_data[i]);
         }
         
-        std::vector<int64_t> grad_shape;
-        if (offset + 4 * sizeof(int32_t) <= size) {
-            for (int i = 0; i < 4; ++i) {
-                int32_t dim;
-                std::memcpy(&dim, data + offset, sizeof(int32_t));
-                offset += sizeof(int32_t);
-                dim = std::abs(dim) % 8 + 1;
-                grad_shape.push_back(static_cast<int64_t>(dim));
-            }
-        } else {
-            grad_shape = {1, 2, 2, 1};
-        }
-        
-        tensorflow::TensorShape grad_tensor_shape;
-        for (auto dim : grad_shape) {
-            grad_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::Tensor grad_tensor(grad_dtype, grad_tensor_shape);
-        fillTensorWithDataByType(grad_tensor, grad_dtype, data, offset, size);
-        
         std::vector<int> ksize;
         if (offset + 4 * sizeof(int32_t) <= size) {
             for (int i = 0; i < 4; ++i) {
@@ -200,50 +180,67 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::string data_format = (offset < size && data[offset++] % 2 == 0) ? "NHWC" : "NCHW";
         
         auto orig_input_shape_op = tensorflow::ops::Const(root, orig_input_shape_tensor);
-        auto grad_op = tensorflow::ops::Const(root, grad_tensor);
-        
-        // Use raw_ops namespace to access AvgPoolGrad
-        auto avg_pool_grad = tensorflow::ops::AvgPool(
-            root.WithOpName("AvgPool"),
-            grad_op,
+
+        // Compute an output shape compatible with the AvgPool forward op so the
+        // gradient tensor lines up with the expected output dimensions.
+        std::vector<int64_t> out_shape = {orig_input_shape_data[0], 1, 1, 1};
+        if (orig_input_shape_data.size() == 4) {
+            if (data_format == "NHWC") {
+                int64_t batch = orig_input_shape_data[0];
+                int64_t height = orig_input_shape_data[1];
+                int64_t width = orig_input_shape_data[2];
+                int64_t channels = orig_input_shape_data[3];
+
+                int64_t out_height, out_width;
+                if (padding == "VALID") {
+                    out_height = (height - ksize[1]) / strides[1] + 1;
+                    out_width = (width - ksize[2]) / strides[2] + 1;
+                } else {
+                    out_height = (height + strides[1] - 1) / strides[1];
+                    out_width = (width + strides[2] - 1) / strides[2];
+                }
+
+                if (out_height > 0 && out_width > 0) {
+                    out_shape = {batch, out_height, out_width, channels};
+                }
+            } else {
+                int64_t batch = orig_input_shape_data[0];
+                int64_t channels = orig_input_shape_data[1];
+                int64_t height = orig_input_shape_data[2];
+                int64_t width = orig_input_shape_data[3];
+
+                int64_t out_height, out_width;
+                if (padding == "VALID") {
+                    out_height = (height - ksize[2]) / strides[2] + 1;
+                    out_width = (width - ksize[3]) / strides[3] + 1;
+                } else {
+                    out_height = (height + strides[2] - 1) / strides[2];
+                    out_width = (width + strides[3] - 1) / strides[3];
+                }
+
+                if (out_height > 0 && out_width > 0) {
+                    out_shape = {batch, channels, out_height, out_width};
+                }
+            }
+        }
+
+        tensorflow::TensorShape grad_tensor_shape(out_shape);
+        tensorflow::Tensor grad_tensor_adjusted(grad_dtype, grad_tensor_shape);
+        fillTensorWithDataByType(grad_tensor_adjusted, grad_dtype, data, offset, size);
+        auto adjusted_grad_op = tensorflow::ops::Const(root, grad_tensor_adjusted);
+
+        auto avg_pool_grad = tensorflow::ops::internal::AvgPoolGrad(
+            root.WithOpName("AvgPoolGrad"),
+            orig_input_shape_op,
+            adjusted_grad_op,
             ksize,
             strides,
             padding,
-            data_format
-        );
-        
-        // Alternative approach using raw ops
-        tensorflow::NodeDef node_def;
-        node_def.set_name("AvgPoolGrad");
-        node_def.set_op("AvgPoolGrad");
-        
-        auto* attr_ksize = node_def.mutable_attr()->insert({"ksize", tensorflow::AttrValue()}).first->second.mutable_list();
-        for (auto k : ksize) {
-            attr_ksize->add_i(k);
-        }
-        
-        auto* attr_strides = node_def.mutable_attr()->insert({"strides", tensorflow::AttrValue()}).first->second.mutable_list();
-        for (auto s : strides) {
-            attr_strides->add_i(s);
-        }
-        
-        (*node_def.mutable_attr())["padding"].set_s(padding);
-        (*node_def.mutable_attr())["data_format"].set_s(data_format);
-        (*node_def.mutable_attr())["T"].set_type(grad_dtype);
-        
-        tensorflow::Status status;
-        auto op = root.AddNode(node_def, &status);
-        if (!status.ok()) {
-            return -1;
-        }
-        
-        auto avg_pool_grad_op = tensorflow::Output(op, 0);
-        root.UpdateEdge(orig_input_shape_op, 0, op, 0);
-        root.UpdateEdge(grad_op, 0, op, 1);
-        
+            tensorflow::ops::internal::AvgPoolGrad::Attrs().DataFormat(data_format));
+
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        status = session.Run({avg_pool_grad_op}, &outputs);
+        tensorflow::Status status = session.Run({avg_pool_grad}, &outputs);
         if (!status.ok()) {
             return -1;
         }

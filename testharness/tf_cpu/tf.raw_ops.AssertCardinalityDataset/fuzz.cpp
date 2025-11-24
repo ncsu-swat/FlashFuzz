@@ -1,11 +1,13 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/dataset_ops.h"
+#include "tensorflow/cc/ops/dataset_ops_internal.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/tensor_shape.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -226,68 +228,65 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::Tensor variant_tensor(tensorflow::DT_VARIANT, tensorflow::TensorShape({}));
-        
-        if (offset >= size) return 0;
-        int64_t cardinality_value;
+        int64_t start_val = 0;
+        int64_t stop_val = 5;
+        int64_t step_val = 1;
+
         if (offset + sizeof(int64_t) <= size) {
-            std::memcpy(&cardinality_value, data + offset, sizeof(int64_t));
+            std::memcpy(&start_val, data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
-        } else {
-            cardinality_value = 1;
-        }
-        cardinality_value = std::abs(cardinality_value) % 1000;
-        
-        tensorflow::Tensor cardinality_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
-        cardinality_tensor.scalar<int64_t>()() = cardinality_value;
-
-        if (offset >= size) return 0;
-        uint8_t num_output_types = (data[offset] % 3) + 1;
-        offset++;
-
-        std::vector<tensorflow::DataType> output_types;
-        std::vector<tensorflow::PartialTensorShape> output_shapes;
-
-        for (uint8_t i = 0; i < num_output_types; ++i) {
-            if (offset >= size) break;
-            
-            tensorflow::DataType dtype = parseDataType(data[offset]);
-            offset++;
-            output_types.push_back(dtype);
-
-            if (offset >= size) break;
-            uint8_t rank = parseRank(data[offset]);
-            offset++;
-            
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            output_shapes.push_back(tensorflow::PartialTensorShape(shape));
         }
 
-        if (output_types.empty()) {
-            output_types.push_back(tensorflow::DT_FLOAT);
-            output_shapes.push_back(tensorflow::PartialTensorShape({1}));
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&stop_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
         }
 
-        auto input_dataset_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_VARIANT);
-        auto cardinality_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&step_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+        }
 
-        // Use raw_ops namespace for AssertCardinalityDataset
-        auto assert_cardinality_dataset = tensorflow::ops::_AssertCardinalityDataset(
-            root, 
-            input_dataset_placeholder, 
-            cardinality_placeholder,
+        start_val = start_val % 5;
+        stop_val = start_val + (std::abs(stop_val) % 20) + 1;
+        step_val = (std::abs(step_val) % 5) + 1;
+
+        auto start_const = tensorflow::ops::Const(root, start_val);
+        auto stop_const = tensorflow::ops::Const(root, stop_val);
+        auto step_const = tensorflow::ops::Const(root, step_val);
+
+        std::vector<tensorflow::DataType> output_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape({})};
+
+        auto range_dataset = tensorflow::ops::internal::RangeDataset(
+            root.WithOpName("range_dataset"),
+            start_const,
+            stop_const,
+            step_const,
             output_types,
-            output_shapes
-        );
+            output_shapes);
+
+        int64_t cardinality_value = (stop_val - start_val + step_val - 1) / step_val;
+        auto cardinality_const = tensorflow::ops::Const(root, cardinality_value);
+
+        tensorflow::Node* assert_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+            root.GetUniqueNameForOp("AssertCardinalityDataset"),
+            "AssertCardinalityDataset")
+            .Input(range_dataset.node())
+            .Input(cardinality_const.node())
+            .Attr("output_types", output_types)
+            .Attr("output_shapes", output_shapes)
+            .Finalize(root.graph(), &assert_node);
+
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create AssertCardinalityDataset node: " + status.ToString(), data, size);
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
-        
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run(
-            {{input_dataset_placeholder, variant_tensor}, {cardinality_placeholder, cardinality_tensor}},
-            {assert_cardinality_dataset},
-            &outputs
-        );
+        status = session.Run({tensorflow::Output(assert_node)}, &outputs);
 
         if (!status.ok()) {
             return -1;

@@ -274,7 +274,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({assert_op}, &outputs);
+        std::vector<tensorflow::Output> fetch_outputs;
+        std::vector<tensorflow::Operation> run_outputs = {assert_op.operation};
+        tensorflow::Status status = session.Run({}, fetch_outputs, run_outputs, &outputs);
         
         if (!status.ok()) {
             return -1;

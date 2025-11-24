@@ -7,6 +7,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -131,6 +132,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         if (offset >= size) return 0;
         tensorflow::DataType dtype = parseDataType(data[offset++]);
 
@@ -149,8 +151,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         fillTensorWithDataByType(input_tensor, dtype, data, offset, size);
 
         auto input_placeholder = tensorflow::ops::Placeholder(root, dtype);
-
-        auto batch_matrix_determinant = tensorflow::ops::MatrixDeterminant(root, input_placeholder);
+        auto input_node = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        tensorflow::Node* determinant_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("BatchMatrixDeterminant"),
+                           "BatchMatrixDeterminant")
+                           .Input(input_node);
+        root.UpdateStatus(builder.Finalize(root.graph(), &determinant_node));
+        if (!root.ok() || determinant_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_matrix_determinant(determinant_node, 0);
 
         tensorflow::ClientSession session(root);
 

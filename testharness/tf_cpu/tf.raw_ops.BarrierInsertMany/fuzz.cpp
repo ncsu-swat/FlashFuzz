@@ -236,11 +236,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        std::vector<tensorflow::DataType> component_types = {tensorflow::DT_STRING};
+        if (offset >= size) return 0;
+        tensorflow::DataType values_dtype = parseDataType(data[offset++]);
+        std::vector<tensorflow::DataType> component_types = {values_dtype};
         auto barrier_handle = tensorflow::ops::Barrier(root, component_types);
         
         if (offset >= size) return 0;
         uint8_t keys_rank = parseRank(data[offset++]);
+        if (keys_rank < 1) keys_rank = 1;
         std::vector<int64_t> keys_shape = parseShape(data, offset, size, keys_rank);
         
         tensorflow::Tensor keys_tensor(tensorflow::DT_STRING, tensorflow::TensorShape(keys_shape));
@@ -248,10 +251,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto keys = tensorflow::ops::Const(root, keys_tensor);
         
         if (offset >= size) return 0;
-        tensorflow::DataType values_dtype = parseDataType(data[offset++]);
-        
-        if (offset >= size) return 0;
         uint8_t values_rank = parseRank(data[offset++]);
+        if (values_rank < 1) values_rank = 1;
         std::vector<int64_t> values_shape = parseShape(data, offset, size, values_rank);
         
         if (values_shape.empty()) {
@@ -264,15 +265,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         fillTensorWithDataByType(values_tensor, values_dtype, data, offset, size);
         auto values = tensorflow::ops::Const(root, values_tensor);
         
-        if (offset >= size) return 0;
-        int32_t component_index = static_cast<int32_t>(data[offset++] % 5);
+        int32_t component_index = 0;
+        if (offset < size) {
+            component_index = static_cast<int32_t>(data[offset++] % component_types.size());
+        }
         
         auto barrier_insert_many = tensorflow::ops::BarrierInsertMany(
             root, barrier_handle.handle, keys, values, component_index);
         
         tensorflow::ClientSession session(root);
-        std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({barrier_insert_many}, &outputs);
+        std::vector<tensorflow::Operation> ops_to_run = {barrier_insert_many.operation};
+        tensorflow::Status status = session.Run({}, {}, ops_to_run, nullptr);
         
         if (!status.ok()) {
             return -1;

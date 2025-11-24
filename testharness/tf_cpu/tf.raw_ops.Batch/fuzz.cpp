@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/errors.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -204,81 +205,43 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             input_tensors.push_back(placeholder);
         }
 
-        // Create the Batch operation using raw_ops
         std::vector<tensorflow::DataType> in_types(num_tensors, dtype);
-        
-        tensorflow::NodeDef batch_node_def;
-        batch_node_def.set_name("Batch");
-        batch_node_def.set_op("Batch");
-        
-        // Add inputs to the node def
+        std::vector<tensorflow::NodeBuilder::NodeOut> input_nodes;
+        input_nodes.reserve(input_tensors.size());
         for (const auto& input : input_tensors) {
-            batch_node_def.add_input(input.name());
+            input_nodes.push_back(tensorflow::ops::AsNodeOut(root, input));
         }
+
+        tensorflow::Node* batch_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("Batch"), "Batch")
+                           .Input(input_nodes)
+                           .Attr("num_batch_threads", num_batch_threads)
+                           .Attr("max_batch_size", max_batch_size)
+                           .Attr("batch_timeout_micros", static_cast<int64_t>(batch_timeout_micros))
+                           .Attr("grad_timeout_micros", static_cast<int64_t>(grad_timeout_micros))
+                           .Attr("T", in_types);
+        root.UpdateStatus(builder.Finalize(root.graph(), &batch_node));
         
-        // Add attributes to the node def
-        auto* attr_map = batch_node_def.mutable_attr();
-        
-        tensorflow::AttrValue num_batch_threads_attr;
-        num_batch_threads_attr.set_i(num_batch_threads);
-        (*attr_map)["num_batch_threads"] = num_batch_threads_attr;
-        
-        tensorflow::AttrValue max_batch_size_attr;
-        max_batch_size_attr.set_i(max_batch_size);
-        (*attr_map)["max_batch_size"] = max_batch_size_attr;
-        
-        tensorflow::AttrValue batch_timeout_micros_attr;
-        batch_timeout_micros_attr.set_i(static_cast<int64_t>(batch_timeout_micros));
-        (*attr_map)["batch_timeout_micros"] = batch_timeout_micros_attr;
-        
-        tensorflow::AttrValue grad_timeout_micros_attr;
-        grad_timeout_micros_attr.set_i(static_cast<int64_t>(grad_timeout_micros));
-        (*attr_map)["grad_timeout_micros"] = grad_timeout_micros_attr;
-        
-        tensorflow::AttrValue allowed_batch_sizes_attr;
-        (*attr_map)["allowed_batch_sizes"] = allowed_batch_sizes_attr;
-        
-        tensorflow::AttrValue container_attr;
-        container_attr.set_s("");
-        (*attr_map)["container"] = container_attr;
-        
-        tensorflow::AttrValue shared_name_attr;
-        shared_name_attr.set_s("");
-        (*attr_map)["shared_name"] = shared_name_attr;
-        
-        tensorflow::AttrValue T_attr;
-        T_attr.set_type(dtype);
-        (*attr_map)["T"] = T_attr;
-        
-        tensorflow::AttrValue in_types_attr;
-        for (const auto& t : in_types) {
-            in_types_attr.mutable_list()->add_type(t);
-        }
-        (*attr_map)["in_types"] = in_types_attr;
-        
-        // Create the operation
-        tensorflow::Status status;
-        auto batch_op = root.AddNode(batch_node_def, &status);
-        
-        if (!status.ok()) {
+        if (!root.ok() || batch_node == nullptr) {
             return -1;
         }
         
         // Get the outputs
         std::vector<tensorflow::Output> batched_tensors;
         for (int i = 0; i < num_tensors; ++i) {
-            batched_tensors.push_back(tensorflow::Output(batch_op, i));
+            batched_tensors.push_back(tensorflow::Output(batch_node, i));
         }
-        auto batch_index = tensorflow::Output(batch_op, num_tensors);
-        auto id = tensorflow::Output(batch_op, num_tensors + 1);
+        auto batch_index = tensorflow::Output(batch_node, num_tensors);
+        auto id = tensorflow::Output(batch_node, num_tensors + 1);
 
         tensorflow::ClientSession session(root);
+        tensorflow::Status status;
         
-        std::vector<std::pair<std::string, tensorflow::Tensor>> feed_dict;
+        tensorflow::ClientSession::FeedType feed_dict;
         for (int i = 0; i < num_tensors; ++i) {
             tensorflow::Tensor tensor(dtype, tensorflow::TensorShape(shape));
             fillTensorWithDataByType(tensor, dtype, data, offset, size);
-            feed_dict.push_back({input_tensors[i].node()->name(), tensor});
+            feed_dict.emplace(input_tensors[i], tensor);
         }
 
         std::vector<tensorflow::Tensor> outputs;

@@ -6,6 +6,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -179,19 +180,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::string data_format = "NHWC";
         std::vector<int> dilations = {1, 1, 1, 1};
 
-        auto conv2d_backprop_filter = tensorflow::ops::Conv2DBackpropFilter(
-            root,
-            input_placeholder,
-            tensorflow::ops::Shape(root, filter_placeholder),
-            out_backprop_placeholder,
-            strides,
-            padding,
-            tensorflow::ops::Conv2DBackpropFilter::Attrs()
-                .UseCudnnOnGpu(use_cudnn_on_gpu)
-                .ExplicitPaddings(explicit_paddings)
-                .DataFormat(data_format)
-                .Dilations(dilations)
-        );
+        auto input_node = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        auto filter_node = tensorflow::ops::AsNodeOut(root, filter_placeholder);
+        auto out_backprop_node = tensorflow::ops::AsNodeOut(root, out_backprop_placeholder);
+
+        tensorflow::Node* conv_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("Conv2DBackpropFilterV2"),
+                           "Conv2DBackpropFilterV2")
+                           .Input(input_node)
+                           .Input(filter_node)
+                           .Input(out_backprop_node)
+                           .Attr("strides", strides)
+                           .Attr("use_cudnn_on_gpu", use_cudnn_on_gpu)
+                           .Attr("padding", padding)
+                           .Attr("explicit_paddings", explicit_paddings)
+                           .Attr("data_format", data_format)
+                           .Attr("dilations", dilations);
+        root.UpdateStatus(builder.Finalize(root.graph(), &conv_node));
+        if (!root.ok() || conv_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output conv2d_backprop_filter(conv_node, 0);
 
         tensorflow::ClientSession session(root);
         

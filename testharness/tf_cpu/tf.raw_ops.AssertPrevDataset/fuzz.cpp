@@ -1,11 +1,13 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/dataset_ops.h"
+#include "tensorflow/cc/ops/dataset_ops_internal.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -232,75 +234,75 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::Tensor variant_tensor(tensorflow::DT_VARIANT, tensorflow::TensorShape({}));
-        
-        uint8_t num_transformations = (data[offset] % 5) + 1;
-        offset++;
-        
-        std::vector<std::string> transformation_strings;
-        for (uint8_t i = 0; i < num_transformations; ++i) {
-            if (offset < size) {
-                uint8_t str_len = (data[offset] % 20) + 1;
-                offset++;
-                
-                std::string trans_str = "transformation_";
-                for (uint8_t j = 0; j < str_len && offset < size; ++j) {
-                    trans_str += static_cast<char>((data[offset] % 26) + 'a');
-                    offset++;
-                }
-                transformation_strings.push_back(trans_str);
-            } else {
-                transformation_strings.push_back("default_transformation");
-            }
+        int64_t start_val = 0;
+        int64_t stop_val = 5;
+        int64_t step_val = 1;
+
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&start_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
         }
-        
-        tensorflow::Tensor transformations_tensor(tensorflow::DT_STRING, 
-                                                 tensorflow::TensorShape({static_cast<int64_t>(transformation_strings.size())}));
-        auto trans_flat = transformations_tensor.flat<tensorflow::tstring>();
-        for (size_t i = 0; i < transformation_strings.size(); ++i) {
-            trans_flat(i) = tensorflow::tstring(transformation_strings[i]);
+
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&stop_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
         }
-        
-        uint8_t num_output_types = (data[offset % size] % 3) + 1;
-        offset++;
-        
-        std::vector<tensorflow::DataType> output_types;
-        std::vector<tensorflow::PartialTensorShape> output_shapes;
-        
-        for (uint8_t i = 0; i < num_output_types; ++i) {
-            tensorflow::DataType dtype = parseDataType(data[offset % size]);
-            output_types.push_back(dtype);
-            offset++;
-            
-            uint8_t rank = parseRank(data[offset % size]);
-            offset++;
-            
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            output_shapes.push_back(tensorflow::PartialTensorShape(shape));
+
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&step_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
         }
-        
-        auto input_dataset = tensorflow::ops::Placeholder(root, tensorflow::DT_VARIANT);
-        auto transformations = tensorflow::ops::Placeholder(root, tensorflow::DT_STRING);
-        
-        // Use raw_ops approach instead of ops::AssertPrevDataset
-        auto assert_prev_dataset = tensorflow::ops::internal::AssertPrevDataset(
-            root.WithOpName("AssertPrevDataset"),
-            input_dataset,
-            transformations,
+
+        start_val = start_val % 5;
+        stop_val = start_val + (std::abs(stop_val) % 20) + 1;
+        step_val = (std::abs(step_val) % 5) + 1;
+
+        auto start_const = tensorflow::ops::Const(root, start_val);
+        auto stop_const = tensorflow::ops::Const(root, stop_val);
+        auto step_const = tensorflow::ops::Const(root, step_val);
+
+        std::vector<tensorflow::DataType> output_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape({})};
+
+        auto input_dataset = tensorflow::ops::internal::RangeDataset(
+            root.WithOpName("range_dataset"),
+            start_const,
+            stop_const,
+            step_const,
             output_types,
-            output_shapes
-        );
+            output_shapes);
+
+        if (offset >= size) return 0;
+        uint8_t num_transformations = data[offset] % 5 + 1;
+        offset++;
+
+        tensorflow::TensorShape transformations_shape({num_transformations});
+        tensorflow::Tensor transformations_tensor(tensorflow::DT_STRING, transformations_shape);
+        fillStringTensor(transformations_tensor, data, offset, size);
+
+        auto transformations_const =
+            tensorflow::ops::Const(root.WithOpName("transformations"), transformations_tensor);
+
+        tensorflow::Node* assert_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+            root.GetUniqueNameForOp("AssertPrevDataset"),
+            "AssertPrevDataset")
+            .Input(input_dataset.node())
+            .Input(transformations_const.node())
+            .Attr("output_types", output_types)
+            .Attr("output_shapes", output_shapes)
+            .Finalize(root.graph(), &assert_node);
+
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create AssertPrevDataset node: " + status.ToString(), data, size);
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
-        
-        std::vector<std::pair<std::string, tensorflow::Tensor>> feed_dict = {
-            {input_dataset.node()->name(), variant_tensor},
-            {transformations.node()->name(), transformations_tensor}
-        };
-        
+
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run(feed_dict, {assert_prev_dataset}, &outputs);
-        
+        status = session.Run({tensorflow::Output(assert_node)}, &outputs);
+
         if (!status.ok()) {
             return -1;
         }

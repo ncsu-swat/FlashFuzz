@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -199,18 +200,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             if (max_outputs > 10) max_outputs = 3;
         }
         
-        // Use raw_ops.AudioSummary instead of ops::AudioSummary
-        auto audio_summary = tensorflow::ops::internal::AudioSummary(
-            root,
-            tag_input,
-            tensor_input,
-            sample_rate,
-            tensorflow::ops::internal::AudioSummary::Attrs().MaxOutputs(max_outputs)
-        );
+        auto tag_node = tensorflow::ops::AsNodeOut(root, tag_input);
+        auto tensor_node = tensorflow::ops::AsNodeOut(root, tensor_input);
+        tensorflow::Node* audio_summary_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("AudioSummary"),
+                           "AudioSummary")
+                           .Input(tag_node)
+                           .Input(tensor_node)
+                           .Attr("sample_rate", sample_rate)
+                           .Attr("max_outputs", max_outputs);
+        root.UpdateStatus(builder.Finalize(root.graph(), &audio_summary_node));
+        if (!root.ok() || audio_summary_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output audio_summary(audio_summary_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({audio_summary.summary}, &outputs);
+        tensorflow::Status status = session.Run({}, {audio_summary}, &outputs);
         if (!status.ok()) {
             return -1;
         }

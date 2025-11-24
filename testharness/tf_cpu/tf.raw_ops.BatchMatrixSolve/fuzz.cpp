@@ -1,11 +1,13 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
+#include "tensorflow/cc/ops/array_ops.h"
 #include "tensorflow/cc/ops/linalg_ops.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -112,6 +114,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         tensorflow::DataType dtype = parseDataType(data[offset++]);
         
         uint8_t matrix_rank = parseRank(data[offset++]);
@@ -150,18 +153,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         bool adjoint = (offset < size) ? (data[offset++] % 2 == 1) : false;
         
-        auto matrix_input = tensorflow::ops::Const(root, matrix_tensor);
-        auto rhs_input = tensorflow::ops::Const(root, rhs_tensor);
-        
-        auto batch_matrix_solve = tensorflow::ops::MatrixSolve(
-            root, matrix_input, rhs_input,
-            tensorflow::ops::MatrixSolve::Adjoint(adjoint)
-        );
+        auto matrix_placeholder = tensorflow::ops::Placeholder(root, dtype);
+        auto rhs_placeholder = tensorflow::ops::Placeholder(root, dtype);
+        auto matrix_node_out = tensorflow::ops::AsNodeOut(root, matrix_placeholder);
+        auto rhs_node_out = tensorflow::ops::AsNodeOut(root, rhs_placeholder);
+        tensorflow::Node* batch_matrix_solve_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchMatrixSolve"), "BatchMatrixSolve")
+                           .Input(matrix_node_out)
+                           .Input(rhs_node_out)
+                           .Attr("adjoint", adjoint);
+        root.UpdateStatus(builder.Finalize(root.graph(), &batch_matrix_solve_node));
+        if (!root.ok() || batch_matrix_solve_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_matrix_solve(batch_matrix_solve_node, 0);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({batch_matrix_solve}, &outputs);
+        tensorflow::Status status = session.Run(
+            {{matrix_placeholder, matrix_tensor}, {rhs_placeholder, rhs_tensor}},
+            {batch_matrix_solve},
+            &outputs);
         if (!status.ok()) {
             return -1;
         }

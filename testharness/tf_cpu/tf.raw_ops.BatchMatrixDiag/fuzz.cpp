@@ -195,6 +195,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         tensorflow::DataType dtype = parseDataType(data[offset++]);
         
         uint8_t rank = parseRank(data[offset++]);
@@ -220,14 +221,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         fillTensorWithDataByType(diagonal_tensor, dtype, data, offset, size);
 
-        auto diagonal_input = tensorflow::ops::Const(root, diagonal_tensor);
-
-        auto batch_matrix_diag = tensorflow::ops::MatrixDiag(root, diagonal_input);
+        auto diagonal_placeholder = tensorflow::ops::Placeholder(root, dtype);
+        auto diagonal_node = tensorflow::ops::AsNodeOut(root, diagonal_placeholder);
+        tensorflow::Node* batch_diag_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchMatrixDiag"), "BatchMatrixDiag")
+                           .Input(diagonal_node);
+        root.UpdateStatus(builder.Finalize(root.graph(), &batch_diag_node));
+        if (!root.ok() || batch_diag_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_matrix_diag(batch_diag_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({batch_matrix_diag}, &outputs);
+        tensorflow::Status status = session.Run({{diagonal_placeholder, diagonal_tensor}}, {batch_matrix_diag}, &outputs);
         if (!status.ok()) {
             return -1;
         }

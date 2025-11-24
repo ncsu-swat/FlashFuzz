@@ -193,15 +193,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         auto true_classes = tensorflow::ops::Const(root, true_classes_tensor);
         
+        auto sampler_attrs =
+            tensorflow::ops::AllCandidateSampler::Attrs()
+                .Seed(static_cast<tensorflow::int64>(seed))
+                .Seed2(static_cast<tensorflow::int64>(seed2));
         auto all_candidate_sampler = tensorflow::ops::AllCandidateSampler(
-            root, 
+            root,
             true_classes,
             num_true,
             num_sampled,
             unique,
-            seed,
-            seed2
-        );
+            sampler_attrs);
         
         tensorflow::ClientSession session(root);
         

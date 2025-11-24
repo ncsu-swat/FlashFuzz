@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/training_ops.h"
@@ -269,22 +270,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto epsilon_const = tensorflow::ops::Const(root.WithOpName("epsilon"), epsilon_tensor);
         auto grad_const = tensorflow::ops::Const(root.WithOpName("grad"), grad_tensor);
 
-        tensorflow::ops::ApplyAdamaxOptions options;
-        options.use_locking_ = use_locking;
-        
-        auto apply_adamax = tensorflow::ops::ApplyAdamax(
-            root.WithOpName("apply_adamax"),
-            var_input,
-            m_input,
-            v_input,
-            beta1_power_const,
-            lr_const,
-            beta1_const,
-            beta2_const,
-            epsilon_const,
-            grad_const,
-            options
-        );
+        auto var_node = tensorflow::ops::AsNodeOut(root, var_input);
+        auto m_node = tensorflow::ops::AsNodeOut(root, m_input);
+        auto v_node = tensorflow::ops::AsNodeOut(root, v_input);
+        auto beta1_power_node = tensorflow::ops::AsNodeOut(root, beta1_power_const);
+        auto lr_node = tensorflow::ops::AsNodeOut(root, lr_const);
+        auto beta1_node = tensorflow::ops::AsNodeOut(root, beta1_const);
+        auto beta2_node = tensorflow::ops::AsNodeOut(root, beta2_const);
+        auto epsilon_node = tensorflow::ops::AsNodeOut(root, epsilon_const);
+        auto grad_node = tensorflow::ops::AsNodeOut(root, grad_const);
+
+        tensorflow::Node* apply_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("ApplyAdaMax"),
+                           "ApplyAdaMax")
+                           .Input(var_node)
+                           .Input(m_node)
+                           .Input(v_node)
+                           .Input(beta1_power_node)
+                           .Input(lr_node)
+                           .Input(beta1_node)
+                           .Input(beta2_node)
+                           .Input(epsilon_node)
+                           .Input(grad_node)
+                           .Attr("T", dtype)
+                           .Attr("use_locking", use_locking);
+        root.UpdateStatus(builder.Finalize(root.graph(), &apply_node));
+        if (!root.ok() || apply_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output apply_output(apply_node, 0);
 
         tensorflow::ClientSession session(root);
         
@@ -295,7 +310,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
 
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({apply_adamax}, &outputs);
+        tensorflow::Status status = session.Run({apply_output}, &outputs);
         if (!status.ok()) {
             return -1;
         }

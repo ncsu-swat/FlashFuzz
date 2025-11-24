@@ -136,15 +136,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::Tensor tensor_grad(dtype, tensor_shape_grad);
         fillTensorWithDataByType(tensor_grad, dtype, data, offset, size);
 
-        auto l_input = tensorflow::ops::Const(root, tensor_l);
-        auto grad_input = tensorflow::ops::Const(root, tensor_grad);
+        auto l_placeholder = tensorflow::ops::Placeholder(root, dtype);
+        auto grad_placeholder = tensorflow::ops::Placeholder(root, dtype);
 
-        // Use raw_ops namespace to access BatchCholeskyGrad
-        auto batch_cholesky_grad = tensorflow::ops::BatchCholeskyGrad(root, l_input, grad_input);
+        auto l_node_out = tensorflow::ops::AsNodeOut(root, l_placeholder);
+        auto grad_node_out = tensorflow::ops::AsNodeOut(root, grad_placeholder);
+
+        // Build the deprecated BatchCholeskyGrad op directly so the harness hits the raw op keyword.
+        tensorflow::Node* batch_cholesky_grad_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchCholeskyGrad"), "BatchCholeskyGrad")
+                           .Input(l_node_out)
+                           .Input(grad_node_out);
+        root.UpdateStatus(builder.Finalize(root.graph(), &batch_cholesky_grad_node));
+        if (!root.ok() || batch_cholesky_grad_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_cholesky_grad(batch_cholesky_grad_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({batch_cholesky_grad}, &outputs);
+        tensorflow::Status status = session.Run({{l_placeholder, tensor_l}, {grad_placeholder, tensor_grad}}, 
+                                               {batch_cholesky_grad}, &outputs);
         
         if (!status.ok()) {
             return -1;

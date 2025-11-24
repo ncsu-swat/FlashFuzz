@@ -172,6 +172,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         tensorflow::DataType dtype = parseDataType(data[offset++]);
         
         uint8_t input_rank = parseRank(data[offset++]);
@@ -199,9 +200,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         auto input_placeholder = tensorflow::ops::Placeholder(root, dtype);
         auto diag_placeholder = tensorflow::ops::Placeholder(root, dtype);
-        
-        auto batch_matrix_set_diag = tensorflow::ops::MatrixSetDiag(
-            root, input_placeholder, diag_placeholder);
+        auto input_node_out = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        auto diag_node_out = tensorflow::ops::AsNodeOut(root, diag_placeholder);
+        tensorflow::Node* batch_matrix_set_diag_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("BatchMatrixSetDiag"), "BatchMatrixSetDiag")
+                           .Input(input_node_out)
+                           .Input(diag_node_out)
+                           .Attr("T", dtype);
+        root.UpdateStatus(builder.Finalize(root.graph(), &batch_matrix_set_diag_node));
+        if (!root.ok() || batch_matrix_set_diag_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_matrix_set_diag(batch_matrix_set_diag_node, 0);
         
         tensorflow::ClientSession session(root);
         

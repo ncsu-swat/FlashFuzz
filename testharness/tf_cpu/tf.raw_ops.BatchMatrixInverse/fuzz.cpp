@@ -8,6 +8,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -118,6 +119,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
+
         tensorflow::DataType dtype = parseDataType(data[offset++]);
         
         uint8_t rank = parseRank(data[offset++]);
@@ -135,19 +137,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
         
         auto input_placeholder = tensorflow::ops::Placeholder(root, dtype);
-        
-        tensorflow::ops::MatrixInverse::Attrs attrs;
-        attrs = attrs.Adjoint(adjoint);
-        
-        auto matrix_inverse_op = tensorflow::ops::MatrixInverse(
-            root, input_placeholder, attrs);
+        auto input_node_out = tensorflow::ops::AsNodeOut(root, input_placeholder);
+        tensorflow::Node* inverse_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchMatrixInverse"), "BatchMatrixInverse")
+                           .Input(input_node_out)
+                           .Attr("adjoint", adjoint);
+        root.UpdateStatus(builder.Finalize(root.graph(), &inverse_node));
+        if (!root.ok() || inverse_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output batch_matrix_inverse_op(inverse_node, 0);
         
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
         tensorflow::Status status = session.Run(
             {{input_placeholder, input_tensor}},
-            {matrix_inverse_op},
+            {batch_matrix_inverse_op},
             &outputs);
             
         if (!status.ok()) {

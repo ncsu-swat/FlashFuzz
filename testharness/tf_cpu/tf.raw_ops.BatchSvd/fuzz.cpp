@@ -7,6 +7,7 @@
 #include "tensorflow/cc/ops/linalg_ops.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -151,6 +152,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         fillTensorWithDataByType(input_tensor, dtype, data, offset, size);
 
         auto input_placeholder = tensorflow::ops::Placeholder(root, dtype);
+        auto input_node = tensorflow::ops::AsNodeOut(root, input_placeholder);
         
         bool compute_uv = true;
         bool full_matrices = false;
@@ -162,18 +164,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             full_matrices = (data[offset++] % 2) == 1;
         }
 
-        auto svd_op = tensorflow::ops::Svd(
-            root, 
-            input_placeholder,
-            tensorflow::ops::Svd::ComputeUv(compute_uv).FullMatrices(full_matrices)
-        );
+        tensorflow::Node* batch_svd_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BatchSvd"), "BatchSvd")
+                           .Input(input_node)
+                           .Attr("compute_uv", compute_uv)
+                           .Attr("full_matrices", full_matrices);
+        root.UpdateStatus(builder.Finalize(root.graph(), &batch_svd_node));
+        if (!root.ok() || batch_svd_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output s_output(batch_svd_node, 0);
+        tensorflow::Output u_output(batch_svd_node, 1);
+        tensorflow::Output v_output(batch_svd_node, 2);
 
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
         tensorflow::Status status = session.Run(
             {{input_placeholder, input_tensor}},
-            {svd_op.s, svd_op.u, svd_op.v},
+            {s_output, u_output, v_output},
             &outputs
         );
         

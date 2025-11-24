@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -150,7 +151,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::DataType tensor_dtype = tensorflow::DT_FLOAT;
         uint8_t tensor_rank = parseRank(data[offset % size]);
         offset++;
-        if (tensor_rank < 2) tensor_rank = 2;
+        if (tensor_rank < 3) tensor_rank = 3;
         if (tensor_rank > 3) tensor_rank = 3;
         
         std::vector<int64_t> tensor_shape = parseShape(data, offset, size, tensor_rank);
@@ -187,9 +188,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto tensor_input = tensorflow::ops::Const(root, tensor_tensor);
         auto sample_rate_input = tensorflow::ops::Const(root, sample_rate_tensor);
 
-        // Use raw_ops.AudioSummaryV2 instead of ops::AudioSummaryV2
-        auto audio_summary = tensorflow::ops::internal::AudioSummaryV2(
-            root, tag_input, tensor_input, sample_rate_input, max_outputs);
+        auto tag_node = tensorflow::ops::AsNodeOut(root, tag_input);
+        auto tensor_node = tensorflow::ops::AsNodeOut(root, tensor_input);
+        auto sample_rate_node = tensorflow::ops::AsNodeOut(root, sample_rate_input);
+        tensorflow::Node* audio_summary_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("AudioSummaryV2"), "AudioSummaryV2")
+                           .Input(tag_node)
+                           .Input(tensor_node)
+                           .Input(sample_rate_node)
+                           .Attr("max_outputs", max_outputs);
+        root.UpdateStatus(builder.Finalize(root.graph(), &audio_summary_node));
+        if (!root.ok() || audio_summary_node == nullptr) {
+            return -1;
+        }
+        tensorflow::Output audio_summary(audio_summary_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
