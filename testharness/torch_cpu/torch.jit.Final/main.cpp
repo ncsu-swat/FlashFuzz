@@ -2,7 +2,7 @@
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
 #include <sstream>        // For serialization stream
-#include <ATen/core/tensor_type.h> // For TensorType::create
+#include <ATen/core/jit_type.h> // For TensorType::create
 #include <torch/script.h>
 
 // --- Fuzzer Entry Point ---

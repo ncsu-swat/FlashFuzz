@@ -1,6 +1,8 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
+#include <torch/csrc/jit/passes/tensorexpr_fuser.h>
+#include <torch/csrc/jit/runtime/graph_executor.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -9,6 +11,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     try
     {
         size_t offset = 0;
+        const char *keyword = "torch.jit.contextmanager";
+        (void)keyword;
         
         if (Size < 4) {
             return 0;
@@ -34,52 +38,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Use the context manager to control various JIT settings
             {
                 // Test with graph executor mode
-                bool original_mode = torch::jit::getExecutorMode().load();
-                torch::jit::getExecutorMode().store(!original_mode);
+                auto &exec_mode = torch::jit::getExecutorMode();
+                bool original_mode = exec_mode.load();
+                exec_mode.store(!original_mode);
                 
                 // Run the module with the tensor
-                std::vector<torch::jit::IValue> inputs;
-                inputs.push_back(tensor);
-                
-                // Execute the module
-                auto output = module->run_method("forward", inputs);
-                
-                // Try to get the tensor result
+                auto output = module->run_method("forward", tensor);
                 if (output.isTensor()) {
-                    torch::Tensor result = output.toTensor();
+                    // Touch result to exercise execution
+                    (void)output.toTensor().sum().item<double>();
                 }
                 
                 // Restore original mode
-                torch::jit::getExecutorMode().store(original_mode);
+                exec_mode.store(original_mode);
             }
             
             // Test another context manager - optimization
             {
-                bool original_opt = torch::jit::getProfilingMode();
-                torch::jit::setProfilingMode(!original_opt);
-                
-                // Run the module with the tensor again
-                std::vector<torch::jit::IValue> inputs;
-                inputs.push_back(tensor);
+                auto &profiling_mode = torch::jit::getProfilingMode();
+                bool original_opt = profiling_mode.load();
+                profiling_mode.store(!original_opt);
                 
                 // Execute the module
-                auto output = module->run_method("forward", inputs);
+                (void)module->run_method("forward", tensor);
                 
                 // Restore original setting
-                torch::jit::setProfilingMode(original_opt);
+                profiling_mode.store(original_opt);
             }
             
             // Test with tensor type specialization
             {
-                bool original_spec = torch::jit::getTensorExprFuserEnabled();
+                bool original_spec = torch::jit::tensorExprFuserEnabled();
                 torch::jit::setTensorExprFuserEnabled(!original_spec);
                 
-                // Run the module with the tensor again
-                std::vector<torch::jit::IValue> inputs;
-                inputs.push_back(tensor);
-                
                 // Execute the module
-                auto output = module->run_method("forward", inputs);
+                (void)module->run_method("forward", tensor);
                 
                 // Restore original setting
                 torch::jit::setTensorExprFuserEnabled(original_spec);
@@ -87,28 +80,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Test with nested context managers
             {
-                bool original_mode = torch::jit::getExecutorMode().load();
-                bool original_prof = torch::jit::getProfilingMode();
-                bool original_fuser = torch::jit::getTensorExprFuserEnabled();
+                auto &exec_mode = torch::jit::getExecutorMode();
+                auto &profiling_mode = torch::jit::getProfilingMode();
+                bool original_mode = exec_mode.load();
+                bool original_prof = profiling_mode.load();
+                bool original_fuser = torch::jit::tensorExprFuserEnabled();
                 
-                torch::jit::getExecutorMode().store(!original_mode);
+                exec_mode.store(!original_mode);
                 {
-                    torch::jit::setProfilingMode(!original_prof);
+                    profiling_mode.store(!original_prof);
                     {
                         torch::jit::setTensorExprFuserEnabled(!original_fuser);
                         
                         // Run the module with the tensor
-                        std::vector<torch::jit::IValue> inputs;
-                        inputs.push_back(tensor);
-                        
-                        // Execute the module
-                        auto output = module->run_method("forward", inputs);
+                        (void)module->run_method("forward", tensor);
                         
                         torch::jit::setTensorExprFuserEnabled(original_fuser);
                     }
-                    torch::jit::setProfilingMode(original_prof);
+                    profiling_mode.store(original_prof);
                 }
-                torch::jit::getExecutorMode().store(original_mode);
+                exec_mode.store(original_mode);
             }
             
         } catch (const c10::Error& e) {

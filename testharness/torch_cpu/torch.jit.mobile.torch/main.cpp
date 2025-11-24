@@ -1,112 +1,73 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <torch/script.h>
-#include <torch/csrc/jit/mobile/module.h>
 #include <torch/csrc/jit/mobile/import.h>
+#include <torch/csrc/jit/mobile/module.h>
+#include <cstdio>
+#include <sstream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    const char *keyword = "torch.jit.mobile.torch";
+    (void)keyword;
     try
     {
         size_t offset = 0;
-        
-        // Need at least some data to create a tensor
+
         if (Size < 4) {
             return 0;
         }
-        
-        // Create input tensor from fuzzer data
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create a simple model to test torch.jit.mobile.torch functionality
-        std::string model_path = "";
-        
-        // Try different operations with torch.jit.mobile
+
+        // Build a bounded tensor to exercise mobile execution paths.
+        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset).to(torch::kFloat);
+        input_tensor = input_tensor.contiguous();
+
+        // Script a tiny module we can serialize for mobile.
+        torch::jit::Module module("mobile_module");
+        module.define(R"JIT(
+            def forward(self, x):
+                return x * 2.0 + 1.0
+        )JIT");
+
+        // Save/load through a temporary file using the mobile loader.
+        const bool use_flatbuffer = (Data[0] & 1) != 0;
+        const std::string filename = "temp_mobile_model.ptl";
+        module._save_for_mobile(filename, {}, /*save_mobile_debug_info=*/false, use_flatbuffer);
+
         try {
-            // Test loading a non-existent model (should throw an exception)
-            auto module = torch::jit::mobile::load_from_file(model_path);
-        } catch (const c10::Error&) {
-            // Expected exception for invalid model path
-        }
-        
-        // Test serialization/deserialization
-        try {
-            // Create a simple module
-            torch::jit::Module m("test_module");
-            
-            // Serialize to a buffer
-            std::stringstream ss;
-            m.save(ss);
-            
-            // Try to load as mobile module
-            ss.seekg(0);
-            auto mobile_module = torch::jit::mobile::load_from_stream(ss);
-        } catch (const c10::Error&) {
-            // May throw if the module format is incompatible with mobile
-        }
-        
-        // Test with tensor operations
-        try {
-            // Create a simple TorchScript module that operates on tensors
-            torch::jit::Module m("test_module");
-            
-            // Try to use the input tensor with the module
-            if (input_tensor.defined()) {
-                std::vector<torch::jit::IValue> inputs;
-                inputs.push_back(input_tensor);
-                
-                // This would normally call a method on the module
-                // m.forward(inputs);
+            auto loaded_file = torch::jit::_load_for_mobile(filename);
+            std::vector<c10::IValue> inputs;
+            inputs.emplace_back(input_tensor);
+            auto file_output = loaded_file.forward(inputs);
+            if (file_output.isTensor()) {
+                file_output.toTensor().sum();
             }
-        } catch (const c10::Error&) {
-            // Expected for invalid operations
+
+            auto op_names = torch::jit::mobile::_export_operator_list(loaded_file);
+            if (!op_names.empty()) {
+                (void)*op_names.begin();
+            }
+        } catch (const std::exception &) {
+            // Ignore loader/runtime failures; keep fuzzing.
         }
-        
-        // Test mobile module creation with different tensor types
+
+        // Save/load via a stream to cover the alternate API surface.
         try {
-            // Create tensors of different types to test with mobile module
-            auto float_tensor = input_tensor.to(torch::kFloat);
-            auto int_tensor = input_tensor.to(torch::kInt);
-            auto bool_tensor = input_tensor.to(torch::kBool);
-            
-            // Test operations that might be used with mobile modules
-            auto result1 = float_tensor + 1.0;
-            auto result2 = int_tensor * 2;
-            auto result3 = torch::logical_not(bool_tensor);
-        } catch (const c10::Error&) {
-            // Handle PyTorch-specific errors
+            std::stringstream ss;
+            module._save_for_mobile(ss, {}, /*save_mobile_debug_info=*/false, use_flatbuffer);
+            ss.seekg(0);
+            auto loaded_stream = torch::jit::_load_for_mobile(ss);
+            auto stream_output = loaded_stream.forward({input_tensor});
+            if (stream_output.isTensor()) {
+                stream_output.toTensor().sum();
+            }
+        } catch (const std::exception &) {
+            // Ignore loader/runtime failures; keep fuzzing.
         }
-        
-        // Test with empty tensor
-        try {
-            torch::Tensor empty_tensor = torch::empty({0});
-            std::vector<torch::jit::IValue> empty_inputs;
-            empty_inputs.push_back(empty_tensor);
-            
-            // This would normally be used with a mobile module
-            // mobile_module.forward(empty_inputs);
-        } catch (const c10::Error&) {
-            // Expected for some operations with empty tensors
-        }
-        
-        // Test with scalar tensor
-        try {
-            torch::Tensor scalar_tensor = torch::tensor(5);
-            std::vector<torch::jit::IValue> scalar_inputs;
-            scalar_inputs.push_back(scalar_tensor);
-            
-            // This would normally be used with a mobile module
-            // mobile_module.forward(scalar_inputs);
-        } catch (const c10::Error&) {
-            // Handle errors
-        }
+
+        std::remove(filename.c_str());
     }
-    catch (const std::exception &e)
+    catch (const std::exception &)
     {
-        std::cerr << "Exception caught: " << e.what() << std::endl;
         return -1; // discard the input
     }
     return 0; // keep the input

@@ -65,7 +65,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test isinstance with list
         if (offset < Size) {
-            std::vector<torch::jit::IValue> list_val;
+            c10::impl::GenericList list_val(c10::AnyType::get());
             size_t list_size = Data[offset++] % 5; // Create a list with 0-4 elements
             
             for (size_t i = 0; i < list_size && offset < Size; i++) {
@@ -127,7 +127,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto complex_compilation_unit = torch::jit::compile(complex_script);
             
             // Create a list of tensors
-            std::vector<torch::jit::IValue> tensor_list;
+            c10::impl::GenericList tensor_list(c10::AnyType::get());
             size_t list_size = Data[offset++] % 3 + 1; // 1-3 tensors
             
             for (size_t i = 0; i < list_size && offset < Size; i++) {

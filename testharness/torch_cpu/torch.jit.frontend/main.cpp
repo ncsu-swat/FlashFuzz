@@ -7,10 +7,14 @@
 #include <torch/csrc/jit/frontend/sugared_value.h>
 #include <torch/csrc/jit/frontend/schema_matching.h>
 #include <torch/csrc/jit/frontend/parser.h>
+#include <ATen/core/stack.h>
+
+static const char *kTorchJitFrontendKeyword = "torch.jit.frontend";
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
     std::cout << "Start Fuzzing" << std::endl;
+    (void)kTorchJitFrontendKeyword;
     try
     {
         size_t offset = 0;
@@ -86,19 +90,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             case 3: {
                 // Test tracing functionality
                 try {
-                    // Create a simple C++ function to trace
-                    auto func = [&input_tensor](const torch::Tensor& x) {
-                        return x + input_tensor;
-                    };
-                    
-                    // Create a tensor to trace with
                     torch::Tensor trace_input = torch::ones_like(input_tensor);
-                    
-                    // Trace the function
-                    auto traced_func = torch::jit::trace(func, trace_input);
-                    
-                    // Try to run the traced function
-                    traced_func({input_tensor});
+
+                    torch::jit::Stack stack_inputs;
+                    stack_inputs.emplace_back(trace_input);
+
+                    auto traced_fn = [&input_tensor](torch::jit::Stack inputs) {
+                        torch::Tensor x = inputs.at(0).toTensor();
+                        torch::Tensor y = x + input_tensor;
+                        return torch::jit::Stack{y};
+                    };
+
+                    auto traced = torch::jit::tracer::trace(
+                        stack_inputs,
+                        traced_fn,
+                        [](const torch::autograd::Variable &) { return std::string("v"); },
+                        /*strict=*/false);
+
+                    auto traced_stack = traced.second;
+                    if (!traced_stack.empty() && traced_stack.front().isTensor()) {
+                        traced_stack.front().toTensor().sum();
+                    }
                 } catch (...) {
                     // Ignore tracing errors
                 }

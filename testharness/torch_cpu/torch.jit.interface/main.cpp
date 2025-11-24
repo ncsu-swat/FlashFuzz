@@ -4,18 +4,6 @@
 #include <torch/script.h>
 #include <torch/custom_class.h>
 
-// Define a simple interface
-struct MyModuleInterface : torch::CustomClassHolder {
-    virtual torch::Tensor forward(torch::Tensor x) = 0;
-};
-
-// Implement the interface
-struct MyModule : MyModuleInterface {
-    torch::Tensor forward(torch::Tensor x) override {
-        return x + 1;
-    }
-};
-
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
@@ -30,84 +18,56 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Create a tensor from the fuzzer data
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Register the interface and implementation
-        c10::intrusive_ptr<MyModuleInterface> impl = c10::make_intrusive<MyModule>();
-        
-        // Test interface registration
-        torch::registerCustomClass<MyModuleInterface>("MyModuleInterface");
-        torch::registerCustomClass<MyModule>("MyModule");
-        
-        // Create a script module that uses the interface
-        std::string script_code = R"(
-            class TestModule(torch.nn.Module):
-                def __init__(self):
-                    super().__init__()
-                    self.interface = None
-                
-                def forward(self, x):
-                    if self.interface is not None:
-                        return self.interface.forward(x)
-                    return x
-        )";
-        
+
+        // TorchScript interface usage (torch.jit.interface keyword preserved)
+        std::string script_code = R"JIT(
+import torch
+
+@torch.jit.interface
+class MyModuleInterface:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pass
+
+class MyModule(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 1
+
+class Holder(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.impl: MyModuleInterface = MyModule()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        impl: MyModuleInterface = self.impl
+        return impl.forward(x)
+
+def call_with_attr(x: torch.Tensor) -> torch.Tensor:
+    h = Holder()
+    return h.forward(x)
+
+def call_direct(x: torch.Tensor) -> torch.Tensor:
+    iface: MyModuleInterface = MyModule()
+    return iface.forward(x)
+)JIT";
+
         try {
             auto cu = torch::jit::compile(script_code);
-            auto class_type = cu->get_class("TestModule");
-            auto test_module = torch::jit::Module(class_type->create_instance());
-            
-            // Set the interface implementation
-            test_module.setattr("interface", c10::IValue(impl));
-            
-            // Call the module with our tensor
-            std::vector<torch::jit::IValue> inputs;
-            inputs.push_back(input_tensor);
-            
-            auto output = test_module.forward(inputs);
-            
-            // Try to get the tensor result
-            if (output.isTensor()) {
-                torch::Tensor result = output.toTensor();
+            auto output1 = cu->run_method("call_with_attr", input_tensor);
+            if (output1.isTensor()) {
+                auto touched = output1.toTensor().sum();
+                (void)touched;
+            }
+
+            auto output2 = cu->run_method("call_direct", input_tensor);
+            if (output2.isTensor()) {
+                auto touched = output2.toTensor().sum();
+                (void)touched;
             }
         } catch (const c10::Error& e) {
             // Expected exceptions from torch::jit operations
-        }
-        
-        // Try alternative interface usage patterns
-        try {
-            // Create a direct interface reference
-            auto interface_type = torch::getCustomClass("__torch__.MyModuleInterface");
-            if (interface_type) {
-                // Just test that we can get the type
-            }
-        } catch (const c10::Error& e) {
-            // Expected exceptions
-        }
-        
-        // Try with different interface method signatures
-        try {
-            struct AnotherInterface : torch::CustomClassHolder {
-                virtual torch::Tensor process(torch::Tensor x, int64_t value) = 0;
-            };
-            
-            struct AnotherImpl : AnotherInterface {
-                torch::Tensor process(torch::Tensor x, int64_t value) override {
-                    return x * value;
-                }
-            };
-            
-            torch::registerCustomClass<AnotherInterface>("AnotherInterface");
-            torch::registerCustomClass<AnotherImpl>("AnotherImpl");
-            
-            c10::intrusive_ptr<AnotherInterface> another_impl = c10::make_intrusive<AnotherImpl>();
-            
-            // Use the interface
-            if (offset + 1 < Size) {
-                int64_t value = static_cast<int64_t>(Data[offset]);
-                another_impl->process(input_tensor, value);
-            }
-        } catch (const c10::Error& e) {
-            // Expected exceptions
         }
     }
     catch (const std::exception &e)

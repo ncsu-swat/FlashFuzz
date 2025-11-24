@@ -1,6 +1,7 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
+#include <torch/csrc/jit/serialization/export.h>
 #include <torch/script.h>
 
 // --- Fuzzer Entry Point ---
@@ -41,25 +42,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         module.forward(inputs);
         
         // Test export_opnames with different parameters
-        if (Size > 1) {
-            bool include_overloads = Data[offset % Size] % 2 == 0;
-            offset = (offset + 1) % Size;
-            
-            // Call export_opnames with the parameter from fuzzer data
-            auto op_names = torch::jit::export_opnames(module._ivalue(), include_overloads);
-            
-            // Verify the result is not empty
-            if (op_names.empty()) {
-                throw std::runtime_error("export_opnames returned empty list");
-            }
-        } else {
-            // Call export_opnames with default parameters
-            auto op_names = torch::jit::export_opnames(module._ivalue());
-            
-            // Verify the result is not empty
-            if (op_names.empty()) {
-                throw std::runtime_error("export_opnames returned empty list");
-            }
+        // Call export_opnames with the scripted module
+        auto op_names = torch::jit::export_opnames(module);
+        
+        // Verify the result is not empty
+        if (op_names.empty()) {
+            throw std::runtime_error("export_opnames returned empty list");
         }
         
         // Try with a more complex module if we have enough data
@@ -82,14 +70,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Run the module to ensure operations are recorded
             complex_module.forward(inputs);
             
-            // Test export_opnames with different parameters
-            bool include_overloads = Data[offset % Size] % 2 == 0;
-            auto op_names = torch::jit::export_opnames(complex_module._ivalue(), include_overloads);
+            // Test export_opnames with the complex module
+            auto op_names = torch::jit::export_opnames(complex_module);
         }
         
         // Test with an empty module
         torch::jit::Module empty_module("empty_module");
-        auto empty_op_names = torch::jit::export_opnames(empty_module._ivalue());
+        auto empty_op_names = torch::jit::export_opnames(empty_module);
     }
     catch (const std::exception &e)
     {

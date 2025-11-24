@@ -118,7 +118,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     }
                     
                     // Reset to original state
-                    torch::backends::cudnn::set_deterministic(cuda_deterministic);
+                    at::globalContext().setDeterministicCuDNN(cuda_deterministic);
                 }
             }
         }
