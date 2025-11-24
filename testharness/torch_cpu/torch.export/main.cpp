@@ -2,6 +2,7 @@
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
 #include <torch/torch.h>
+#include <torch/csrc/autograd/variable.h>
 #include <torch/csrc/jit/api/module.h>
 #include <torch/csrc/jit/frontend/tracer.h>
 
@@ -22,6 +23,7 @@ private:
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
+    // torch.export harness: exercise export-like tracing paths.
     std::cout << "Start Fuzzing" << std::endl;
     try
     {
@@ -42,6 +44,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a sample input for tracing
         std::vector<torch::jit::IValue> example_inputs;
         example_inputs.push_back(input_tensor);
+
+        auto trace_once = [&](bool force_outplace) {
+            torch::jit::Stack input_stack(example_inputs.begin(), example_inputs.end());
+            auto traced = torch::jit::tracer::trace(
+                std::move(input_stack),
+                [&model](torch::jit::Stack inputs) -> torch::jit::Stack {
+                    torch::jit::Stack outputs;
+                    if (!inputs.empty() && inputs[0].isTensor()) {
+                        torch::Tensor x = inputs[0].toTensor();
+                        outputs.push_back(model.forward(x));
+                    }
+                    return outputs;
+                },
+                [](const torch::autograd::Variable &) { return std::string(); },
+                /*strict=*/true,
+                /*force_outplace=*/force_outplace,
+                /*self=*/nullptr,
+                {});
+
+            torch::jit::Stack traced_outputs = std::get<1>(traced);
+            if (!traced_outputs.empty() && traced_outputs[0].isTensor()) {
+                traced_outputs[0].toTensor().sum();
+            }
+        };
         
         // Try different export options based on remaining data
         if (offset < Size) {
@@ -50,29 +76,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             try {
                 if (export_option == 0) {
                     // Basic export
-                    torch::jit::Module exported_module = torch::jit::tracer::trace(model, example_inputs);
+                    trace_once(false);
                 } else if (export_option == 1) {
                     // Export with optimization
-                    torch::jit::Module exported_module = torch::jit::tracer::trace(model, example_inputs);
-                    exported_module = torch::jit::optimize_for_inference(exported_module);
+                    trace_once(true);
                 } else {
-                    // Export with custom attributes
-                    torch::jit::Module exported_module = torch::jit::tracer::trace(model, example_inputs);
-                    
-                    // Try to add custom attributes if we have more data
+                    trace_once(false);
+
+                    // Try to tweak module state if we have more data
                     if (offset < Size) {
                         uint8_t attr_type = Data[offset++] % 4;
                         
                         if (attr_type == 0) {
-                            exported_module.setattr("int_attr", torch::tensor(static_cast<int64_t>(Data[offset % Size])));
+                            model.register_buffer("int_attr", torch::tensor(static_cast<int64_t>(Data[offset % Size])));
                         } else if (attr_type == 1) {
-                            exported_module.setattr("float_attr", torch::tensor(static_cast<float>(Data[offset % Size]) / 255.0f));
+                            model.register_buffer("float_attr", torch::tensor(static_cast<float>(Data[offset % Size]) / 255.0f));
                         } else if (attr_type == 2) {
-                            exported_module.setattr("bool_attr", torch::tensor(Data[offset % Size] > 127));
+                            model.register_buffer("bool_attr", torch::tensor(Data[offset % Size] > 127));
                         } else {
                             // Create a small tensor attribute
                             torch::Tensor attr_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                            exported_module.setattr("tensor_attr", attr_tensor);
+                            model.register_buffer("tensor_attr", attr_tensor);
                         }
                     }
                 }
@@ -82,7 +106,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         } else {
             // Basic export if no more data
-            torch::jit::Module exported_module = torch::jit::tracer::trace(model, example_inputs);
+            trace_once(false);
         }
     }
     catch (const std::exception &e)

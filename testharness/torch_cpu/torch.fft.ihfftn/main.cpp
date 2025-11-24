@@ -1,5 +1,10 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
+#include <algorithm>      // For std::max
+#include <cmath>          // For std::abs
+#include <cstring>        // For std::memcpy
 #include <iostream>       // For cerr
+#include <optional>       // For std::optional
+#include <string_view>    // For std::string_view
 #include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
@@ -19,7 +24,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Parse n_dims parameter if we have more data
-        c10::optional<c10::IntArrayRef> dim = c10::nullopt;
         std::vector<int64_t> dim_vec;
         if (offset + 1 < Size) {
             uint8_t n_dims_count = Data[offset++] % 5; // Get up to 4 dimensions
@@ -35,10 +39,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     dim_vec.push_back(i + 1);
                 }
             }
-            if (!dim_vec.empty()) {
-                dim = c10::IntArrayRef(dim_vec);
+        }
+        int64_t input_rank = input_tensor.dim();
+        for (auto &d : dim_vec) {
+            if (input_rank > 0) {
+                int64_t wrapped = d % input_rank;
+                if (wrapped < 0) {
+                    wrapped += input_rank;
+                }
+                d = wrapped;
+            } else {
+                d = 0;
             }
         }
+        std::vector<int64_t> default_dim;
+        if (input_rank >= 2) {
+            default_dim = {-2, -1};
+        } else if (input_rank == 1) {
+            default_dim = {0};
+        }
+        c10::IntArrayRef dim_ref = !dim_vec.empty() ? c10::IntArrayRef(dim_vec) : c10::IntArrayRef(default_dim);
         
         // Parse s parameter if we have more data
         c10::optional<c10::IntArrayRef> s = c10::nullopt;
@@ -58,12 +78,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 }
             }
             if (!s_vec.empty()) {
+                for (auto &val : s_vec) {
+                    val = std::max<int64_t>(1, static_cast<int64_t>(std::abs(val) % 16) + 1);
+                }
                 s = c10::IntArrayRef(s_vec);
             }
         }
         
         // Parse norm parameter if we have more data
-        c10::optional<c10::string_view> norm = c10::nullopt;
+        std::optional<std::string_view> norm = std::nullopt;
         if (offset < Size) {
             uint8_t norm_selector = Data[offset++];
             if (norm_selector % 3 == 0) {
@@ -88,24 +111,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     result = torch::fft::ihfftn(input_tensor);
                     break;
                 case 1:
-                    // Input tensor and dim
-                    if (dim.has_value()) {
-                        result = torch::fft::ihfftn(input_tensor, dim.value());
-                    } else {
-                        result = torch::fft::ihfftn(input_tensor);
-                    }
+                    // Input tensor with optional shape and dims
+                    result = torch::fft::ihfftn(input_tensor, s, dim_ref);
                     break;
                 case 2:
                     // Input tensor, dim, and norm
-                    if (dim.has_value()) {
-                        result = torch::fft::ihfftn(input_tensor, dim.value(), s, norm);
-                    } else {
-                        result = torch::fft::ihfftn(input_tensor, c10::nullopt, s, norm);
-                    }
+                    result = torch::fft::ihfftn(input_tensor, s, dim_ref, norm);
                     break;
                 case 3:
                     // All parameters
-                    result = torch::fft::ihfftn(input_tensor, dim, s, norm);
+                    result = torch::fft::ihfftn(input_tensor, c10::nullopt, dim_ref, norm);
                     break;
             }
         } else {

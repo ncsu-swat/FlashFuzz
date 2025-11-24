@@ -27,7 +27,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         )";
         
         auto compilation_unit = torch::jit::compile(script_code);
-        auto module_func = compilation_unit->get_function("forward");
+        auto &module_func = compilation_unit->get_function("forward");
         
         // Create inputs for the module
         std::vector<torch::jit::IValue> inputs;
@@ -66,7 +66,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             )";
             
             auto list_compilation_unit = torch::jit::compile(list_script);
-            auto list_module_func = list_compilation_unit->get_function("forward");
+            auto &list_module_func = list_compilation_unit->get_function("forward");
             
             // Create a list input
             torch::jit::IValue list_input = torch::jit::IValue(tensor_list);
@@ -86,7 +86,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 )";
                 
                 auto nested_compilation_unit = torch::jit::compile(nested_script);
-                auto nested_module_func = nested_compilation_unit->get_function("forward");
+                auto &nested_module_func = nested_compilation_unit->get_function("forward");
                 torch::jit::IValue nested_output = nested_module_func({list_input});
             }
         }
@@ -110,7 +110,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 )";
                 
                 auto dict_compilation_unit = torch::jit::compile(dict_script);
-                auto dict_module_func = dict_compilation_unit->get_function("forward");
+                auto &dict_module_func = dict_compilation_unit->get_function("forward");
                 torch::jit::IValue dict_input = torch::jit::IValue(tensor_dict);
                 torch::jit::IValue dict_output = dict_module_func({dict_input});
             } catch (const std::exception&) {

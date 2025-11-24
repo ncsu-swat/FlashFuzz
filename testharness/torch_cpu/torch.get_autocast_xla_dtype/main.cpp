@@ -1,7 +1,7 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <torch/csrc/autocast_mode.h>
+#include <ATen/autocast_mode.h>
+#include <iostream> // For cerr
+#include <tuple>    // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -17,11 +17,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Parse a boolean flag for whether autocast is enabled
-        bool enabled = Data[offset++] & 0x1;
-        
-        // Try to get the autocast XLA dtype
-        torch::ScalarType dtype = torch::autocast::get_autocast_xla_dtype(enabled);
-        
+        bool enabled = (Data[offset++] & 0x1) != 0;
+
+        // Toggle XLA autocast and query its dtype
+        at::autocast::set_autocast_enabled(at::kXLA, enabled);
+        torch::ScalarType dtype = at::autocast::get_autocast_xla_dtype();
+
         // Verify the result is a valid dtype
         if (dtype != torch::kFloat && dtype != torch::kBFloat16) {
             // This is not expected behavior, so we'll keep the input
@@ -34,7 +35,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
             // Get the autocast XLA dtype again
-            dtype = torch::autocast::get_autocast_xla_dtype(enabled);
+            dtype = at::autocast::get_autocast_xla_dtype();
             
             // Try to cast the tensor to the autocast dtype
             torch::Tensor casted_tensor = tensor.to(dtype);

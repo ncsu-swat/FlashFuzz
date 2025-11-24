@@ -87,23 +87,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             try {
                 // Get the function
-                torch::jit::Function* method = cu.get_function(func_to_call);
+                torch::jit::Function& method = cu.get_function(func_to_call);
                 
-                if (method) {
-                    // Create a list of inputs for the function
-                    std::vector<torch::jit::IValue> inputs;
-                    inputs.push_back(input_tensor);
+                // Create a list of inputs for the function
+                std::vector<torch::jit::IValue> inputs;
+                inputs.push_back(input_tensor);
+                
+                // Call the function
+                auto output = method(inputs);
+                
+                // Try to extract the tensor from the output
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
                     
-                    // Call the function
-                    auto output = (*method)(inputs);
-                    
-                    // Try to extract the tensor from the output
-                    if (output.isTensor()) {
-                        torch::Tensor result = output.toTensor();
-                        
-                        // Perform some operation on the result to ensure it's used
-                        auto sum = result.sum();
-                    }
+                    // Perform some operation on the result to ensure it's used
+                    auto sum = result.sum();
                 }
             } catch (...) {
                 // Function call might fail, continue testing
@@ -130,7 +128,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Try to get a non-existent function
         if (offset < Size && Data[offset++] % 2 == 0) {
             try {
-                torch::jit::Function* non_existent = cu.get_function("non_existent_function");
+                torch::jit::Function& non_existent = cu.get_function("non_existent_function");
             } catch (...) {
                 // Expected to fail, continue testing
             }

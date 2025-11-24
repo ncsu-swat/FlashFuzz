@@ -71,6 +71,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Resize by creating a new tensor
             torch::Tensor resized_tensor = torch::empty({new_size}, torch::kByte);
             storage = resized_tensor.storage();
+            storage_size = storage.nbytes();
         }
         
         // 5. Test storage fill by creating tensor and filling it
@@ -109,7 +110,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // 9. Test storage to CPU (create tensor on CPU)
-        torch::Tensor cpu_tensor = torch::from_blob(storage.data(), {storage_size}, torch::kByte).cpu();
+        torch::Tensor cpu_tensor = torch::from_blob(storage.mutable_data(), {storage_size}, torch::kByte).cpu();
         torch::Storage cpu_storage = cpu_tensor.storage();
         
         // 10. Test storage data pointer access
@@ -126,8 +127,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor dtype_tensor = torch::from_blob(storage.mutable_data(), {storage_size}, torch::kByte);
         torch::ScalarType dtype = dtype_tensor.dtype().toScalarType();
         
-        // 14. Test storage is_pinned
-        bool is_pinned = storage.is_pinned();
     }
     catch (const std::exception &e)
     {

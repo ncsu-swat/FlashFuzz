@@ -6,6 +6,15 @@
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
     std::cout << "Start Fuzzing" << std::endl;
+    const char *target_api = "torch.is_deterministic_algorithms_warn_only_enabled";
+    (void)target_api;
+
+    const bool initial_det = at::globalContext().deterministicAlgorithms();
+    const bool initial_warn = at::globalContext().deterministicAlgorithmsWarnOnly();
+    auto restoreState = [&]() {
+        at::globalContext().setDeterministicAlgorithms(initial_det, initial_warn);
+    };
+
     try
     {
         size_t offset = 0;
@@ -17,7 +26,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Set the deterministic algorithms warn-only mode
-        at::globalContext().setDeterministicAlgorithmsWarnOnly(enable_warn_only);
+        at::globalContext().setDeterministicAlgorithms(initial_det, enable_warn_only);
         
         // Check if the warn-only mode is enabled
         bool is_warn_only_enabled = at::globalContext().deterministicAlgorithmsWarnOnly();
@@ -32,7 +41,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
             // Enable deterministic algorithms
-            at::globalContext().setDeterministicAlgorithms(true);
+            at::globalContext().setDeterministicAlgorithms(true, enable_warn_only);
             
             // Perform an operation that requires deterministic algorithms
             // This will either warn or error depending on warn_only setting
@@ -47,22 +56,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             
             // Reset deterministic mode to avoid affecting other tests
-            at::globalContext().setDeterministicAlgorithms(false);
+            restoreState();
         }
         
         // Toggle the warn-only mode again to test the transition
         if (offset < Size) {
             enable_warn_only = !enable_warn_only;
-            at::globalContext().setDeterministicAlgorithmsWarnOnly(enable_warn_only);
+            at::globalContext().setDeterministicAlgorithms(initial_det, enable_warn_only);
             bool new_warn_only_enabled = at::globalContext().deterministicAlgorithmsWarnOnly();
             
             if (new_warn_only_enabled != enable_warn_only) {
                 throw std::runtime_error("Failed to toggle deterministic algorithms warn-only mode");
             }
         }
+
+        restoreState();
     }
     catch (const std::exception &e)
     {
+        restoreState();
         std::cerr << "Exception caught: " << e.what() << std::endl;
         return -1; // discard the input
     }

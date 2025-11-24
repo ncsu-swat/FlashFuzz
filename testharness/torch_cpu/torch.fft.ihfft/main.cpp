@@ -56,7 +56,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         } else {
             // For 0-dim tensors, just apply ihfft without dimension
-            result = torch::fft::ihfft(input, c10::nullopt, c10::nullopt, norm);
+            result = torch::fft::ihfft(input, c10::nullopt, -1, norm);
         }
         
         // Try with n parameter (length of transformed axis)
@@ -76,7 +76,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     result = torch::fft::ihfft(input, c10::optional<int64_t>(n), -1, norm);
                 }
             } else {
-                result = torch::fft::ihfft(input, c10::optional<int64_t>(n), c10::nullopt, norm);
+                result = torch::fft::ihfft(input, c10::optional<int64_t>(n), -1, norm);
             }
         }
     }

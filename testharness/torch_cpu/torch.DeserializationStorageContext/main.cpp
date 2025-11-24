@@ -2,6 +2,9 @@
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
 #include <sstream>        // For stringstream
+#include <algorithm>      // For std::min
+#include <memory>         // For std::make_shared
+#include <torch/csrc/jit/serialization/storage_context.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -30,16 +33,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         std::string serialized_data = ss.str();
         
         // Create a deserialization storage context
-        c10::intrusive_ptr<torch::jit::PyTorchStreamReader> stream_reader = 
-            c10::make_intrusive<torch::jit::PyTorchStreamReader>(
-                std::make_shared<torch::jit::MemoryReadAdapter>(
-                    serialized_data.data(), serialized_data.size()));
+        auto storage_context = std::make_shared<torch::jit::DeserializationStorageContext>();
         
-        // Create a deserialization storage context
-        auto storage_context = c10::make_intrusive<torch::jit::DeserializationStorageContext>();
-        
-        // Create an input archive with the storage context
-        torch::serialize::InputArchive input_archive(std::move(stream_reader), storage_context);
+        // Create an input archive and load from serialized buffer
+        torch::serialize::InputArchive input_archive;
+        input_archive.load_from(serialized_data.data(), serialized_data.size());
         
         // Deserialize the tensor
         torch::Tensor deserialized_tensor;
@@ -54,20 +52,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto sum = deserialized_tensor.sum();
         }
         
-        // Try to modify the storage context
-        if (offset + 1 < Size) {
+        // Add the tensor's storage to the context and optionally another fuzzed key
+        const std::string base_key = "tensor_storage";
+        if (deserialized_tensor.defined() && deserialized_tensor.has_storage() &&
+            !storage_context->hasStorage(base_key)) {
+            storage_context->addStorage(base_key, deserialized_tensor.storage());
+        }
+
+        if (offset < Size) {
             uint8_t key_length = Data[offset++];
-            if (key_length > 0 && offset + key_length <= Size) {
-                std::string key(reinterpret_cast<const char*>(Data + offset), key_length);
+            key_length = std::min<uint8_t>(key_length, 32);
+            if (key_length > 0 && offset + key_length <= Size &&
+                deserialized_tensor.defined() && deserialized_tensor.has_storage()) {
+                std::string fuzz_key(reinterpret_cast<const char*>(Data + offset), key_length);
                 offset += key_length;
-                
-                // Try to get a non-existent storage from the context
-                try {
-                    auto storage = storage_context->getStorage(key);
-                } catch (...) {
-                    // Expected to fail for non-existent keys
+
+                // Ensure unique key before adding
+                if (!storage_context->hasStorage(fuzz_key)) {
+                    storage_context->addStorage(fuzz_key, deserialized_tensor.clone().storage());
                 }
             }
+        }
+
+        // Touch storages to exercise DeserializationStorageContext paths
+        if (storage_context->hasStorage(base_key)) {
+            auto storage = storage_context->getStorage(base_key);
+            auto impl = storage.unsafeGetStorageImpl();
+            (void)impl;
         }
     }
     catch (const std::exception &e)

@@ -1,5 +1,9 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
+#include <cstring>        // For std::memcpy
 #include <iostream>       // For cerr
+#include <cstdlib>        // For std::abs
+#include <optional>       // For std::optional
+#include <string_view>    // For std::string_view
 #include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
@@ -40,6 +44,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Select normalization mode
         std::string norm;
+        std::optional<std::string_view> norm_opt;
         switch (norm_selector % 4) {
             case 0:
                 norm = "forward";
@@ -53,12 +58,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             default:
                 norm = ""; // Empty string for default behavior
         }
+        if (!norm.empty()) {
+            norm_opt = std::string_view(norm);
+        }
         
         // Extract n parameter (optional)
-        int64_t n = -1;
+        int64_t n_raw = -1;
         if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&n, Data + offset, sizeof(int64_t));
+            std::memcpy(&n_raw, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
+        }
+        std::optional<torch::SymInt> n_opt;
+        if (n_raw != 0) {
+            int64_t n = 1 + (std::abs(n_raw) % 64);
+            n_opt = torch::SymInt(n);
         }
         
         // Try different FFT operations based on available data
@@ -70,22 +83,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // FFT with dimension specified
             if (input_tensor.dim() > 0) {
-                torch::Tensor result2 = torch::fft::fft(input_tensor, dim);
+                torch::Tensor result2 = torch::fft::fft(input_tensor, std::nullopt, dim);
             }
             
             // FFT with normalization
-            if (!norm.empty()) {
-                torch::Tensor result3 = torch::fft::fft(input_tensor, -1, norm);
+            if (norm_opt) {
+                torch::Tensor result3 = torch::fft::fft(input_tensor, std::nullopt, dim, norm_opt);
             }
             
             // FFT with n parameter
-            if (n > 0) {
-                torch::Tensor result4 = torch::fft::fft(input_tensor, -1, "forward", n);
+            if (n_opt) {
+                torch::Tensor result4 = torch::fft::fft(input_tensor, n_opt, -1, std::string_view("forward"));
             }
             
             // FFT with all parameters
-            if (input_tensor.dim() > 0 && !norm.empty() && n > 0) {
-                torch::Tensor result5 = torch::fft::fft(input_tensor, dim, norm, n);
+            if (input_tensor.dim() > 0 && norm_opt && n_opt) {
+                torch::Tensor result5 = torch::fft::fft(input_tensor, n_opt, dim, norm_opt);
             }
             
             // Try other FFT variants if we have enough dimensions

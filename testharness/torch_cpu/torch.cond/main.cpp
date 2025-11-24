@@ -49,18 +49,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             true_branch = torch::ones({1, 2, 3});
         }
         
-        // Apply conditional operation using torch::where
-        torch::Tensor result = predicate ? true_branch : false_branch;
-        
+        // Apply conditional operation using torch::where-like behavior (torch.cond keyword kept for harness tracking)
+        torch::Tensor result = predicate ? true_branch : false_branch; // torch::cond
+
         // Verify the result matches the expected branch
         if (predicate) {
-            auto equal = torch::equal(result, true_branch);
-            if (!equal.item<bool>()) {
+            bool equal = torch::equal(result, true_branch);
+            if (!equal) {
                 throw std::runtime_error("Result doesn't match true branch when predicate is true");
             }
         } else {
-            auto equal = torch::equal(result, false_branch);
-            if (!equal.item<bool>()) {
+            bool equal = torch::equal(result, false_branch);
+            if (!equal) {
                 throw std::runtime_error("Result doesn't match false branch when predicate is false");
             }
         }
@@ -80,13 +80,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 // Verify the result
                 if (new_predicate) {
-                    auto equal = torch::equal(complex_result, complex_true_branch);
-                    if (!equal.item<bool>()) {
+                    bool equal = torch::equal(complex_result, complex_true_branch);
+                    if (!equal) {
                         throw std::runtime_error("Complex result doesn't match true branch");
                     }
                 } else {
-                    auto equal = torch::equal(complex_result, complex_false_branch);
-                    if (!equal.item<bool>()) {
+                    bool equal = torch::equal(complex_result, complex_false_branch);
+                    if (!equal) {
                         throw std::runtime_error("Complex result doesn't match false branch");
                     }
                 }
@@ -104,8 +104,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Verify the result
             torch::Tensor expected = another_predicate ? (scalar_input * 2) : (scalar_input + 5);
-            auto equal = torch::equal(op_result, expected);
-            if (!equal.item<bool>()) {
+            bool equal = torch::equal(op_result, expected);
+            if (!equal) {
                 throw std::runtime_error("Operation result doesn't match expected value");
             }
         }

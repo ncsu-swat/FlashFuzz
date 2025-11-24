@@ -59,7 +59,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         names.push_back(torch::Dimname::wildcard());
                     }
                     auto named_tensor = input.refine_names(names);
-                    auto result3 = torch::aminmax(named_tensor, names[0], keepdim);
+                    auto result3 = torch::aminmax(named_tensor, 0, keepdim);
                 }
             } catch (const std::exception&) {
                 // Ignore exceptions from naming dimensions

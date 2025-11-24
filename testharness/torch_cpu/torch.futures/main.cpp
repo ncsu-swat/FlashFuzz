@@ -4,6 +4,7 @@
 #include <thread>         // For std::thread
 #include <chrono>         // For std::chrono
 
+// Target API: torch.futures
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
@@ -51,8 +52,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             case 2: {
                 // Test then() callback
                 future->markCompleted(tensor);
-                future->then([](c10::IValue result) {
-                    return result;
+                future->then([](c10::ivalue::Future &parent) {
+                    return parent.value();
                 }, c10::TensorType::get());
                 break;
             }

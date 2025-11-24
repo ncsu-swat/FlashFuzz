@@ -1,6 +1,7 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"       // General fuzzing utilities
+#include <ATen/autocast_mode.h> // at::autocast helpers
+#include <iostream>             // For cerr
+#include <tuple>                // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -70,7 +71,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test setting the autocast state and then decrementing
         if (offset < Size && (Data[offset++] & 0x1)) {
-            at::autocast::set_enabled(device_type, true);
+            at::autocast::set_autocast_enabled(device_type, true);
             at::autocast::set_autocast_dtype(device_type, dtype);
             at::autocast::decrement_nesting();
         }

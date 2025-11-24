@@ -1,86 +1,57 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"                                   // General fuzzing utilities
+#include <torch/csrc/jit/serialization/storage_context.h>   // torch::jit::SerializationStorageContext
+#include <iostream>                                         // For cerr
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
     try
     {
         size_t offset = 0;
-        
-        if (Size < 4) {
+
+        if (Size < 1)
+        {
             return 0;
         }
-        
+
+        torch::jit::SerializationStorageContext context;
+
         // Create a tensor to be serialized
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create a serialization storage context using torch::jit
-        torch::jit::SerializationStorageContext context;
-        
-        // Get a unique ID for the tensor's storage
-        const auto& storage = tensor.storage();
+        const auto &storage = tensor.storage();
+
         const auto storageKey = context.getOrAddStorage(storage);
-        
-        // Test if we can retrieve the storage back from the context
-        if (context.hasStorage(storageKey)) {
-            auto retrievedStorage = context.getStorage(storageKey);
-            
-            // Verify the retrieved storage matches the original
-            if (retrievedStorage.data() != storage.data() || 
-                retrievedStorage.nbytes() != storage.nbytes() ||
-                retrievedStorage.device().type() != storage.device().type()) {
-                throw std::runtime_error("Retrieved storage doesn't match original");
-            }
+        const auto storageKeyRepeat = context.getOrAddStorage(storage);
+        if (storageKey != storageKeyRepeat || !context.hasStorage(storage))
+        {
+            throw std::runtime_error("Storage lookup failed");
         }
-        
-        // Test adding a storage with a custom key
-        uint64_t customKey = 0;
-        if (offset + sizeof(uint64_t) <= Size) {
-            std::memcpy(&customKey, Data + offset, sizeof(uint64_t));
-            offset += sizeof(uint64_t);
+
+        // Create another tensor with different data (bounded by fuzzer_utils helpers)
+        torch::Tensor anotherTensor =
+            (offset < Size) ? fuzzer_utils::createTensor(Data, Size, offset) : torch::ones({2, 3});
+        const auto &anotherStorage = anotherTensor.storage();
+        const auto anotherKey = context.getOrAddStorage(anotherStorage);
+        if (!context.hasStorage(anotherStorage))
+        {
+            throw std::runtime_error("Secondary storage missing");
         }
-        
-        // Create another tensor with different data
-        torch::Tensor anotherTensor;
-        if (offset < Size) {
-            anotherTensor = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            anotherTensor = torch::ones({2, 3});
+
+        // Clone to force a distinct storage and ensure it also registers
+        torch::Tensor clonedTensor = tensor.clone();
+        const auto &clonedStorage = clonedTensor.storage();
+        const auto clonedKey = context.getOrAddStorage(clonedStorage);
+        if (!context.hasStorage(clonedStorage))
+        {
+            throw std::runtime_error("Cloned storage not tracked");
         }
-        
-        // Add the storage with the custom key
-        context.addStorage(customKey, anotherTensor.storage());
-        
-        // Verify we can retrieve it
-        if (context.hasStorage(customKey)) {
-            auto retrievedStorage = context.getStorage(customKey);
-            
-            // Verify the retrieved storage matches
-            if (retrievedStorage.data() != anotherTensor.storage().data() || 
-                retrievedStorage.nbytes() != anotherTensor.storage().nbytes() ||
-                retrievedStorage.device().type() != anotherTensor.storage().device().type()) {
-                throw std::runtime_error("Retrieved custom storage doesn't match original");
-            }
-        }
-        
-        // Test with empty tensor
-        torch::Tensor emptyTensor = torch::empty({0});
-        const auto emptyStorageKey = context.getOrAddStorage(emptyTensor.storage());
-        
-        // Test with scalar tensor
-        torch::Tensor scalarTensor = torch::tensor(3.14);
-        const auto scalarStorageKey = context.getOrAddStorage(scalarTensor.storage());
-        
-        // Test with boolean tensor
-        torch::Tensor boolTensor = torch::tensor(true);
-        const auto boolStorageKey = context.getOrAddStorage(boolTensor.storage());
-        
-        // Test with complex tensor if available
-        torch::Tensor complexTensor = torch::complex(torch::rand({2, 2}), torch::rand({2, 2}));
-        const auto complexStorageKey = context.getOrAddStorage(complexTensor.storage());
+
+        // Touch storages so the fuzzer drives through allocation paths
+        volatile uint8_t touch = 0;
+        touch ^= static_cast<uint8_t>(storageKey);
+        touch ^= static_cast<uint8_t>(anotherKey);
+        touch ^= static_cast<uint8_t>(clonedKey);
+        (void)touch;
     }
     catch (const std::exception &e)
     {

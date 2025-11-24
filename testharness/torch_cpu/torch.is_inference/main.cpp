@@ -1,6 +1,9 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <c10/core/InferenceMode.h>
+#include <iostream> // For cerr
+#include <tuple>    // For std::get with lu_unpack result
+
+// Target API: torch.is_inference
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -17,60 +20,74 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Create a tensor to test with
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Test torch.is_inference mode
-        bool initial_mode = torch::autograd::is_inference_mode_enabled();
-        
+
+        // Initial inference state checks
+        bool initial_mode = c10::InferenceMode::is_enabled();
+        bool tensor_inference = torch::is_inference(tensor);
+        (void)initial_mode;
+        (void)tensor_inference;
+
         // Test enabling inference mode
-        torch::InferenceMode guard(true);
-        bool enabled_mode = torch::autograd::is_inference_mode_enabled();
-        
+        {
+            c10::InferenceMode guard(true);
+            bool enabled_mode = c10::InferenceMode::is_enabled();
+            bool enabled_tensor = torch::is_inference(tensor);
+            torch::Tensor result1 = tensor + 1;
+            (void)enabled_mode;
+            (void)enabled_tensor;
+            (void)result1.sum();
+        }
+
         // Test disabling inference mode
-        torch::InferenceMode guard2(false);
-        bool disabled_mode = torch::autograd::is_inference_mode_enabled();
-        
-        // Test with tensor operations in inference mode
-        torch::InferenceMode inference_on(true);
-        torch::Tensor result1 = tensor + 1;
-        
-        // Test with tensor operations outside inference mode
-        torch::InferenceMode inference_off(false);
-        torch::Tensor result2 = tensor + 2;
-        
+        {
+            c10::InferenceMode guard(false);
+            bool disabled_mode = c10::InferenceMode::is_enabled();
+            bool disabled_tensor = torch::is_inference(tensor);
+            torch::Tensor result2 = tensor + 2;
+            (void)disabled_mode;
+            (void)disabled_tensor;
+            (void)result2.sum();
+        }
+
         // Test nested inference modes
         {
-            torch::InferenceMode outer(true);
-            bool outer_mode = torch::autograd::is_inference_mode_enabled();
+            c10::InferenceMode outer(true);
+            bool outer_mode = c10::InferenceMode::is_enabled();
+            bool outer_tensor = torch::is_inference(tensor);
             
             {
-                torch::InferenceMode inner(false);
-                bool inner_mode = torch::autograd::is_inference_mode_enabled();
+                c10::InferenceMode inner(false);
+                bool inner_mode = c10::InferenceMode::is_enabled();
+                bool inner_tensor = torch::is_inference(tensor);
+                (void)inner_mode;
+                (void)inner_tensor;
             }
             
-            bool after_inner_mode = torch::autograd::is_inference_mode_enabled();
+            bool after_inner_mode = c10::InferenceMode::is_enabled();
+            bool after_inner_tensor = torch::is_inference(tensor);
+            (void)outer_mode;
+            (void)outer_tensor;
+            (void)after_inner_mode;
+            (void)after_inner_tensor;
         }
         
         // Test with tensor creation in inference mode
-        torch::InferenceMode creation_guard(true);
-        torch::Tensor new_tensor = torch::ones_like(tensor);
-        
-        // Test with tensor requires_grad in inference mode
-        torch::InferenceMode grad_guard(true);
-        torch::Tensor grad_tensor = tensor.clone();
-        grad_tensor.set_requires_grad(true);
-        
-        // Test with autograd operations
-        torch::InferenceMode autograd_guard(true);
-        torch::Tensor autograd_tensor = tensor.clone();
-        if (autograd_tensor.requires_grad()) {
-            autograd_tensor = autograd_tensor * 2;
+        {
+            c10::InferenceMode creation_guard(true);
+            torch::Tensor new_tensor = torch::ones_like(tensor);
+            bool new_tensor_inference = torch::is_inference(new_tensor);
+            (void)new_tensor_inference;
+            (void)new_tensor.sum();
         }
         
         // Test with different tensor types
         if (offset + 1 < Size) {
             torch::Tensor another_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            torch::InferenceMode type_guard(true);
+            c10::InferenceMode type_guard(true);
             torch::Tensor combined = tensor + another_tensor;
+            bool combined_inference = torch::is_inference(combined);
+            (void)combined_inference;
+            (void)combined.sum();
         }
     }
     catch (const std::exception &e)

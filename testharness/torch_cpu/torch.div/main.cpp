@@ -1,6 +1,7 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
+#include <c10/core/ScalarType.h> // For c10::isIntegralType
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -74,7 +75,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     }
                     
                     // Only apply rounding mode for integer types
-                    if (input.dtype().isIntegral() && other.dtype().isIntegral()) {
+                    if (c10::isIntegralType(input.scalar_type(), /*includeBool=*/true) &&
+                        c10::isIntegralType(other.scalar_type(), /*includeBool=*/true)) {
                         torch::Tensor result3 = torch::div(input, other, rounding_mode);
                         
                         // Test method version with rounding mode

@@ -1,5 +1,6 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
+#include <torch/script.h> // For torch::jit::compile and run_method
 #include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
@@ -18,6 +19,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Target API keyword: torch.compiler
         // Create TorchScript code as string
         std::string simple_script = R"(
             def my_function(x):
@@ -41,24 +43,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 if (compile_mode == 0) {
                     // Basic compilation
                     auto cu = torch::jit::compile(simple_script);
-                    auto method = cu->get_function("my_function");
-                    std::vector<torch::jit::IValue> inputs;
-                    inputs.push_back(input_tensor);
-                    auto result = method(inputs);
+                    auto result = cu->run_method("my_function", input_tensor);
+                    if (result.isTensor()) {
+                        result.toTensor().sum();
+                    }
                 } else if (compile_mode == 1) {
                     // Compilation with optimization
                     auto cu = torch::jit::compile(simple_script);
-                    auto method = cu->get_function("my_function");
-                    std::vector<torch::jit::IValue> inputs;
-                    inputs.push_back(input_tensor);
-                    auto result = method(inputs);
+                    auto result = cu->run_method("my_function", input_tensor);
+                    if (result.isTensor()) {
+                        result.toTensor().sum();
+                    }
                 } else {
                     // Try with complex function
                     auto cu = torch::jit::compile(complex_script);
-                    auto method = cu->get_function("complex_function");
-                    std::vector<torch::jit::IValue> inputs;
-                    inputs.push_back(input_tensor);
-                    auto result = method(inputs);
+                    auto result = cu->run_method("complex_function", input_tensor);
+                    if (result.isTensor()) {
+                        result.toTensor().sum();
+                    }
                 }
             } catch (const c10::Error& e) {
                 // Catch PyTorch-specific errors but don't discard the input
@@ -67,20 +69,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         } else {
             // Basic compilation if we don't have more data
             auto cu = torch::jit::compile(simple_script);
-            auto method = cu->get_function("my_function");
-            std::vector<torch::jit::IValue> inputs;
-            inputs.push_back(input_tensor);
-            auto result = method(inputs);
+            auto result = cu->run_method("my_function", input_tensor);
+            if (result.isTensor()) {
+                result.toTensor().sum();
+            }
         }
         
         // Try another compilation with a more complex function if we have more data
         if (offset + 2 < Size) {
             try {
                 auto cu = torch::jit::compile(complex_script);
-                auto method = cu->get_function("complex_function");
-                std::vector<torch::jit::IValue> inputs;
-                inputs.push_back(input_tensor);
-                auto result = method(inputs);
+                auto result = cu->run_method("complex_function", input_tensor);
+                if (result.isTensor()) {
+                    result.toTensor().sum();
+                }
             } catch (const c10::Error& e) {
                 // Catch PyTorch-specific errors but don't discard the input
                 return 0;

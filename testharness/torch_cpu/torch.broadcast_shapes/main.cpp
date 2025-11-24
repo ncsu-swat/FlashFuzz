@@ -1,6 +1,7 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"    // General fuzzing utilities
+#include <ATen/ExpandUtils.h> // For at::infer_size
+#include <iostream>          // For cerr
+#include <tuple>             // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -38,12 +39,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     shape_refs.push_back(c10::IntArrayRef(shape));
                 }
                 
-                // Call broadcast_shapes using c10::infer_size
-                auto result = c10::infer_size(shape_refs[0], shape_refs.size() > 1 ? shape_refs[1] : shape_refs[0]);
+                // Call broadcast_shapes using at::infer_size to mirror torch.broadcast_shapes
+                auto result = at::infer_size(shape_refs[0], shape_refs.size() > 1 ? shape_refs[1] : shape_refs[0]);
                 
                 // For more than 2 shapes, iteratively broadcast
                 for (size_t i = 2; i < shape_refs.size(); ++i) {
-                    result = c10::infer_size(result, shape_refs[i]);
+                    result = at::infer_size(result, shape_refs[i]);
                 }
                 
                 // Verify result by creating tensors with the shapes and checking if they broadcast

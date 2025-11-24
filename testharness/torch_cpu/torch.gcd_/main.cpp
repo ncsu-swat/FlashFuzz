@@ -28,11 +28,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Convert tensors to integer types if needed, as gcd requires integer inputs
-        if (!tensor1.dtype().is_integral()) {
+        if (!at::isIntegralType(tensor1.scalar_type(), /*includeBool=*/true)) {
             tensor1 = tensor1.to(torch::kInt64);
         }
         
-        if (!tensor2.dtype().is_integral()) {
+        if (!at::isIntegralType(tensor2.scalar_type(), /*includeBool=*/true)) {
             tensor2 = tensor2.to(torch::kInt64);
         }
         

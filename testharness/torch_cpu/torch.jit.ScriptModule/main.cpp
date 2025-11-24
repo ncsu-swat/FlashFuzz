@@ -1,6 +1,7 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
+#include <vector>         // For std::vector inputs
 #include <torch/script.h>
 
 // --- Fuzzer Entry Point ---
@@ -25,39 +26,35 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Determine which script to use based on tensor properties
         if (input_tensor.dim() == 0) {
             // For scalar tensors
-            script_code = R"(
-                def forward(x):
-                    return x * 2
-            )";
+            script_code = R"(def forward(self, x):
+    return x * 2
+)";
         } else if (input_tensor.dim() == 1) {
             // For 1D tensors
-            script_code = R"(
-                def forward(x):
-                    return torch.relu(x)
-            )";
+            script_code = R"(import torch
+def forward(self, x):
+    return torch.relu(x)
+)";
         } else {
             // For multi-dimensional tensors
-            script_code = R"(
-                def forward(x):
-                    if x.dim() > 1:
-                        return x.sum(dim=1)
-                    return x
-            )";
+            script_code = R"(def forward(self, x):
+    if x.dim() > 1:
+        return x.sum(dim=1)
+    return x
+)";
         }
         
         // Create a ScriptModule from the code
-        torch::jit::Module module;
+        torch::jit::Module module("fuzz_module");
         try {
-            auto cu = torch::jit::compile(script_code);
-            module = torch::jit::Module(cu->get_function("forward"));
+            module.define(script_code);
         } catch (...) {
             // If compilation fails, try a simpler module
-            script_code = R"(
-                def forward(x):
-                    return x
-            )";
-            auto cu = torch::jit::compile(script_code);
-            module = torch::jit::Module(cu->get_function("forward"));
+            script_code = R"(def forward(self, x):
+    return x
+)";
+            module = torch::jit::Module("fallback_module");
+            module.define(script_code);
         }
         
         // Create inputs vector for the module
@@ -78,17 +75,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor second_tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
             // Try a different script with multiple inputs
-            script_code = R"(
-                def forward(x, y):
-                    try:
-                        return x + y
-                    except:
-                        return x
-            )";
+            script_code = R"(def forward(self, x, y):
+    return x + y
+)";
             
             try {
-                auto cu2 = torch::jit::compile(script_code);
-                torch::jit::Module module2 = torch::jit::Module(cu2->get_function("forward"));
+                torch::jit::Module module2("fuzz_module_two_input");
+                module2.define(script_code);
                 std::vector<torch::jit::IValue> multi_inputs;
                 multi_inputs.push_back(input_tensor);
                 multi_inputs.push_back(second_tensor);

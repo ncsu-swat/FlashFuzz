@@ -38,11 +38,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Scalar scalar_value;
             try {
                 scalar_value = input1.item();
-                torch::Tensor scalar_tensor = torch::tensor(scalar_value);
+                torch::Tensor scalar_tensor = torch::scalar_tensor(scalar_value, input1.options());
                 torch::Tensor result2 = torch::hypot(input2, scalar_tensor);
             } catch (...) {
                 // If item() fails (e.g., for multi-element tensors), use a default value
-                torch::Tensor scalar_tensor = torch::tensor(2.0);
+                torch::Tensor scalar_tensor = torch::scalar_tensor(2.0, input1.options());
                 torch::Tensor result2 = torch::hypot(input2, scalar_tensor);
             }
         }
@@ -51,10 +51,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (input2.numel() > 0) {
             try {
                 torch::Scalar scalar_value = input2.item();
-                torch::Tensor scalar_tensor = torch::tensor(scalar_value);
+                torch::Tensor scalar_tensor = torch::scalar_tensor(scalar_value, input2.options());
                 torch::Tensor result3 = torch::hypot(scalar_tensor, input1);
             } catch (...) {
-                torch::Tensor scalar_tensor = torch::tensor(3.0);
+                torch::Tensor scalar_tensor = torch::scalar_tensor(3.0, input2.options());
                 torch::Tensor result3 = torch::hypot(scalar_tensor, input1);
             }
         }

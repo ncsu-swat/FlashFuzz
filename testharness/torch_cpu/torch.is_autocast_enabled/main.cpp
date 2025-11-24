@@ -1,106 +1,62 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <torch/csrc/autograd/autocast_mode.h>
+#include <ATen/autocast_mode.h>
+#include <array>
+#include <iostream> // For cerr
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
     try
     {
         size_t offset = 0;
-        
-        // Check if autocast is enabled (should be false by default)
-        bool is_enabled_default = torch::autocast::is_enabled();
-        
-        // Create a tensor to use in autocast context
-        if (Size > 0) {
+
+        // torch.is_autocast_enabled
+        const std::array<c10::DeviceType, 2> device_choices = {
+            c10::DeviceType::CUDA,
+            c10::DeviceType::CPU,
+        };
+
+        // Respect the Python default of CUDA when available.
+        c10::DeviceType default_device = torch::cuda::is_available() ? c10::DeviceType::CUDA
+                                                                     : c10::DeviceType::CPU;
+        bool default_enabled = at::autocast::is_autocast_enabled(default_device);
+        (void)default_enabled;
+
+        if (Size > 0)
+        {
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Test autocast in different contexts
+
+            // Pick a device from fuzzer data and fall back to CPU if unsupported.
+            uint8_t selector = Data[offset % Size];
+            c10::DeviceType device_type = device_choices[selector % device_choices.size()];
+            if (device_type == c10::DeviceType::CUDA && !torch::cuda::is_available())
             {
-                // Enable autocast
-                torch::autocast::set_enabled(true);
-                bool is_enabled_true = torch::autocast::is_enabled();
-                
-                // Perform some operation with the tensor in autocast context
-                torch::Tensor result = tensor + 1.0;
-                
-                // Disable autocast
-                torch::autocast::set_enabled(false);
-                bool is_enabled_false = torch::autocast::is_enabled();
-                
-                // Perform operation again with autocast disabled
-                torch::Tensor result2 = tensor + 1.0;
+                device_type = c10::DeviceType::CPU;
             }
-            
-            // Test nested autocast contexts
+
+            bool before_toggle = at::autocast::is_autocast_enabled(device_type);
+            at::autocast::set_autocast_enabled(device_type, true);
+            bool after_enable = at::autocast::is_autocast_enabled(device_type);
+
+            // Exercise autocast state while using a small tensor op.
+            (tensor + 1).sum();
+
+            at::autocast::set_autocast_enabled(device_type, false);
+            bool after_disable = at::autocast::is_autocast_enabled(device_type);
+
+            // Prevent unused variable warnings and keep the values observable.
+            if (before_toggle == after_enable && after_disable)
             {
-                torch::autocast::set_enabled(true);
-                bool outer_enabled = torch::autocast::is_enabled();
-                
-                {
-                    // Nested context with different setting
-                    torch::autocast::set_enabled(false);
-                    bool inner_enabled = torch::autocast::is_enabled();
-                }
-                
-                // Check if outer context is restored
-                bool after_nested = torch::autocast::is_enabled();
-                
-                // Reset to default
-                torch::autocast::set_enabled(false);
-            }
-            
-            // Test with specific device type
-            if (offset + 1 <= Size) {
-                bool use_cuda = Data[offset++] % 2 == 0;
-                
-                if (use_cuda && torch::cuda::is_available()) {
-                    torch::autocast::set_enabled(true);
-                    bool cuda_enabled = torch::autocast::is_enabled();
-                    torch::autocast::set_enabled(false);
-                }
-                
-                // Test with CPU device
-                torch::autocast::set_enabled(true);
-                bool cpu_enabled = torch::autocast::is_enabled();
-                torch::autocast::set_enabled(false);
+                tensor = tensor.relu();
             }
         }
-        
-        // Test with different device types if available
-        if (offset + 1 <= Size) {
-            uint8_t device_selector = Data[offset++];
-            c10::DeviceType device_type;
-            
-            switch (device_selector % 3) {
-                case 0:
-                    device_type = torch::kCPU;
-                    break;
-                case 1:
-                    device_type = torch::kCUDA;
-                    break;
-                case 2:
-                    device_type = torch::kMPS;
-                    break;
-            }
-            
-            // Check if autocast is enabled for the selected device
-            bool is_enabled_for_device = torch::autocast::is_enabled();
-            
-            // Enable autocast for the device and check again
-            torch::autocast::set_enabled(true);
-            bool is_enabled_after = torch::autocast::is_enabled();
-            
-            // Disable and check
-            torch::autocast::set_enabled(false);
-            bool is_disabled_after = torch::autocast::is_enabled();
+
+        // Reset known devices to a disabled state to avoid leaking state across runs.
+        at::autocast::set_autocast_enabled(c10::DeviceType::CPU, false);
+        if (torch::cuda::is_available())
+        {
+            at::autocast::set_autocast_enabled(c10::DeviceType::CUDA, false);
         }
-        
-        // Ensure we reset autocast state to default
-        torch::autocast::set_enabled(false);
     }
     catch (const std::exception &e)
     {

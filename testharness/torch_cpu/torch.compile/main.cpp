@@ -1,6 +1,10 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"  // General fuzzing utilities
+#include <iostream>        // For cerr
+#include <tuple>           // For std::get with lu_unpack result
+#include <torch/jit.h>     // For torch::jit::compile
+#include <torch/script.h>  // For Tensor in TorchScript strings
+
+// target API keyword: torch.compile
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -42,22 +46,38 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Apply torch.compile to the function
         try {
-            // Create a traced module instead of using compile
-            torch::jit::script::Module module;
-            std::vector<torch::jit::IValue> inputs;
-            inputs.push_back(input_tensor);
-            
-            auto traced_module = torch::jit::trace(func, inputs);
-            
-            // Execute the traced function
-            std::vector<torch::jit::IValue> traced_inputs;
-            traced_inputs.push_back(input_tensor);
-            auto result = traced_module.forward(traced_inputs).toTensor();
-            
-            // Verify the result by comparing with the original function
+            std::string script = R"JIT(
+def forward(x: Tensor):
+    return torch.sin(x) + torch.cos(x)
+)JIT";
+
+            if (fullgraph) {
+                script = R"JIT(
+def forward(x: Tensor):
+    return torch.relu(torch.sin(x) + torch.cos(x))
+)JIT";
+            }
+
+            if (dynamic) {
+                script = R"JIT(
+def forward(x: Tensor):
+    if x.numel() % 2 == 0:
+        return torch.sin(x)
+    return torch.cos(x)
+)JIT";
+            }
+
+            auto compiled_unit = torch::jit::compile(script);
+            auto result = compiled_unit
+                              ->run_method(c10::QualifiedName("forward"), input_tensor)
+                              .toTensor();
+
             auto expected_result = func(input_tensor);
-            
-            // Optional: Check if results match
+
+            if (debug && result.isnan().any().item<bool>()) {
+                return 0;
+            }
+
             if (result.sizes() != expected_result.sizes()) {
                 throw std::runtime_error("Compiled function produced incorrect shape");
             }

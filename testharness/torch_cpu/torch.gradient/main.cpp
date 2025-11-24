@@ -1,5 +1,6 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
+#include <optional>       // For std::optional spacing handling
 #include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
@@ -98,7 +99,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size) {
             double scalar_spacing = static_cast<double>(Data[offset++]) / 10.0;
             try {
-                result = torch::gradient(input, torch::Scalar(scalar_spacing));
+                std::optional<torch::Scalar> spacing_scalar = torch::Scalar(scalar_spacing);
+                result = torch::gradient(input, spacing_scalar);
             } catch (const std::exception&) {
                 // Exception caught, continue with other cases
             }
@@ -108,7 +110,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size) {
             double scalar_spacing = static_cast<double>(Data[offset++]) / 10.0;
             try {
-                result = torch::gradient(input, torch::Scalar(scalar_spacing), torch::nullopt, edge_order);
+                std::optional<torch::Scalar> spacing_scalar = torch::Scalar(scalar_spacing);
+                result = torch::gradient(input, spacing_scalar, std::nullopt, edge_order);
             } catch (const std::exception&) {
                 // Exception caught, continue with other cases
             }
@@ -118,7 +121,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size && !dim.empty()) {
             double scalar_spacing = static_cast<double>(Data[offset++]) / 10.0;
             try {
-                result = torch::gradient(input, torch::Scalar(scalar_spacing), dim, edge_order);
+                std::vector<torch::Scalar> spacing_scalar{torch::Scalar(scalar_spacing)};
+                result = torch::gradient(input, spacing_scalar, dim, edge_order);
             } catch (const std::exception&) {
                 // Exception caught, continue with other cases
             }

@@ -1,5 +1,10 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
+#include <algorithm>
+#include <array>
+#include <cstring>
 #include <iostream>       // For cerr
+#include <optional>
+#include <string_view>
 #include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
@@ -19,9 +24,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Parse optional parameters if we have more data
-        int64_t s = -1;  // Default: use input size
+        int64_t s = -1;                // Default: use input size
         int64_t dim1 = -1, dim2 = -1;  // Default dimensions
-        torch::optional<c10::string_view> norm = c10::nullopt;
+        std::optional<std::string_view> norm = std::nullopt;
         
         // Parse dimensions if we have more data
         if (offset + 2 < Size) {
@@ -42,8 +47,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&s_raw, Data + offset, sizeof(int32_t));
             offset += sizeof(int32_t);
             
-            // Allow negative values to test error handling
-            s = s_raw;
+            // Bound positive sizes to keep allocations in check
+            if (s_raw > 0)
+            {
+                constexpr int64_t max_fft_size = 16;
+                s = std::max<int64_t>(1, std::min<int64_t>(s_raw, max_fft_size));
+            }
+            else
+            {
+                s = s_raw;
+            }
         }
         
         // Parse norm parameter if we have more data
@@ -60,7 +73,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     norm = "ortho";
                     break;
                 default:
-                    norm = c10::nullopt;
+                    norm = std::nullopt;
                     break;
             }
         }
@@ -81,47 +94,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
+        // Prepare optional size overrides and dims (API defaults to {-2, -1})
+        static const std::array<int64_t, 2> default_dims = {-2, -1};
+        size_t target_dim_count = dim.empty() ? default_dims.size() : dim.size();
+
         // Create s parameter
         std::vector<int64_t> s_vec;
-        if (s >= 0) {
+        if (s > 0)
+        {
             // Use the provided s value for all dimensions
-            for (size_t i = 0; i < dim.size(); i++) {
+            for (size_t i = 0; i < target_dim_count; i++)
+            {
                 s_vec.push_back(s);
             }
         }
+
+        c10::optional<at::IntArrayRef> s_opt = c10::nullopt;
+        if (!s_vec.empty())
+        {
+            s_opt = at::IntArrayRef(s_vec);
+        }
+
+        at::IntArrayRef dim_ref = dim.empty() ? at::IntArrayRef(default_dims) : at::IntArrayRef(dim);
         
         // Apply rfft2 operation with different parameter combinations
-        torch::Tensor output;
-        
-        if (s_vec.empty()) {
-            if (norm.has_value()) {
-                if (dim.empty()) {
-                    output = torch::fft::rfft2(input, c10::nullopt, c10::nullopt, norm);
-                } else {
-                    output = torch::fft::rfft2(input, c10::nullopt, dim, norm);
-                }
-            } else {
-                if (dim.empty()) {
-                    output = torch::fft::rfft2(input);
-                } else {
-                    output = torch::fft::rfft2(input, c10::nullopt, dim);
-                }
-            }
-        } else {
-            if (norm.has_value()) {
-                if (dim.empty()) {
-                    output = torch::fft::rfft2(input, s_vec, c10::nullopt, norm);
-                } else {
-                    output = torch::fft::rfft2(input, s_vec, dim, norm);
-                }
-            } else {
-                if (dim.empty()) {
-                    output = torch::fft::rfft2(input, s_vec);
-                } else {
-                    output = torch::fft::rfft2(input, s_vec, dim);
-                }
-            }
-        }
+        torch::Tensor output = torch::fft::rfft2(input, s_opt, dim_ref, norm);
         
         // Verify output is not empty
         if (output.numel() == 0 && input.numel() > 0) {
@@ -129,7 +126,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Try inverse operation to ensure roundtrip works
-        torch::Tensor reconstructed = torch::fft::irfft2(output, s_vec, dim, norm);
+        torch::Tensor reconstructed = torch::fft::irfft2(output, s_opt, dim_ref, norm);
         
         // Try some additional operations on the output
         torch::Tensor abs_output = output.abs();

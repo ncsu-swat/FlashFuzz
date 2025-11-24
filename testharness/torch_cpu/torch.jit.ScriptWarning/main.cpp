@@ -1,8 +1,11 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"   // General fuzzing utilities
+#include <c10/util/Exception.h>
+#include <iostream>         // For cerr
+#include <tuple>            // For std::get with lu_unpack result
+#include <vector>
 #include <torch/script.h>
 
+// Target API: torch.jit.ScriptWarning
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
@@ -82,7 +85,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::vector<torch::jit::IValue> inputs;
             inputs.push_back(tensor);
             
-            auto output = module.forward(inputs);
+            auto output = module->run_method("forward", tensor);
             
         } catch (const std::exception& e) {
             // JIT compilation errors are expected in some cases
@@ -92,16 +95,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test warning handling if possible
         if (offset < Size) {
             try {
-                // Create a warning handler
-                torch::WarningHandler warning_handler;
-                
-                // Generate a warning using c10::Warning
+                // Build a warning and dispatch through the warning utilities
                 std::string warning_msg = "Test warning message";
-                std::string source = "test_source.py";
                 int line = Data[offset++] % 100;
-                
-                // Use c10::Warning to generate warnings
-                c10::Warning::warn(c10::UserWarning(), warning_msg);
+                c10::Warning warning(
+                    c10::Warning::UserWarning(),
+                    c10::SourceLocation{__func__, __FILE__, static_cast<uint32_t>(line)},
+                    warning_msg,
+                    /*verbatim=*/true);
+                c10::warn(warning);
                 
             } catch (...) {
                 // Ignore exceptions from warning handling

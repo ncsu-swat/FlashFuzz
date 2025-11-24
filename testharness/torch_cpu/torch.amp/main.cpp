@@ -1,7 +1,10 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
+#include <algorithm>      // For std::min/max
+#include <cmath>          // For std::sqrt
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
 #include <torch/torch.h>
+#include <ATen/autocast_mode.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -17,20 +20,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        torch::Tensor safe_tensor = input_tensor.flatten();
+        if (safe_tensor.numel() < 4)
+        {
+            safe_tensor = torch::randn({2, 2});
+        }
+        else
+        {
+            int64_t side = std::min<int64_t>(8, static_cast<int64_t>(std::sqrt(static_cast<double>(safe_tensor.numel()))));
+            side = std::max<int64_t>(side, 2);
+            safe_tensor = safe_tensor.narrow(0, 0, std::min<int64_t>(safe_tensor.numel(), side * side)).reshape({side, side});
+        }
         
         // Test torch.amp.autocast
         if (offset < Size) {
             bool enabled = Data[offset++] % 2 == 0;
             
             // Get device type
-            torch::DeviceType device_type = torch::kCPU;
-            if (offset < Size) {
-                uint8_t device_selector = Data[offset++];
-                device_type = (device_selector % 2 == 0) ? torch::kCPU : torch::kCUDA;
-            }
+            c10::DeviceType device_type = c10::kCPU;
             
             // Get dtype
-            torch::ScalarType dtype = torch::kFloat;
+            at::ScalarType dtype = torch::kFloat;
             if (offset < Size) {
                 uint8_t dtype_selector = Data[offset++];
                 if (dtype_selector % 3 == 0) {
@@ -48,16 +58,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 cache_enabled = Data[offset++] % 2 == 0;
             }
             
-            // Test autocast using at::autocast
+            // Test autocast using at::autocast APIs directly
             {
-                at::autocast::AutocastMode autocast_mode(device_type, enabled, dtype, cache_enabled);
+                bool prev_enabled = at::autocast::is_autocast_enabled(device_type);
+                at::ScalarType prev_dtype = at::autocast::get_autocast_dtype(device_type);
+                bool prev_cache = at::autocast::is_autocast_cache_enabled();
+                
+                at::autocast::set_autocast_enabled(device_type, enabled);
+                at::autocast::set_autocast_dtype(device_type, dtype);
+                at::autocast::set_autocast_cache_enabled(cache_enabled);
                 
                 // Perform some operations under autocast
-                torch::Tensor result = torch::matmul(input_tensor, input_tensor);
+                torch::Tensor result = torch::matmul(safe_tensor, safe_tensor);
+                (void)result.sum().item<double>();
                 
                 // Test autocast state
-                bool is_enabled = at::autocast::is_enabled();
-                torch::DeviceType current_device = at::autocast::get_autocast_device_type();
+                bool is_enabled = at::autocast::is_autocast_enabled(device_type);
                 torch::ScalarType current_dtype = at::autocast::get_autocast_dtype(device_type);
                 
                 // Test autocast_increment_nesting
@@ -65,8 +81,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 at::autocast::decrement_nesting();
                 
                 // Test set_autocast_enabled
-                at::autocast::set_enabled(device_type, false);
-                at::autocast::set_enabled(device_type, true);
+                at::autocast::set_autocast_enabled(device_type, false);
+                at::autocast::set_autocast_enabled(device_type, true);
                 
                 // Test set_autocast_dtype
                 at::autocast::set_autocast_dtype(device_type, torch::kFloat);
@@ -74,6 +90,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 // Test clear_autocast_cache
                 at::autocast::clear_cache();
+
+                // Restore prior autocast settings
+                at::autocast::set_autocast_cache_enabled(prev_cache);
+                at::autocast::set_autocast_dtype(device_type, prev_dtype);
+                at::autocast::set_autocast_enabled(device_type, prev_enabled);
+                (void)is_enabled;
+                (void)current_dtype;
             }
             
             // Test basic tensor operations that might benefit from AMP

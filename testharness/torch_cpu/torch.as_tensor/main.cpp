@@ -1,6 +1,7 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
+// Target API: torch.as_tensor
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -78,21 +79,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::vector<int> empty_vec;
             torch::Tensor result9 = torch::tensor(empty_vec);
             
-            // Try with nested vectors
-            if (offset + 4 < Size) {
-                std::vector<std::vector<int>> nested_vec;
+            // Try with nested vectors by flattening into a small 2D tensor
+            if (offset + 2 < Size) {
                 size_t num_inner = Data[offset++] % 3 + 1;
                 size_t inner_size = Data[offset++] % 3 + 1;
-                
-                for (size_t i = 0; i < num_inner; i++) {
-                    std::vector<int> inner;
-                    for (size_t j = 0; j < inner_size && offset < Size; j++) {
-                        inner.push_back(static_cast<int>(Data[offset++]));
-                    }
-                    nested_vec.push_back(inner);
+                size_t total_elems = num_inner * inner_size;
+
+                std::vector<int64_t> flat(total_elems, 0);
+                for (size_t i = 0; i < total_elems && offset < Size; i++) {
+                    flat[i] = static_cast<int64_t>(Data[offset++]);
                 }
-                
-                torch::Tensor result10 = torch::tensor(nested_vec);
+
+                torch::Tensor flat_tensor = torch::tensor(flat, torch::TensorOptions().dtype(torch::kLong));
+                torch::Tensor result10 = flat_tensor.view({static_cast<int64_t>(num_inner), static_cast<int64_t>(inner_size)});
             }
         }
         catch (const c10::Error &e) {

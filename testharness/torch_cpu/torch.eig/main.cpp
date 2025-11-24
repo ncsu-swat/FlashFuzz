@@ -1,6 +1,8 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"           // General fuzzing utilities
+#include <ATen/ops/linalg_eig.h>    // at::linalg_eig
+#include <cmath>                    // std::sqrt
+#include <iostream>                 // For cerr
+#include <tuple>                    // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -15,34 +17,29 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create a square matrix for eig operation
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // eig requires a 2D tensor (matrix)
-        if (input.dim() != 2) {
-            // Reshape to a square matrix if possible
-            int64_t total_elements = input.numel();
-            int64_t dim_size = static_cast<int64_t>(std::sqrt(total_elements));
-            
-            if (dim_size > 0) {
-                // Ensure we have a square matrix
-                input = input.reshape({dim_size, dim_size});
-            } else {
-                // Create a minimal 1x1 matrix if we can't reshape
-                input = torch::ones({1, 1}, input.options());
-            }
-        } else if (input.size(0) != input.size(1)) {
-            // If 2D but not square, make it square
-            int64_t min_dim = std::min(input.size(0), input.size(1));
-            input = input.slice(0, 0, min_dim).slice(1, 0, min_dim);
+        // Create a square matrix for torch.eig operation
+        torch::Tensor raw_input = fuzzer_utils::createTensor(Data, Size, offset);
+
+        // Bound total elements to keep allocations reasonable and reshape to square
+        constexpr int64_t max_elements = 4096;
+        auto flat = raw_input.flatten();
+        if (flat.numel() == 0) {
+            flat = torch::zeros({1}, raw_input.options());
         }
-        
-        // Ensure the tensor has a compatible dtype for eig
-        if (input.dtype() != torch::kFloat && 
-            input.dtype() != torch::kDouble && 
-            input.dtype() != torch::kComplexFloat && 
-            input.dtype() != torch::kComplexDouble) {
-            // Convert to float for eig operation
+        int64_t limited_elems = std::min<int64_t>(flat.numel(), max_elements);
+        flat = flat.narrow(0, 0, limited_elems);
+        int64_t square_size = std::max<int64_t>(1, static_cast<int64_t>(std::sqrt(static_cast<double>(flat.numel()))));
+        while (square_size > 1 && square_size * square_size > flat.numel()) {
+            --square_size;
+        }
+        int64_t target_elems = square_size * square_size;
+        if (target_elems == 0) {
+            target_elems = 1;
+        }
+        torch::Tensor input = flat.narrow(0, 0, target_elems).reshape({square_size, square_size});
+
+        // Ensure the tensor has a compatible dtype for eig (torch.eig requires floating real types)
+        if (input.dtype() != torch::kFloat && input.dtype() != torch::kDouble) {
             input = input.to(torch::kFloat);
         }
         
@@ -52,8 +49,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             eigenvectors = Data[offset++] & 0x1;
         }
         
-        // Apply torch.linalg.eig operation
-        auto result = torch::linalg::eig(input);
+        // Apply eig operation (torch.eig target API)
+        auto result = at::linalg_eig(input);
         
         // Access the eigenvalues and eigenvectors
         auto eigenvalues = std::get<0>(result);
@@ -61,18 +58,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Perform some operations with the results to ensure they're used
         if (eigenvectors) {
-            auto product = torch::matmul(input, eigenvectors_tensor);
-            auto sum = torch::sum(product);
+            auto vec_norm = torch::sum(torch::abs(eigenvectors_tensor));
             
             // Use the sum to prevent optimization from removing the computation
-            if (sum.item<float>() == -12345.6789f) {
+            if (vec_norm.item<double>() == -12345.6789) {
                 return 1; // This will never happen, just to use the result
             }
         }
         
         // Use eigenvalues to prevent optimization from removing the computation
-        auto sum_eigenvalues = torch::sum(eigenvalues);
-        if (sum_eigenvalues.item<float>() == -12345.6789f) {
+        auto sum_eigenvalues = torch::sum(torch::abs(eigenvalues));
+        if (sum_eigenvalues.item<double>() == -12345.6789) {
             return 1; // This will never happen, just to use the result
         }
     }

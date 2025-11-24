@@ -1,6 +1,11 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstdlib>
+#include <cstring>
+#include <iostream> // For cerr
+#include <limits>
+#include <optional>
+#include <string_view>
+#include <tuple> // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -19,14 +24,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Extract parameters for hfft if we have more data
-        int64_t n = -1;  // Default: -1 means use the default size
+        std::optional<torch::SymInt> n_opt = std::nullopt;
         int64_t dim = -1; // Default dimension
         std::optional<std::string_view> norm = std::nullopt;
         
         // Parse n parameter if we have enough data
         if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&n, Data + offset, sizeof(int64_t));
+            int64_t raw_n;
+            std::memcpy(&raw_n, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
+
+            // Bound n to a reasonable size to avoid huge allocations
+            constexpr int64_t kMaxLength = 4096;
+            int64_t abs_n = (raw_n == std::numeric_limits<int64_t>::min())
+                                ? std::numeric_limits<int64_t>::max()
+                                : std::abs(raw_n);
+            if (abs_n > 0)
+            {
+                int64_t bounded_n = 1 + (abs_n % kMaxLength);
+                n_opt = torch::SymInt(bounded_n);
+            }
         }
         
         // Parse dim parameter if we have enough data
@@ -64,29 +81,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         break;
                 }
             }
+            ++offset;
         }
         
         // Apply hfft operation
-        torch::Tensor output;
-        
-        // Try different parameter combinations
-        if (n == -1) {
-            if (dim == -1) {
-                // Use default n and dim
-                output = torch::fft::hfft(input, c10::nullopt, norm);
-            } else {
-                // Use default n, specified dim
-                output = torch::fft::hfft(input, c10::nullopt, dim, norm);
-            }
-        } else {
-            if (dim == -1) {
-                // Use specified n, default dim
-                output = torch::fft::hfft(input, n, norm);
-            } else {
-                // Use specified n and dim
-                output = torch::fft::hfft(input, n, dim, norm);
-            }
+        int64_t target_dim = dim;
+        if (input.dim() == 0) {
+            target_dim = -1;
         }
+        torch::Tensor output = torch::fft::hfft(input, n_opt, target_dim, norm);
         
         // Force evaluation of the output tensor
         if (output.defined()) {

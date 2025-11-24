@@ -37,15 +37,16 @@ RUN wget https://apt.llvm.org/llvm.sh && \
     chmod +x llvm.sh && \
     ./llvm.sh 20 && \
     apt-get update && apt-get install -y --no-install-recommends \
-      clang-20 \
-      lld-20 \
-      libclang-20-dev \
-      llvm-20 \
-      llvm-20-dev \
+    clang-20 \
+    lld-20 \
+    libclang-20-dev \
+    llvm-20 \
+    llvm-20-dev \
     && rm -rf /var/lib/apt/lists/* && \
     update-alternatives --install /usr/bin/clang clang /usr/bin/clang-20 100 && \
     update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-20 100 && \
-    update-alternatives --install /usr/bin/ld ld /usr/bin/lld-20 100
+    update-alternatives --install /usr/bin/ld ld /usr/bin/lld-20 100 && \
+    update-alternatives --install /usr/bin/clangd clangd /usr/bin/clangd-20 100 
 
 # Install Python requirements (avoid upgrading apt-managed pip)
 RUN python3 -m pip install --no-cache-dir --break-system-packages \

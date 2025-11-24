@@ -100,29 +100,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     break;
                 }
                 case 1: {
-                    // Method 2: Trace a C++ function
-                    auto lambda_func = [](torch::Tensor x) -> torch::Tensor {
-                        return x.sigmoid();
-                    };
-                    
-                    torch::jit::Module traced_module = torch::jit::trace(lambda_func, {input_tensor});
-                    std::vector<torch::jit::IValue> inputs;
-                    inputs.push_back(input_tensor);
-                    torch::jit::IValue output = traced_module.forward(inputs);
-                    torch::Tensor result = output.toTensor();
-                    break;
-                }
-                case 2: {
-                    // Method 3: Create a simple traced module
-                    auto simple_func = [](torch::Tensor x) -> torch::Tensor {
-                        return x.tanh();
-                    };
-                    
-                    torch::jit::Module scripted_module = torch::jit::trace(simple_func, {input_tensor});
+                    // Method 2: Script a small module and run it
+                    torch::jit::Module scripted_module("scripted_module");
+                    scripted_module.define(R"JIT(
+                        def forward(self, x):
+                            return torch.sigmoid(x)
+                    )JIT");
                     std::vector<torch::jit::IValue> inputs;
                     inputs.push_back(input_tensor);
                     torch::jit::IValue output = scripted_module.forward(inputs);
-                    torch::Tensor result = output.toTensor();
+                    torch::Tensor result = output.toTensor().sum();
+                    break;
+                }
+                case 2: {
+                    // Method 3: Define a module with control flow
+                    torch::jit::Module scripted_module("control_module");
+                    scripted_module.define(R"JIT(
+                        def forward(self, x):
+                            if x.sum() > 0:
+                                return x.tanh()
+                            else:
+                                return x.relu()
+                    )JIT");
+                    std::vector<torch::jit::IValue> inputs;
+                    inputs.push_back(input_tensor);
+                    torch::jit::IValue output = scripted_module.forward(inputs);
+                    torch::Tensor result = output.toTensor().sum();
                     break;
                 }
             }
@@ -140,12 +143,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test serialization and deserialization if we have more data
         if (offset < Size && Data[offset++] % 2 == 0) {
-            // Create a simple traced module
-            auto simple_func = [](torch::Tensor x) -> torch::Tensor {
-                return x * 2;
-            };
-            
-            torch::jit::Module scripted_module = torch::jit::trace(simple_func, {input_tensor});
+            // Create a simple scripted module
+            torch::jit::Module scripted_module("serialized_module");
+            scripted_module.define(R"JIT(
+                def forward(self, x):
+                    return x * 2
+            )JIT");
             
             // Save to a temporary file
             scripted_module.save("temp_module.pt");

@@ -1,6 +1,6 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <ATen/autocast_mode.h>
+#include <iostream> // For cerr
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -25,54 +25,42 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             uint8_t dtype_selector = Data[offset++];
             dtype = fuzzer_utils::parseDataType(dtype_selector);
         }
-        
-        // Call the get_autocast_cpu_dtype function
-        torch::ScalarType result_dtype = torch::autocast::get_autocast_cpu_dtype();
-        
-        // Try setting the autocast CPU dtype
-        torch::autocast::set_autocast_cpu_dtype(dtype);
-        
-        // Try enabling/disabling autocast
-        torch::autocast::AutocastCPU guard(enabled);
-        
+
+        // torch.get_autocast_cpu_dtype target API
+        auto legacy_dtype = at::autocast::get_autocast_cpu_dtype();
+
+        auto original_dtype = at::autocast::get_autocast_dtype(at::kCPU);
+        bool original_enabled = at::autocast::is_autocast_enabled(at::kCPU);
+
+        // Update dtype and enabled flag based on fuzz input
+        at::autocast::set_autocast_dtype(at::kCPU, dtype);
+        at::autocast::set_autocast_enabled(at::kCPU, enabled);
+
         // Get the dtype again after setting
-        torch::ScalarType new_result_dtype = torch::autocast::get_autocast_cpu_dtype();
-        
+        auto new_result_dtype = at::autocast::get_autocast_dtype(at::kCPU);
+
         // Create a tensor with the autocast dtype
         if (offset < Size) {
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Try using the tensor with autocast
-            torch::Tensor result;
-            {
-                torch::autocast::AutocastCPU inner_guard(enabled);
-                result = tensor.to(torch::autocast::get_autocast_cpu_dtype());
-            }
+
+            torch::Tensor result = tensor.to(new_result_dtype);
+            (void)result.sum();
         }
-        
+
         // Try with different enabled states
-        {
-            torch::autocast::AutocastCPU guard1(true);
-            torch::ScalarType dtype1 = torch::autocast::get_autocast_cpu_dtype();
-        }
-        
-        {
-            torch::autocast::AutocastCPU guard2(false);
-            torch::ScalarType dtype2 = torch::autocast::get_autocast_cpu_dtype();
-        }
-        
-        // Try with nested autocast contexts
-        {
-            torch::autocast::AutocastCPU outer_guard(true);
-            torch::ScalarType outer_dtype = torch::autocast::get_autocast_cpu_dtype();
-            
-            {
-                torch::autocast::AutocastCPU inner_guard(false);
-                torch::ScalarType inner_dtype = torch::autocast::get_autocast_cpu_dtype();
-            }
-            
-            torch::ScalarType after_inner_dtype = torch::autocast::get_autocast_cpu_dtype();
-        }
+        at::autocast::set_autocast_enabled(at::kCPU, true);
+        auto dtype1 = at::autocast::get_autocast_dtype(at::kCPU);
+        at::autocast::set_autocast_enabled(at::kCPU, false);
+        auto dtype2 = at::autocast::get_autocast_dtype(at::kCPU);
+
+        // Flip back to original settings
+        at::autocast::set_autocast_dtype(at::kCPU, original_dtype);
+        at::autocast::set_autocast_enabled(at::kCPU, original_enabled);
+
+        (void)legacy_dtype;
+        (void)new_result_dtype;
+        (void)dtype1;
+        (void)dtype2;
     }
     catch (const std::exception &e)
     {

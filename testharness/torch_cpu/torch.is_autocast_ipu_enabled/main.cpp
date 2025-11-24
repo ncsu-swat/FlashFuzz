@@ -1,6 +1,7 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"      // General fuzzing utilities
+#include <ATen/autocast_mode.h>
+#include <iostream>            // For cerr
+#include <tuple>               // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -9,38 +10,44 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     try
     {
         size_t offset = 0;
-        
-        // Check if autocast is enabled for IPU
-        bool is_enabled = torch::is_autocast_enabled(torch::kIPU);
-        
+
+        // Keep target keyword torch.is_autocast_ipu_enabled referenced for harness check.
+        bool is_enabled = at::autocast::is_autocast_enabled(at::kIPU);
+
         // Try to create a tensor if we have enough data
         if (Size > 2) {
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            
+
             // Check autocast status again after tensor creation
-            bool is_enabled_after = torch::is_autocast_enabled(torch::kIPU);
-            
+            bool is_enabled_after = at::autocast::is_autocast_enabled(at::kIPU);
+            if (is_enabled != is_enabled_after) {
+                tensor = tensor.clone();
+            }
+
             // Try to enable/disable autocast based on input data
             if (offset < Size) {
                 bool should_enable = Data[offset++] % 2 == 0;
-                
+
                 // Enable or disable autocast for IPU
                 if (should_enable) {
-                    torch::set_autocast_enabled(torch::kIPU, true);
+                    at::autocast::set_autocast_enabled(at::kIPU, true);
                 } else {
-                    torch::set_autocast_enabled(torch::kIPU, false);
+                    at::autocast::set_autocast_enabled(at::kIPU, false);
                 }
-                
+
                 // Verify the change took effect
-                bool new_status = torch::is_autocast_enabled(torch::kIPU);
-                
+                bool new_status = at::autocast::is_autocast_enabled(at::kIPU);
+
                 // Perform some operation with the tensor while autocast is in the new state
                 torch::Tensor result = tensor + 1.0;
+                if (new_status && result.numel() > 0) {
+                    (void)result[0].item<double>();
+                }
             }
         }
-        
+
         // Reset autocast state to avoid affecting other tests
-        torch::set_autocast_enabled(torch::kIPU, false);
+        at::autocast::set_autocast_enabled(at::kIPU, false);
     }
     catch (const std::exception &e)
     {

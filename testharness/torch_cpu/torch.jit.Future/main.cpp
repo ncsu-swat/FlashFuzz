@@ -27,7 +27,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         future->markCompleted(c10::IValue(input_tensor));
         
         // Test wait() functionality
-        c10::IValue result = future->wait();
+        future->wait();
+        c10::IValue result = future->value();
         
         // Test value() functionality
         c10::IValue value_result = future->value();
@@ -66,13 +67,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test then() functionality
         if (offset < Size) {
             auto then_future = c10::make_intrusive<torch::jit::Future>(c10::TensorType::get());
-            auto next_future = then_future->then([](c10::IValue val) {
-                torch::Tensor t = val.toTensor();
+            auto next_future = then_future->then([](c10::ivalue::Future& parent_future) {
+                torch::Tensor t = parent_future.constValue().toTensor();
                 return c10::IValue(t * 2);
             }, c10::TensorType::get());
             
             then_future->markCompleted(c10::IValue(input_tensor));
-            c10::IValue then_result = next_future->wait();
+            next_future->wait();
+            c10::IValue then_result = next_future->value();
         }
         
         // Test Future with different types
@@ -80,7 +82,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto int_future = c10::make_intrusive<torch::jit::Future>(c10::IntType::get());
             int value = static_cast<int>(Data[offset % Size]);
             int_future->markCompleted(c10::IValue(value));
-            c10::IValue int_result = int_future->wait();
+            int_future->wait();
+            c10::IValue int_result = int_future->value();
         }
         
         // Test Future with void type
@@ -98,7 +101,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             tensors.push_back(input_tensor);
             tensors.push_back(input_tensor);
             list_future->markCompleted(c10::IValue(tensors));
-            c10::IValue list_result = list_future->wait();
+            list_future->wait();
+            c10::IValue list_result = list_future->value();
         }
         
         // Test Future with tuple type
@@ -108,7 +112,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto tuple_future = c10::make_intrusive<torch::jit::Future>(tuple_type);
             std::vector<c10::IValue> tuple_elements = {c10::IValue(input_tensor), c10::IValue(42)};
             tuple_future->markCompleted(c10::IValue(c10::ivalue::Tuple::create(tuple_elements)));
-            c10::IValue tuple_result = tuple_future->wait();
+            tuple_future->wait();
+            c10::IValue tuple_result = tuple_future->value();
         }
     }
     catch (const std::exception &e)

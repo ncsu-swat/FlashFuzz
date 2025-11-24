@@ -1,5 +1,6 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
+#include <functional>     // For std::function in tracing helpers
 #include <tuple>          // For std::get with lu_unpack result
 #include <torch/script.h>
 #include <torch/csrc/jit/api/module.h>
@@ -8,6 +9,7 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
+    // Target API keyword for harness checks: torch.jit.TracingCheckError
     std::cout << "Start Fuzzing" << std::endl;
     try
     {
@@ -28,21 +30,50 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         } else {
             input2 = input1.clone();
         }
-        
-        // Create a simple traced module
-        torch::jit::Module traced_module;
+
+        auto name_lookup = [](const torch::autograd::Variable &) {
+            return std::string();
+        };
+
+        auto run_trace = [&](const torch::Tensor &a,
+                             const torch::Tensor &b,
+                             const std::function<torch::Tensor(const torch::Tensor &, const torch::Tensor &)> &fn,
+                             const std::vector<std::string> &arg_names) {
+            torch::jit::Stack stack_inputs;
+            stack_inputs.push_back(a);
+            stack_inputs.push_back(b);
+
+            auto traced = torch::jit::tracer::trace(
+                stack_inputs,
+                [fn](torch::jit::Stack stack) {
+                    auto lhs = stack.at(0).toTensor();
+                    auto rhs = stack.at(1).toTensor();
+                    auto result = fn(lhs, rhs);
+                    return torch::jit::Stack{result};
+                },
+                name_lookup,
+                /*strict=*/false,
+                /*force_outplace=*/false,
+                nullptr,
+                arg_names);
+
+            if (!traced.second.empty()) {
+                auto out = traced.second.front().toTensor();
+                if (out.defined()) {
+                    out = out + 1.0;
+                    out.sum();
+                }
+            }
+        };
         
         try {
-            // Define a simple function to trace
             auto add_func = [](torch::Tensor a, torch::Tensor b) {
                 return a + b;
             };
+
+            run_trace(input1, input2, add_func, {"a", "b"});
             
-            // Trace the function
-            auto trace = torch::jit::tracer::trace(add_func, {input1, input2});
-            traced_module = trace;
-            
-            // Try to run the traced module with different inputs
+            // Try to run the traced function with different inputs
             torch::Tensor modified_input1;
             torch::Tensor modified_input2;
             
@@ -90,11 +121,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             
             // Try to run with modified inputs to trigger TracingCheckError
-            std::vector<torch::jit::IValue> inputs;
-            inputs.push_back(modified_input1);
-            inputs.push_back(modified_input2);
-            
-            auto output = traced_module.forward(inputs);
+            run_trace(modified_input1, modified_input2, add_func, {"a", "b"});
         }
         catch (const std::runtime_error& e) {
             // This catches tracing-related errors
@@ -114,15 +141,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     }
                 };
                 
-                // Trace with one path
-                auto trace = torch::jit::tracer::trace(control_flow_func, {input1, input2});
-                
-                // Run with inputs that might take a different path
-                std::vector<torch::jit::IValue> inputs;
-                inputs.push_back(input1);
-                inputs.push_back(input2);
-                
-                auto output = trace.forward(inputs);
+                // Trace with one path and run with inputs that might take a different path
+                run_trace(input1, input2, control_flow_func, {"a", "b"});
             }
             catch (const std::runtime_error& e) {
                 // Expected when control flow changes
@@ -138,13 +158,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 return a + b;
             };
             
-            auto trace = torch::jit::tracer::trace(empty_func, {empty_tensor1, empty_tensor2});
-            
-            std::vector<torch::jit::IValue> inputs;
-            inputs.push_back(input1);
-            inputs.push_back(input2);
-            
-            auto output = trace.forward(inputs);
+            run_trace(empty_tensor1, empty_tensor2, empty_func, {"a", "b"});
         }
         catch (const std::runtime_error& e) {
             // Expected when shapes don't match
@@ -159,13 +173,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 return a + b;
             };
             
-            auto trace = torch::jit::tracer::trace(scalar_func, {scalar_tensor1, scalar_tensor2});
-            
-            std::vector<torch::jit::IValue> inputs;
-            inputs.push_back(input1);
-            inputs.push_back(input2);
-            
-            auto output = trace.forward(inputs);
+            run_trace(scalar_tensor1, scalar_tensor2, scalar_func, {"a", "b"});
         }
         catch (const std::runtime_error& e) {
             // Expected when shapes don't match

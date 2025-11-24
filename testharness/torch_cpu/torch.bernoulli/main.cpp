@@ -62,7 +62,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Variant 4: in-place bernoulli with generator
         if (offset < Size && (input_tensor.is_floating_point() || input_tensor.scalar_type() == torch::kBool)) {
             torch::Tensor result4 = input_tensor.clone();
-            auto gen = torch::default_generator();
+            auto gen = torch::make_generator<torch::CPUGeneratorImpl>();
             uint64_t seed = 0;
             if (offset + sizeof(uint64_t) <= Size) {
                 std::memcpy(&seed, Data + offset, sizeof(uint64_t));
@@ -74,7 +74,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Variant 5: bernoulli with generator
         if (offset < Size) {
-            auto gen = torch::default_generator();
+            auto gen = torch::make_generator<torch::CPUGeneratorImpl>();
             uint64_t seed = 0;
             if (offset + sizeof(uint64_t) <= Size) {
                 std::memcpy(&seed, Data + offset, sizeof(uint64_t));

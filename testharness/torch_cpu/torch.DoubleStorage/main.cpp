@@ -1,6 +1,10 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <algorithm>
+#include <cstring>
+#include <cstdlib>
+#include <iostream>
+
+// Target API: torch.DoubleStorage
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -9,133 +13,73 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     try
     {
         size_t offset = 0;
-        
-        // Need at least a few bytes to create meaningful input
         if (Size < 4) {
             return 0;
         }
-        
-        // Create a tensor from the input data
-        torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create a Storage for double type
-        at::Storage storage;
-        
-        // Try different ways to create/use Storage based on remaining data
+
+        torch::Tensor seed = fuzzer_utils::createTensor(Data, Size, offset).to(torch::kDouble);
+
+        int64_t storage_size = 1;
+        if (offset + sizeof(int64_t) <= Size) {
+            std::memcpy(&storage_size, Data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+        }
+        storage_size = std::clamp<int64_t>(std::abs(storage_size), 1, 512);
+
+        torch::Tensor double_tensor = torch::empty({storage_size}, torch::kDouble);
+        torch::Storage storage = double_tensor.storage();
+
         if (offset < Size) {
-            uint8_t option = Data[offset++] % 4;
-            
-            switch (option) {
-                case 0: {
-                    // Create empty storage
-                    storage = at::Storage(at::caffe2::TypeMeta::Make<double>());
-                    break;
-                }
-                case 1: {
-                    // Create storage with size
-                    int64_t size = tensor.numel() > 0 ? tensor.numel() : 1;
-                    storage = at::Storage(at::caffe2::TypeMeta::Make<double>(), size, at::DataPtr(nullptr, at::Device(at::DeviceType::CPU)));
-                    break;
-                }
-                case 2: {
-                    // Create storage from tensor data
-                    // Convert tensor to double type if needed
-                    torch::Tensor doubleTensor = tensor.to(torch::kDouble);
-                    storage = doubleTensor.storage();
-                    break;
-                }
-                case 3: {
-                    // Create storage with data from raw bytes
-                    size_t remaining = Size - offset;
-                    size_t num_doubles = remaining / sizeof(double);
-                    
-                    if (num_doubles > 0) {
-                        std::vector<double> values(num_doubles);
-                        std::memcpy(values.data(), Data + offset, num_doubles * sizeof(double));
-                        torch::Tensor temp = torch::from_blob(values.data(), {static_cast<int64_t>(num_doubles)}, torch::kDouble).clone();
-                        storage = temp.storage();
-                    } else {
-                        storage = at::Storage(at::caffe2::TypeMeta::Make<double>());
-                    }
-                    break;
-                }
-            }
-        } else {
-            // Default case if we've consumed all data
-            storage = at::Storage(at::caffe2::TypeMeta::Make<double>());
-        }
-        
-        // Test storage operations
-        if (offset < Size && storage.nbytes() > 0) {
-            uint8_t op = Data[offset++] % 4;
-            
-            switch (op) {
-                case 0: {
-                    // Resize storage
-                    int64_t new_size = (offset < Size) ? Data[offset++] : 10;
-                    storage.resize_(new_size * sizeof(double));
-                    break;
-                }
-                case 1: {
-                    // Fill storage with value
-                    double fill_value = 0.0;
-                    if (offset + sizeof(double) <= Size) {
-                        std::memcpy(&fill_value, Data + offset, sizeof(double));
-                        offset += sizeof(double);
-                    }
-                    if (storage.data_ptr().get() != nullptr) {
-                        double* data_ptr = static_cast<double*>(storage.data_ptr().get());
-                        size_t num_elements = storage.nbytes() / sizeof(double);
-                        for (size_t i = 0; i < num_elements; i++) {
-                            data_ptr[i] = fill_value;
-                        }
-                    }
-                    break;
-                }
-                case 2: {
-                    // Access elements
-                    if (storage.data_ptr().get() != nullptr) {
-                        double* data_ptr = static_cast<double*>(storage.data_ptr().get());
-                        size_t num_elements = storage.nbytes() / sizeof(double);
-                        for (size_t i = 0; i < num_elements; i++) {
-                            double val = data_ptr[i];
-                            data_ptr[i] = val * 2.0;
-                        }
-                    }
-                    break;
-                }
-                case 3: {
-                    // Copy storage
-                    at::Storage copy_storage = storage.copy();
-                    break;
+            uint8_t selector = Data[offset++] % 3;
+            if (selector == 1 && seed.numel() > 0) {
+                storage = seed.contiguous().storage();
+            } else if (selector == 2) {
+                int64_t blob_elems = std::min<int64_t>(
+                    static_cast<int64_t>((Size - offset) / sizeof(double)),
+                    storage_size);
+                if (blob_elems > 0) {
+                    torch::Tensor blob_tensor = torch::from_blob(
+                        const_cast<uint8_t*>(Data + offset),
+                        {blob_elems},
+                        torch::kDouble);
+                    storage = blob_tensor.storage();
+                    offset += blob_elems * static_cast<int64_t>(sizeof(double));
                 }
             }
         }
-        
-        // Create a tensor from the storage
-        if (storage.nbytes() > 0) {
-            std::vector<int64_t> sizes;
-            if (tensor.dim() > 0) {
-                sizes = tensor.sizes().vec();
-            } else {
-                sizes = {static_cast<int64_t>(storage.nbytes() / sizeof(double))};
+
+        int64_t available_elems = storage.nbytes() / static_cast<int64_t>(sizeof(double));
+        available_elems = std::min<int64_t>(available_elems, 1024);
+
+        if (available_elems > 0) {
+            torch::Tensor fill_tensor = torch::from_blob(
+                storage.mutable_data(),
+                {available_elems},
+                torch::kDouble);
+
+            int64_t copy_elems = std::min<int64_t>(seed.numel(), available_elems);
+            if (copy_elems > 0) {
+                std::memcpy(fill_tensor.data_ptr<double>(), seed.data_ptr<double>(), copy_elems * sizeof(double));
+            } else if (offset < Size) {
+                double fill_value = static_cast<double>(Data[offset++]) / 255.0;
+                fill_tensor.fill_(fill_value);
             }
-            
-            // Ensure product of sizes matches storage size
-            int64_t total_size = 1;
-            for (auto s : sizes) {
-                total_size *= s;
+
+            torch::Tensor copy_tensor = torch::zeros({available_elems}, torch::kDouble);
+            torch::Storage copy_storage = copy_tensor.storage();
+            size_t bytes_to_copy = std::min(storage.nbytes(), copy_storage.nbytes());
+            if (bytes_to_copy > 0) {
+                std::memcpy(copy_storage.mutable_data(), storage.data(), bytes_to_copy);
             }
-            
-            if (total_size * sizeof(double) > storage.nbytes()) {
-                sizes = {static_cast<int64_t>(storage.nbytes() / sizeof(double))};
-            }
-            
-            torch::Tensor result = torch::from_blob(
-                storage.data_ptr().get(),
-                sizes,
-                torch::TensorOptions().dtype(torch::kDouble)
-            ).clone();
+
+            torch::Tensor view_tensor = torch::from_blob(
+                storage.mutable_data(),
+                {available_elems},
+                torch::kDouble);
+            volatile double first = view_tensor[0].item<double>();
+            volatile double sum = copy_tensor.sum().item<double>();
+            (void)first;
+            (void)sum;
         }
     }
     catch (const std::exception &e)

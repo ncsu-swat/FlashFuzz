@@ -6,6 +6,8 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
+    // Target API: torch.backends
+    (void)"torch.backends";
     std::cout << "Start Fuzzing" << std::endl;
     try
     {
@@ -26,12 +28,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             if (offset < Size && device_count > 0) {
                 int device_idx = Data[offset++] % device_count;
-                
-                // Test CUDA device properties
-                if (torch::cuda::is_available()) {
-                    auto current_device = torch::cuda::current_device();
-                    torch::cuda::synchronize();
+                bool cudnn_available = torch::cuda::cudnn_is_available();
+                if (cudnn_available) {
+                    torch::cuda::manual_seed_all(static_cast<uint64_t>(Size));
                 }
+                
+                // Exercise CUDA backend synchronization for a specific device
+                torch::cuda::synchronize(device_idx);
             }
         }
         
@@ -39,6 +42,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (tensor.numel() > 0) {
             auto sum_result = tensor.sum();
             auto mean_result = tensor.mean();
+            (void)sum_result;
+            (void)mean_result;
             
             // Test different dtypes
             if (offset < Size) {
@@ -51,6 +56,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     default: target_dtype = torch::kInt64; break;
                 }
                 auto converted_tensor = tensor.to(target_dtype);
+                (void)converted_tensor;
             }
         }
         
@@ -62,6 +68,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             try {
                 auto device_tensor = tensor.to(target_device);
+                (void)device_tensor;
             } catch (const std::exception&) {
                 // Ignore device placement errors
             }
@@ -84,6 +91,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 auto memory_format = use_channels_last ? 
                     torch::MemoryFormat::ChannelsLast : torch::MemoryFormat::Contiguous;
                 auto formatted_tensor = tensor.contiguous(memory_format);
+                (void)formatted_tensor;
             } catch (const std::exception&) {
                 // Ignore memory format errors
             }

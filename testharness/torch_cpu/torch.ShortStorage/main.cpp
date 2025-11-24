@@ -1,10 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"        // General fuzzing utilities
+#include <c10/core/CPUAllocator.h> // For c10::GetDefaultCPUAllocator
+#include <algorithm>             // For std::min
+#include <cmath>                 // For std::abs
+#include <cstring>               // For std::memcpy
+#include <cstdint>               // For fixed-width integer types
+#include <iostream>              // For cerr
+#include <tuple>                 // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
+    // Target API keyword: torch.ShortStorage
     std::cout << "Start Fuzzing" << std::endl;
     try
     {
@@ -20,37 +26,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Create a ShortStorage from the tensor
         try {
-            // Convert tensor to short type if needed
-            if (tensor.dtype() != torch::kInt16) {
-                tensor = tensor.to(torch::kInt16);
-            }
+            auto short_tensor = tensor.to(torch::kInt16).reshape(-1).contiguous();
+            constexpr int64_t kMaxElements = 4096;
+            const int64_t storage_elements = std::min<int64_t>(short_tensor.numel(), kMaxElements);
+            const size_t storage_bytes = static_cast<size_t>(storage_elements) * sizeof(int16_t);
             
-            // Create ShortStorage from tensor
-            auto storage = c10::Storage(c10::make_intrusive<c10::StorageImpl>(
-                c10::StorageImpl::use_byte_size_t(),
-                tensor.numel() * sizeof(int16_t),
+            c10::Storage storage(
+                c10::Storage::use_byte_size_t(),
+                storage_bytes,
                 c10::GetDefaultCPUAllocator(),
-                true));
+                true);
             
-            // Fill storage with tensor data
-            auto tensor_contiguous = tensor.reshape(-1).contiguous();
-            auto tensor_accessor = tensor_contiguous.accessor<int16_t, 1>();
-            int16_t* storage_data = static_cast<int16_t*>(storage.data());
-            for (int64_t i = 0; i < tensor.numel() && i < storage.nbytes() / sizeof(int16_t); i++) {
-                storage_data[i] = tensor_accessor[i];
+            int16_t *storage_data = static_cast<int16_t *>(storage.mutable_data());
+            if (storage_data && storage_elements > 0) {
+                auto tensor_accessor = short_tensor.accessor<int16_t, 1>();
+                for (int64_t i = 0; i < storage_elements; i++) {
+                    storage_data[i] = tensor_accessor[i];
+                }
             }
             
-            // Test storage properties
-            int64_t size = storage.nbytes() / sizeof(int16_t);
-            
-            // Test data access
-            if (storage.data() && size > 0) {
-                int16_t first_element = storage_data[0];
+            int64_t storage_size = static_cast<int64_t>(storage.nbytes() / sizeof(int16_t));
+            int32_t accumulator = 0;
+            if (storage_data && storage_size > 0) {
+                accumulator += storage_data[0];
                 
                 // Test element assignment if size allows
-                if (size > 1) {
+                if (storage_size > 1) {
                     storage_data[1] = 42;
-                    int16_t modified_element = storage_data[1];
+                    accumulator += storage_data[1];
                 }
             }
             
@@ -60,38 +63,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Test move constructor
             auto storage_moved = std::move(storage_copy);
             
-            // Test resize
-            if (offset + sizeof(int64_t) <= Size) {
-                int64_t new_size;
-                std::memcpy(&new_size, Data + offset, sizeof(int64_t));
+            // Test resize by reallocating through the allocator when possible
+            if (offset + sizeof(int64_t) <= Size && storage_moved.resizable() && storage_moved.allocator()) {
+                int64_t new_size_raw;
+                std::memcpy(&new_size_raw, Data + offset, sizeof(int64_t));
                 offset += sizeof(int64_t);
                 
-                // Ensure new_size is reasonable
-                new_size = std::abs(new_size) % 1000;
-                
-                storage_moved.resize(new_size * sizeof(int16_t));
+                const int64_t new_elements = std::min<int64_t>(std::abs(new_size_raw) % (kMaxElements + 1), kMaxElements);
+                const size_t new_bytes = static_cast<size_t>(new_elements) * sizeof(int16_t);
+                auto new_ptr = storage_moved.allocator()->allocate(new_bytes);
+                storage_moved.set_data_ptr_noswap(std::move(new_ptr));
+                storage_moved.set_nbytes(new_bytes);
+                storage_data = static_cast<int16_t *>(storage_moved.mutable_data());
+                storage_size = static_cast<int64_t>(storage_moved.nbytes() / sizeof(int16_t));
             }
             
             // Test fill
-            if (offset < Size && storage_moved.data()) {
+            if (offset < Size && storage_data) {
                 int16_t fill_value = static_cast<int16_t>(Data[offset++]);
-                int16_t* moved_data = static_cast<int16_t*>(storage_moved.data());
-                int64_t moved_size = storage_moved.nbytes() / sizeof(int16_t);
+                int64_t moved_size = static_cast<int64_t>(storage_moved.nbytes() / sizeof(int16_t));
                 for (int64_t i = 0; i < moved_size; i++) {
-                    moved_data[i] = fill_value;
+                    storage_data[i] = fill_value;
                 }
             }
             
-            // Create a tensor from the storage
-            int64_t storage_size = storage_moved.nbytes() / sizeof(int16_t);
+            // Create a tensor from the storage and exercise it
             auto tensor_from_storage = torch::empty({storage_size}, torch::kInt16);
-            if (storage_moved.data() && storage_size > 0) {
+            if (storage_data && storage_size > 0) {
                 auto accessor = tensor_from_storage.accessor<int16_t, 1>();
-                int16_t* moved_data = static_cast<int16_t*>(storage_moved.data());
                 for (int64_t i = 0; i < storage_size; i++) {
-                    accessor[i] = moved_data[i];
+                    accessor[i] = storage_data[i];
                 }
             }
+            auto reduction = tensor_from_storage.sum().item<int64_t>() + accumulator;
+            (void)reduction;
         }
         catch (const c10::Error &e) {
             // PyTorch specific errors are expected and okay

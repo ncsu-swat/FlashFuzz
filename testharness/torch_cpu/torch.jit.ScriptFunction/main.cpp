@@ -1,26 +1,26 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"                          // General fuzzing utilities
+#include <torch/csrc/jit/api/compilation_unit.h>   // StrongFunctionPtr (ScriptFunction binding)
+#include <torch/script.h>                          // torch::jit::compile and Stack/IValue
+#include <iostream>                                // For cerr
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
     try
     {
         size_t offset = 0;
-        
+
         // Need at least a few bytes to create a tensor and define a script function
         if (Size < 4) {
             return 0;
         }
-        
+
         // Create input tensor from fuzzer data
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
+
         // Define a simple script function
         std::string script_code;
-        
+
         // Use remaining bytes to determine which function to test
         if (offset < Size) {
             uint8_t func_selector = Data[offset++] % 5;
@@ -46,7 +46,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         } else {
             script_code = "def forward(x):\n  return x + 1";
         }
-        
+
         // Compile the script function
         std::shared_ptr<torch::jit::CompilationUnit> cu;
         try {
@@ -56,21 +56,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             script_code = "def forward(x):\n  return x";
             cu = torch::jit::compile(script_code);
         }
-        
+
         // Get the forward function from the compilation unit
         torch::jit::Function& forward_func = cu->get_function("forward");
-        
-        // Create inputs vector for the function
-        std::vector<torch::jit::IValue> inputs;
-        inputs.push_back(input_tensor);
-        
-        // Call the function
-        torch::jit::IValue output = forward_func(inputs);
-        
+
+        // StrongFunctionPtr backs the Python-exposed torch.jit.ScriptFunction
+        torch::jit::StrongFunctionPtr script_function(cu, &forward_func); // torch.jit.ScriptFunction
+
+        // Prepare call stack and invoke the ScriptFunction
+        torch::jit::Stack stack;
+        stack.emplace_back(input_tensor);
+        auto output = (*script_function.function_)(std::move(stack));
+
         // Try to extract the tensor from the output
         if (output.isTensor()) {
             torch::Tensor result = output.toTensor();
-            
+
             // Optional: perform some operation on the result to ensure it's used
             if (result.defined() && result.numel() > 0) {
                 auto sum = result.sum().item<float>();

@@ -1,6 +1,8 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <algorithm>
+#include <cstring>
+#include <iostream> // For cerr
+#include <tuple>    // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -14,6 +16,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
+        // Target API: torch.ComplexFloatStorage
         // Create a tensor with complex float values
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
@@ -31,7 +34,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Access elements if storage is not empty
         if (storage_size > 0) {
             // Access data pointer
-            auto data_ptr = static_cast<c10::complex<float>*>(storage.data());
+            auto data_ptr = static_cast<const c10::complex<float>*>(storage.data());
             
             // Access first element
             auto first_element = data_ptr[0];
@@ -47,16 +50,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Test data() method
-        auto data_ptr = storage.data();
-        
+        const void *raw_data = storage.data();
+
         // Test nbytes() method
         auto nbytes = storage.nbytes();
-        
+
         // Test device() method
         auto device = storage.device();
-        
-        // Test is_pinned() method
-        auto is_pinned = storage.is_pinned();
         
         // Test copy operations if we have enough data
         if (offset + 1 < Size) {
@@ -65,8 +65,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto new_storage = new_tensor.storage();
             
             // Copy data manually
-            if (storage_size > 0) {
-                std::memcpy(new_storage.data(), storage.data(), storage.nbytes());
+            if (storage_size > 0 && nbytes > 0) {
+                std::memcpy(new_storage.mutable_data(), raw_data, nbytes);
             }
             
             // Create a partial copy if storage is not empty
@@ -74,7 +74,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 size_t partial_size = std::max<size_t>(1, storage_size / 2);
                 auto partial_tensor = torch::zeros({static_cast<int64_t>(partial_size)}, torch::kComplexFloat);
                 auto partial_storage = partial_tensor.storage();
-                std::memcpy(partial_storage.data(), storage.data(), partial_size * sizeof(c10::complex<float>));
+                std::memcpy(partial_storage.mutable_data(), raw_data, partial_size * sizeof(c10::complex<float>));
             }
         }
         
@@ -91,7 +91,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(c10::complex<float>);
             
             // Fill the tensor data
-            auto data_ptr = static_cast<c10::complex<float>*>(storage.data());
+            auto data_ptr = static_cast<c10::complex<float>*>(storage.mutable_data());
             for (size_t i = 0; i < storage_size; ++i) {
                 data_ptr[i] = fill_value;
             }
@@ -99,7 +99,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test creating a tensor from storage
         if (storage_size > 0) {
-            auto tensor_from_storage = torch::from_blob(storage.data(), {static_cast<int64_t>(storage_size)}, 
+            auto tensor_from_storage = torch::from_blob(storage.mutable_data(), {static_cast<int64_t>(storage_size)}, 
                                                        torch::TensorOptions().dtype(torch::kComplexFloat));
         }
         
@@ -112,7 +112,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test creating a storage from data pointer
         if (storage_size > 0) {
-            auto storage_from_data = torch::from_blob(storage.data(), {static_cast<int64_t>(storage_size)}, 
+            auto storage_from_data = torch::from_blob(storage.mutable_data(), {static_cast<int64_t>(storage_size)}, 
                                                      torch::TensorOptions().dtype(torch::kComplexFloat));
         }
     }

@@ -2,6 +2,8 @@
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
 
+// Fuzz target: torch.get_device_module
+
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
@@ -35,8 +37,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 if (torch::cuda::is_available()) {
                     // If we have more data, use it to select a CUDA device index
                     int device_index = 0;
+                    int available = torch::cuda::device_count();
+                    if (available <= 0) {
+                        available = 1;
+                    }
                     if (offset < Size) {
-                        device_index = static_cast<int>(Data[offset++]) % torch::cuda::device_count();
+                        device_index = static_cast<int>(Data[offset++]) % available;
                     }
                     device = torch::Device(torch::kCUDA, device_index);
                 } else {
@@ -57,25 +63,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test tensor device properties
         auto device = tensor.device();
-        auto device_type = device.type();
-        auto device_index = device.index();
         
         // Test device functionality based on type
         if (device.is_cuda() && torch::cuda::is_available()) {
             int device_count = torch::cuda::device_count();
-            int current_device = torch::cuda::current_device();
-            
-            // Test setting current device if possible
-            if (device_count > 1) {
-                int new_device = (current_device + 1) % device_count;
-                torch::cuda::set_device(new_device);
+            if (device_count <= 0) {
+                device_count = 1;
             }
-            
-            // Test synchronization
-            torch::cuda::synchronize();
-            
-            // Test device properties
-            auto properties = torch::cuda::getDeviceProperties(device.index());
+            auto index = device.index();
+            if (index < 0 || index >= device_count) {
+                index = 0;
+            }
+            // Synchronize with the chosen device index
+            torch::cuda::synchronize(index);
+        }
+        else if (device.type() == torch::kMPS && torch::mps::is_available()) {
+            torch::mps::synchronize();
         }
         
         // Test basic tensor operations on the device

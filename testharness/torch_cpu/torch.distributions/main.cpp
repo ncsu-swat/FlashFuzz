@@ -2,6 +2,7 @@
 #include <iostream>       // For cerr
 #include <tuple>          // For std::get with lu_unpack result
 #include <torch/torch.h>
+// Target API: torch.distributions
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
@@ -27,45 +28,53 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             try {
                 if (dist_type == 0 && loc.dim() == 0 && scale.dim() == 0) {
                     // Normal distribution
-                    auto normal = torch::normal(loc, scale.abs());
+                    auto normal = at::normal(loc, scale.abs(), c10::nullopt);
+                    normal.sum();
                 }
                 else if (dist_type == 1 && loc.dim() == 0 && scale.dim() == 0) {
                     // Bernoulli distribution
                     auto probs = torch::sigmoid(loc);
                     auto bernoulli = torch::bernoulli(probs);
+                    bernoulli.sum();
                 }
                 else if (dist_type == 2 && loc.dim() == 0 && scale.dim() == 0) {
                     // Exponential distribution
                     auto rate = scale.abs() + 1e-5;  // Ensure rate is positive
                     auto exponential = torch::exponential(rate);
+                    exponential.sum();
                 }
                 else if (dist_type == 3) {
                     // Categorical distribution
                     auto probs = torch::softmax(loc, -1);
                     auto categorical = torch::multinomial(probs, 1);
+                    categorical.sum();
                 }
                 else if (dist_type == 4 && loc.dim() == 0 && scale.dim() == 0) {
                     // Uniform distribution
                     auto low = loc;
                     auto high = loc + scale.abs() + 1e-5;  // Ensure high > low
                     auto uniform = torch::rand_like(loc) * (high - low) + low;
+                    uniform.sum();
                 }
                 else if (dist_type == 5 && loc.dim() == 0 && scale.dim() == 0) {
                     // Gamma distribution
                     auto concentration = scale.abs() + 1e-5;  // Ensure positive
-                    auto rate = loc.abs() + 1e-5;  // Ensure positive
-                    auto gamma = torch::gamma(concentration);
+                    auto rate = loc.abs() + 1e-5;             // Ensure positive
+                    auto gamma_eval = torch::lgamma(concentration + rate);
+                    gamma_eval.sum();
                 }
                 else if (dist_type == 6 && loc.dim() > 0) {
                     // Multinomial distribution
                     auto probs = torch::softmax(loc, -1);
                     int64_t total_count = 10;
                     auto multinomial = torch::multinomial(probs, total_count, true);
+                    multinomial.sum();
                 }
                 else if (dist_type == 7 && loc.dim() == 0 && scale.dim() == 0) {
                     // Poisson distribution
                     auto rate = scale.abs() + 1e-5;  // Ensure rate is positive
                     auto poisson = torch::poisson(rate);
+                    poisson.sum();
                 }
             } catch (const std::exception &e) {
                 // Distribution-specific exceptions are expected and handled here
@@ -85,6 +94,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 cov.add_(torch::eye(dim).mul(0.01));  // Ensure positive definiteness
                 
                 auto mvn = torch::mv(cov, loc_mv);
+                mvn.sum();
             } catch (const std::exception &e) {
                 // MultivariateNormal-specific exceptions are expected and handled here
             }
@@ -99,16 +109,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 for (int64_t i = 0; i < num_components; i++) {
                     auto comp_loc = torch::randn({});
                     auto comp_scale = torch::rand({}) + 0.1;  // Ensure positive scale
-                    components.push_back(torch::normal(comp_loc, comp_scale));
+                    components.push_back(at::normal(comp_loc, comp_scale, c10::nullopt));
                 }
                 
                 auto mix_probs = torch::softmax(torch::randn({num_components}), 0);
                 auto mixture = torch::multinomial(mix_probs, 1);
+                mix_probs.sum();
+                mixture.sum();
                 
                 // Sample from the mixture
                 auto component_idx = mixture.item<int64_t>();
                 if (component_idx < components.size()) {
                     auto sample = components[component_idx];
+                    sample.sum();
                 }
             } catch (const std::exception &e) {
                 // Mixture-specific exceptions are expected and handled here

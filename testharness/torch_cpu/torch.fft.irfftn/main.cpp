@@ -1,6 +1,9 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <c10/util/Optional.h>
+#include <cmath>
+#include <cstring>
+#include <iostream> // For cerr
+#include <string>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -22,7 +25,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         std::vector<int64_t> dims;
         if (offset + 1 < Size) {
             uint8_t num_dims = Data[offset++] % 5; // Up to 4 dimensions
-            
+
             for (uint8_t i = 0; i < num_dims && offset + sizeof(int64_t) <= Size; ++i) {
                 int64_t dim;
                 std::memcpy(&dim, Data + offset, sizeof(int64_t));
@@ -44,38 +47,51 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Parse s parameter (output signal size)
-        std::optional<std::vector<int64_t>> s = std::nullopt;
+        std::vector<int64_t> s_values;
+        bool use_s = false;
         if (offset < Size && Data[offset++] % 2 == 0) { // 50% chance to use s parameter
-            s = std::vector<int64_t>();
+            use_s = true;
             uint8_t s_size = (offset < Size) ? (Data[offset++] % 5) : 0; // Up to 4 dimensions
-            
+
             for (uint8_t i = 0; i < s_size && offset + sizeof(int64_t) <= Size; ++i) {
                 int64_t dim_size;
                 std::memcpy(&dim_size, Data + offset, sizeof(int64_t));
                 offset += sizeof(int64_t);
-                s->push_back(dim_size);
+
+                // Keep lengths small and positive to avoid huge allocations
+                int64_t bounded = 1 + static_cast<int64_t>(std::abs(dim_size) % 16);
+                s_values.push_back(bounded);
             }
         }
+
+        // Ensure the input is complex as required by irfftn
+        if (!input.is_complex()) {
+            input = input.to(torch::kComplexFloat);
+        }
+
+        // Clamp dims to the input rank to avoid invalid axes
+        const auto input_dim = input.dim();
+        if (input_dim == 0) {
+            dims.clear();
+        } else {
+            for (auto &d : dims) {
+                int64_t wrapped = static_cast<int64_t>(std::abs(d)) % input_dim;
+                d = wrapped;
+            }
+        }
+
+        c10::optional<torch::IntArrayRef> dims_opt;
+        if (!dims.empty() && input_dim > 0) {
+            dims_opt = torch::IntArrayRef(dims);
+        }
+
+        c10::optional<torch::IntArrayRef> s_opt;
+        if (use_s && !s_values.empty()) {
+            s_opt = torch::IntArrayRef(s_values);
+        }
         
-        // Apply irfftn operation with different parameter combinations
-        torch::Tensor result;
-        
-        if (dims.empty() && !s.has_value()) {
-            // Case 1: No dims, no s
-            result = torch::fft::irfftn(input, s, c10::nullopt, norm);
-        } 
-        else if (!dims.empty() && !s.has_value()) {
-            // Case 2: With dims, no s
-            result = torch::fft::irfftn(input, s, dims, norm);
-        }
-        else if (dims.empty() && s.has_value()) {
-            // Case 3: No dims, with s
-            result = torch::fft::irfftn(input, s, c10::nullopt, norm);
-        }
-        else {
-            // Case 4: With dims, with s
-            result = torch::fft::irfftn(input, s, dims, norm);
-        }
+        // Apply irfftn operation
+        torch::Tensor result = torch::fft::irfftn(input, s_opt, dims_opt, norm);
         
         // Access result to ensure computation is performed
         auto sum = result.sum().item<double>();

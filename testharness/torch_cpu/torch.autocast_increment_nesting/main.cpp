@@ -1,7 +1,7 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <torch/csrc/autograd/autocast_mode.h>
+#include <ATen/autocast_mode.h>
+#include <iostream> // For cerr
+#include <tuple>    // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
@@ -31,49 +31,57 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Extract a device type from the data
-        c10::DeviceType device_type = c10::kCPU;
+        at::DeviceType device_type = at::kCPU;
         if (offset < Size) {
             uint8_t device_selector = Data[offset++];
             // Only use kCUDA if CUDA is available
             if ((device_selector & 0x1) && torch::cuda::is_available()) {
-                device_type = c10::kCUDA;
+                device_type = at::kCUDA;
             }
         }
         
+        at::autocast::set_autocast_enabled(device_type, enabled);
+        
         // Call autocast_increment_nesting
-        torch::autocast::increment_nesting(device_type);
+        at::autocast::increment_nesting();
         
         // Perform some operations inside the autocast context
         torch::Tensor result = tensor + 1.0;
+        (void)result.sum(); // ensure the result is used
         
         // Decrement nesting to balance the increment
-        torch::autocast::decrement_nesting(device_type);
+        at::autocast::decrement_nesting();
         
         // Try with different device types
         if (offset < Size && torch::cuda::is_available()) {
-            torch::autocast::increment_nesting(c10::kCUDA);
+            at::autocast::set_autocast_enabled(at::kCUDA, enabled);
+            at::autocast::increment_nesting();
             torch::Tensor cuda_result = tensor.to(torch::kCUDA) + 1.0;
-            torch::autocast::decrement_nesting(c10::kCUDA);
+            (void)cuda_result.sum();
+            at::autocast::decrement_nesting();
         }
         
         // Try with different enabled values
-        torch::autocast::increment_nesting(device_type);
+        at::autocast::increment_nesting();
         torch::Tensor another_result = tensor * 2.0;
-        torch::autocast::decrement_nesting(device_type);
+        (void)another_result.sum();
+        at::autocast::decrement_nesting();
         
         // Try nested calls
-        torch::autocast::increment_nesting(device_type);
-        torch::autocast::increment_nesting(device_type);
+        at::autocast::increment_nesting();
+        at::autocast::increment_nesting();
         torch::Tensor nested_result = tensor.pow(2);
-        torch::autocast::decrement_nesting(device_type);
-        torch::autocast::decrement_nesting(device_type);
+        (void)nested_result.sum();
+        at::autocast::decrement_nesting();
+        at::autocast::decrement_nesting();
         
         // Try with different tensor types
         if (offset + 1 < Size) {
             torch::Tensor another_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            torch::autocast::increment_nesting(device_type);
+            at::autocast::increment_nesting();
             torch::Tensor mixed_result = tensor + another_tensor;
-            torch::autocast::decrement_nesting(device_type);
+            (void)mixed_result.sum();
+            at::autocast::decrement_nesting();
         }
         
         // Try with extreme nesting levels
@@ -83,13 +91,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         for (uint8_t i = 0; i < nesting_level; i++) {
-            torch::autocast::increment_nesting(device_type);
+            at::autocast::increment_nesting();
         }
         
         torch::Tensor deep_nested_result = tensor.sin();
+        (void)deep_nested_result.sum();
         
         for (uint8_t i = 0; i < nesting_level; i++) {
-            torch::autocast::decrement_nesting(device_type);
+            at::autocast::decrement_nesting();
         }
     }
     catch (const std::exception &e)
