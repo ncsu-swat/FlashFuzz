@@ -1,0 +1,10 @@
+tf.raw_ops.Add
+tf.raw_ops.MatMul
+tf.raw_ops.Conv2D
+tf.raw_ops.MaxPool
+tf.raw_ops.Relu
+tf.raw_ops.Sigmoid
+tf.raw_ops.Softmax
+tf.raw_ops.Reshape
+tf.raw_ops.Concat
+tf.raw_ops.Slice
