@@ -11,6 +11,7 @@
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -224,95 +225,102 @@ void fillTensorWithDataByType(tensorflow::Tensor& tensor,
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     std::cout << "Start Fuzzing" << std::endl;
-    if (size < 20) return 0;
-    
+    if (size < 1) return 0;
+
     size_t offset = 0;
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::DataType input_dtype = parseDataType(data[offset++]);
-        uint8_t input_rank = parseRank(data[offset++]);
-        std::vector<int64_t> input_shape = parseShape(data, offset, size, input_rank);
-        
-        tensorflow::TensorShape input_tensor_shape(input_shape);
-        tensorflow::Tensor input_dataset_tensor(tensorflow::DT_VARIANT, tensorflow::TensorShape({}));
-        
-        auto input_dataset = tensorflow::ops::Placeholder(root, tensorflow::DT_VARIANT);
-        
-        uint8_t num_other_args = data[offset++] % 3;
-        std::vector<tensorflow::Output> other_arguments;
-        std::vector<tensorflow::Tensor> other_arg_tensors;
-        
-        for (uint8_t i = 0; i < num_other_args; ++i) {
-            if (offset >= size) break;
-            tensorflow::DataType arg_dtype = parseDataType(data[offset++]);
-            uint8_t arg_rank = parseRank(data[offset++]);
-            std::vector<int64_t> arg_shape = parseShape(data, offset, size, arg_rank);
-            
-            tensorflow::TensorShape arg_tensor_shape(arg_shape);
-            tensorflow::Tensor arg_tensor(arg_dtype, arg_tensor_shape);
-            fillTensorWithDataByType(arg_tensor, arg_dtype, data, offset, size);
-            
-            auto arg_placeholder = tensorflow::ops::Placeholder(root, arg_dtype);
-            other_arguments.push_back(arg_placeholder);
-            other_arg_tensors.push_back(arg_tensor);
+        // Build a simple RangeDataset to serve as the variant input handle.
+        int64_t stop_val = 5;
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&stop_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+            stop_val = std::max<int64_t>(1, std::abs(stop_val) % 8 + 1);
         }
-        
+        auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
+        auto stop = tensorflow::ops::Const(root, stop_val);
+        auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
+
+        std::vector<tensorflow::DataType> range_output_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> range_output_shapes = {tensorflow::PartialTensorShape({})};
+        tensorflow::Node* range_dataset_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                         root.GetUniqueNameForOp("range_dataset"),
+                                         "RangeDataset")
+                                         .Input(start.node(), start.index())
+                                         .Input(stop.node(), stop.index())
+                                         .Input(step.node(), step.index())
+                                         .Attr("output_types", range_output_types)
+                                         .Attr("output_shapes", range_output_shapes)
+                                         .Finalize(root.graph(), &range_dataset_node);
+        if (!status.ok()) {
+            return 0;
+        }
+        tensorflow::Output input_dataset(range_dataset_node);
+
+        // Define a predicate function taking the dataset element and returning a bool.
+        tensorflow::Tensor zero_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
+        zero_tensor.scalar<int64_t>()() = 0;
+        tensorflow::FunctionDef predicate_def = tensorflow::FunctionDefHelper::Define(
+            "FuzzPredicate",
+            {"x: int64"},
+            {"y: bool"},
+            {},
+            {
+                {{"zero"}, "Const", {}, {{"value", zero_tensor}, {"dtype", tensorflow::DT_INT64}}},
+                {{"cmp"}, "GreaterEqual", {"x", "zero"}, {{"T", tensorflow::DT_INT64}}},
+                {{"y"}, "Identity", {"cmp"}, {{"T", tensorflow::DT_BOOL}}},
+            });
+        status = root.graph()->mutable_flib_def()->AddFunctionDef(predicate_def);
+        if (!status.ok()) {
+            return 0;
+        }
+
+        tensorflow::NameAttrList predicate_func;
+        predicate_func.set_name("FuzzPredicate");
+
+        std::vector<tensorflow::NodeBuilder::NodeOut> other_arguments_nodes;
+        std::vector<tensorflow::DataType> other_arg_types;
+
         int64_t num_parallel_calls = 1;
         if (offset + sizeof(int64_t) <= size) {
             std::memcpy(&num_parallel_calls, data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
-            num_parallel_calls = std::abs(num_parallel_calls) % 10 + 1;
+            num_parallel_calls = std::max<int64_t>(1, std::abs(num_parallel_calls) % 8 + 1);
         }
-        
-        tensorflow::Tensor num_parallel_calls_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
-        num_parallel_calls_tensor.scalar<int64_t>()() = num_parallel_calls;
-        auto num_parallel_calls_op = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
-        
-        std::vector<tensorflow::DataType> output_types = {input_dtype};
-        std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape(input_shape)};
-        
-        tensorflow::NameAttrList predicate_func;
-        predicate_func.set_name("test_predicate");
-        
-        // Use NodeBuilder to create ParallelFilterDataset operation
-        tensorflow::NodeBuilder node_builder(
-            root.WithOpName("ParallelFilterDataset").ToString(),
-            "ParallelFilterDataset"
-        );
-        
-        node_builder.Input(input_dataset.node());
-        
-        for (const auto& arg : other_arguments) {
-            node_builder.Input(arg.node());
+        auto num_parallel_calls_const = tensorflow::ops::Const(root, num_parallel_calls);
+
+        std::string deterministic = "default";
+        if (offset < size) {
+            deterministic = (data[offset] % 2 == 0) ? "true" : "false";
         }
-        
-        node_builder.Input(num_parallel_calls_op.node());
-        node_builder.Attr("predicate", predicate_func);
-        node_builder.Attr("Targuments", tensorflow::DataTypeVector({tensorflow::DT_INT32}));
-        node_builder.Attr("output_types", output_types);
-        node_builder.Attr("output_shapes", output_shapes);
-        
-        tensorflow::Node* parallel_filter_node;
-        tensorflow::Status status = node_builder.Finalize(root.graph(), &parallel_filter_node);
-        
+
+        tensorflow::Node* parallel_filter_node = nullptr;
+        status = tensorflow::NodeBuilder(
+                     root.GetUniqueNameForOp("parallel_filter_dataset"),
+                     "ParallelFilterDataset")
+                     .Input(input_dataset.node(), input_dataset.index())
+                     .Input(other_arguments_nodes)
+                     .Input(num_parallel_calls_const.node(), num_parallel_calls_const.index())
+                     .Attr("predicate", predicate_func)
+                     .Attr("deterministic", deterministic)
+                     .Attr("Targuments", other_arg_types)
+                     .Attr("output_types", range_output_types)
+                     .Attr("output_shapes", range_output_shapes)
+                     .Finalize(root.graph(), &parallel_filter_node);
         if (!status.ok()) {
             tf_fuzzer_utils::logError("Failed to create ParallelFilterDataset node: " + status.ToString(), data, size);
             return -1;
         }
-        
+
         tensorflow::ClientSession session(root);
-        
-        std::vector<std::pair<std::string, tensorflow::Tensor>> feed_dict;
-        feed_dict.push_back({input_dataset.node()->name(), input_dataset_tensor});
-        feed_dict.push_back({num_parallel_calls_op.node()->name(), num_parallel_calls_tensor});
-        
-        for (size_t i = 0; i < other_arguments.size(); ++i) {
-            feed_dict.push_back({other_arguments[i].node()->name(), other_arg_tensors[i]});
-        }
-        
         std::vector<tensorflow::Tensor> outputs;
-        
+        status = session.Run({tensorflow::Output(parallel_filter_node)}, &outputs);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Session run error: " + status.ToString(), data, size);
+        }
+
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);
         return -1;

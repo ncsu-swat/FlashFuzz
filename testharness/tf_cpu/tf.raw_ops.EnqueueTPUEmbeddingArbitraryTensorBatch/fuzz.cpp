@@ -5,6 +5,8 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
+#include <cmath>
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -127,30 +129,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t list_size_byte = data[offset++];
         size_t list_size = (list_size_byte % MAX_LIST_SIZE) + 1;
 
-        std::vector<tensorflow::Input> sample_indices_list;
-        std::vector<tensorflow::Input> embedding_indices_list;
-        std::vector<tensorflow::Input> aggregation_weights_list;
+        tensorflow::DataType sample_dtype = parseDataTypeForIndices(data[offset++]);
+        tensorflow::DataType embedding_dtype = parseDataTypeForIndices(data[offset++]);
+        tensorflow::DataType weights_dtype = parseDataTypeForWeights(data[offset++]);
+
+        std::vector<tensorflow::Output> sample_indices_list;
+        std::vector<tensorflow::Output> embedding_indices_list;
+        std::vector<tensorflow::Output> aggregation_weights_list;
 
         for (size_t i = 0; i < list_size; ++i) {
             if (offset >= size) break;
 
-            tensorflow::DataType indices_dtype = parseDataTypeForIndices(data[offset++]);
-            uint8_t indices_rank = parseRank(data[offset++]);
+            uint8_t indices_rank = (offset < size) ? parseRank(data[offset++]) : 1;
             std::vector<int64_t> indices_shape = parseShape(data, offset, size, indices_rank);
-            
-            tensorflow::TensorShape indices_tensor_shape;
-            for (int64_t dim : indices_shape) {
-                indices_tensor_shape.AddDim(dim);
-            }
 
-            tensorflow::Tensor sample_indices_tensor(indices_dtype, indices_tensor_shape);
-            fillTensorWithDataByType(sample_indices_tensor, indices_dtype, data, offset, size);
-            
-            tensorflow::Tensor embedding_indices_tensor(indices_dtype, indices_tensor_shape);
-            fillTensorWithDataByType(embedding_indices_tensor, indices_dtype, data, offset, size);
+            tensorflow::Tensor sample_indices_tensor(sample_dtype, tensorflow::TensorShape(indices_shape));
+            fillTensorWithDataByType(sample_indices_tensor, sample_dtype, data, offset, size);
 
-            tensorflow::DataType weights_dtype = parseDataTypeForWeights(data[offset++]);
-            tensorflow::Tensor aggregation_weights_tensor(weights_dtype, indices_tensor_shape);
+            tensorflow::Tensor embedding_indices_tensor(embedding_dtype, tensorflow::TensorShape(indices_shape));
+            fillTensorWithDataByType(embedding_indices_tensor, embedding_dtype, data, offset, size);
+
+            tensorflow::Tensor aggregation_weights_tensor(weights_dtype, tensorflow::TensorShape(indices_shape));
             fillTensorWithDataByType(aggregation_weights_tensor, weights_dtype, data, offset, size);
 
             sample_indices_list.push_back(tensorflow::ops::Const(root, sample_indices_tensor));
@@ -179,41 +178,53 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
         int device_ordinal = -1;
         if (offset < size) {
-            device_ordinal = static_cast<int>(data[offset++]) % 8 - 1;
+            device_ordinal = static_cast<int>(data[offset++] % 8) - 1;
         }
 
-        std::vector<std::string> combiners;
-        if (offset < size) {
-            uint8_t combiner_count = data[offset++] % 3;
-            for (uint8_t i = 0; i < combiner_count && i < list_size; ++i) {
-                if (offset < size) {
-                    uint8_t combiner_selector = data[offset++];
-                    switch (combiner_selector % 3) {
-                        case 0: combiners.push_back("mean"); break;
-                        case 1: combiners.push_back("sum"); break;
-                        case 2: combiners.push_back("sqrtn"); break;
-                    }
-                }
+        std::vector<std::string> combiners(sample_indices_list.size(), "sum");
+        for (size_t i = 0; i < combiners.size() && offset < size; ++i) {
+            switch (data[offset++] % 3) {
+                case 0: combiners[i] = "mean"; break;
+                case 1: combiners[i] = "sum"; break;
+                case 2: combiners[i] = "sqrtn"; break;
             }
         }
 
-        // Use raw_ops directly instead of ops::EnqueueTPUEmbeddingArbitraryTensorBatch
-        auto op = tensorflow::ops::Operation(root.WithOpName("EnqueueTPUEmbeddingArbitraryTensorBatch"),
-                                            "EnqueueTPUEmbeddingArbitraryTensorBatch",
-                                            sample_indices_list,
-                                            embedding_indices_list,
-                                            aggregation_weights_list,
-                                            {mode_override});
-        
-        // Set attributes
-        op.operation.node()->AddAttr("device_ordinal", device_ordinal);
-        op.operation.node()->AddAttr("combiners", combiners);
+        auto to_node_out_list = [](const std::vector<tensorflow::Output>& outputs) {
+            std::vector<tensorflow::NodeBuilder::NodeOut> node_outs;
+            node_outs.reserve(outputs.size());
+            for (const auto& output : outputs) {
+                node_outs.emplace_back(output.node(), output.index());
+            }
+            return node_outs;
+        };
 
-        tensorflow::ClientSession session(root);
-        tensorflow::Status status = session.Run({}, {}, {op}, nullptr);
-        
+        auto sample_inputs = to_node_out_list(sample_indices_list);
+        auto embedding_inputs = to_node_out_list(embedding_indices_list);
+        auto weight_inputs = to_node_out_list(aggregation_weights_list);
+
+        tensorflow::Node* enqueue_node = nullptr;
+        auto builder = tensorflow::NodeBuilder("EnqueueTPUEmbeddingArbitraryTensorBatch",
+                                               "EnqueueTPUEmbeddingArbitraryTensorBatch")
+                           .Input(sample_inputs)
+                           .Input(embedding_inputs)
+                           .Input(weight_inputs)
+                           .Input(tensorflow::NodeBuilder::NodeOut(mode_override.node()))
+                           .Attr("T1", sample_dtype)
+                           .Attr("T2", embedding_dtype)
+                           .Attr("T3", weights_dtype)
+                           .Attr("N", static_cast<int>(sample_indices_list.size()))
+                           .Attr("device_ordinal", device_ordinal)
+                           .Attr("combiners", combiners);
+
+        tensorflow::Status status = builder.Finalize(root.graph(), &enqueue_node);
+        if (status.ok()) {
+            tensorflow::ClientSession session(root);
+            tensorflow::Operation enqueue_op(enqueue_node);
+            status = session.Run({}, {}, {enqueue_op}, nullptr);
+        }
         if (!status.ok()) {
-            return -1;
+            return 0;
         }
 
     } catch (const std::exception& e) {

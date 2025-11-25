@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -198,13 +199,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t num_tensors_byte = data[offset++];
         uint8_t num_tensors = (num_tensors_byte % MAX_NUM_TENSORS) + 1;
 
-        std::vector<tensorflow::Output> input_tensors;
-        input_tensors.reserve(num_tensors);
+        std::vector<tensorflow::Output> placeholders;
+        std::vector<tensorflow::Tensor> tensor_values;
+        std::vector<tensorflow::DataType> dtypes;
+        placeholders.reserve(num_tensors);
+        tensor_values.reserve(num_tensors);
+        dtypes.reserve(num_tensors);
 
         for (uint8_t i = 0; i < num_tensors; ++i) {
             if (offset >= size) break;
 
             tensorflow::DataType dtype = parseDataType(data[offset++]);
+            dtypes.push_back(dtype);
             
             if (offset >= size) break;
             uint8_t rank = parseRank(data[offset++]);
@@ -219,22 +225,51 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             tensorflow::Tensor tensor(dtype, tensor_shape);
             
             fillTensorWithDataByType(tensor, dtype, data, offset, size);
+            tensor_values.push_back(tensor);
 
-            auto const_op = tensorflow::ops::Const(root, tensor);
-            input_tensors.push_back(const_op);
+            auto placeholder = tensorflow::ops::Placeholder(
+                root.WithOpName("annotate_input_" + std::to_string(i)),
+                dtype,
+                tensorflow::ops::Placeholder::Shape(tensor_shape));
+            placeholders.push_back(placeholder);
         }
 
-        if (input_tensors.empty()) {
+        if (placeholders.empty()) {
             return 0;
         }
 
-        // Use raw_ops directly since we don't have the TPU ops header
-        auto tpu_annotate_op = tensorflow::ops::internal::TPUAnnotateTensorsWithDynamicShape(
-            root, input_tensors);
+        std::vector<tensorflow::NodeBuilder::NodeOut> node_inputs;
+        node_inputs.reserve(placeholders.size());
+        for (const auto& input : placeholders) {
+            node_inputs.push_back({input.node(), input.index()});
+        }
+
+        tensorflow::Node* annotate_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("TPUAnnotateTensorsWithDynamicShape",
+                                                            "TPUAnnotateTensorsWithDynamicShape")
+                                        .Input(node_inputs)
+                                        .Attr("T", dtypes)
+                                        .Finalize(root.graph(), &annotate_node);
+
+        if (!status.ok()) {
+            return -1;
+        }
+
+        std::vector<tensorflow::Output> op_outputs;
+        op_outputs.reserve(placeholders.size());
+        for (size_t i = 0; i < placeholders.size(); ++i) {
+            op_outputs.emplace_back(annotate_node, static_cast<int>(i));
+        }
 
         tensorflow::ClientSession session(root);
+        tensorflow::ClientSession::FeedType feed;
+        feed.reserve(placeholders.size());
+        for (size_t i = 0; i < placeholders.size(); ++i) {
+            feed.emplace(placeholders[i], tensor_values[i]);
+        }
+
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({tpu_annotate_op.output}, &outputs);
+        status = session.Run(feed, op_outputs, &outputs);
         
         if (!status.ok()) {
             return -1;

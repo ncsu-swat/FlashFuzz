@@ -8,9 +8,11 @@
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
+#include <cmath>
 
 #define MAX_RANK 4
 #define MIN_RANK 1
@@ -241,44 +243,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto reserve_space_op = tensorflow::ops::Const(root, reserve_space_tensor);
         auto host_reserved_op = tensorflow::ops::Const(root, host_reserved_tensor);
 
-        tensorflow::Output input_backprop, input_h_backprop, input_c_backprop, params_backprop;
-        
-        tensorflow::Status status = tensorflow::ops::CudnnRNNBackpropV2(
-            root,
-            input_op,
-            input_h_op,
-            input_c_op,
-            params_op,
-            output_op,
-            output_h_op,
-            output_c_op,
-            output_backprop_op,
-            output_h_backprop_op,
-            output_c_backprop_op,
-            reserve_space_op,
-            host_reserved_op,
-            &input_backprop,
-            &input_h_backprop,
-            &input_c_backprop,
-            &params_backprop,
-            tensorflow::ops::CudnnRNNBackpropV2::Attrs()
-                .RnnMode(rnn_mode)
-                .InputMode(input_mode)
-                .Direction(direction)
-                .Dropout(dropout)
-                .Seed(seed)
-                .Seed2(seed2)
-        );
+        tensorflow::Node* node;
+        tensorflow::NodeBuilder builder("cudnn_rnn_backprop_v2", "CudnnRNNBackpropV2");
+        builder.Input(input_op.node())
+               .Input(input_h_op.node())
+               .Input(input_c_op.node())
+               .Input(params_op.node())
+               .Input(output_op.node())
+               .Input(output_h_op.node())
+               .Input(output_c_op.node())
+               .Input(output_backprop_op.node())
+               .Input(output_h_backprop_op.node())
+               .Input(output_c_backprop_op.node())
+               .Input(reserve_space_op.node())
+               .Input(host_reserved_op.node())
+               .Attr("rnn_mode", rnn_mode)
+               .Attr("input_mode", input_mode)
+               .Attr("direction", direction)
+               .Attr("dropout", dropout)
+               .Attr("seed", seed)
+               .Attr("seed2", seed2)
+               .Attr("T", dtype);
 
-        if (!status.ok()) {
+        tensorflow::Status build_status = builder.Finalize(root.graph(), &node);
+        if (!build_status.ok()) {
             return -1;
         }
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        status = session.Run({input_backprop, input_h_backprop, input_c_backprop, params_backprop}, &outputs);
-        
+        tensorflow::Status status = session.Run({tensorflow::Output(node, 0),
+                                                 tensorflow::Output(node, 1),
+                                                 tensorflow::Output(node, 2),
+                                                 tensorflow::Output(node, 3)}, &outputs);
         if (!status.ok()) {
             return -1;
         }

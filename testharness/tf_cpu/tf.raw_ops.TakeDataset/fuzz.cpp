@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -240,7 +241,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         auto dummy_data = tensorflow::ops::Const(root, dummy_data_tensor);
         
-        // Create a range dataset using raw ops
+        // Build a simple range dataset to feed into TakeDataset.
         auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
         auto stop = tensorflow::ops::Const(root, static_cast<int64_t>(5));
         auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
@@ -248,37 +249,45 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::vector<tensorflow::DataType> output_types = {tensorflow::DT_INT64};
         std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape({})};
         
-        auto range_dataset = tensorflow::ops::RangeDataset(root, start, stop, step, output_types, output_shapes);
+        tensorflow::Node* range_dataset_node = nullptr;
+        auto range_status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("RangeDataset"), "RangeDataset")
+                                .Input(start.node())
+                                .Input(stop.node())
+                                .Input(step.node())
+                                .Attr("output_types", output_types)
+                                .Attr("output_shapes", output_shapes)
+                                .Finalize(root.graph(), &range_dataset_node);
+        if (!range_status.ok()) {
+            return 0;
+        }
         
         int64_t count_value = 3;
-        if (offset < size) {
-            std::memcpy(&count_value, data + offset, std::min(sizeof(int64_t), size - offset));
-            count_value = std::abs(count_value) % 10;
-            if (count_value == 0) count_value = -1;
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&count_value, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+        } else if (offset < size) {
+            std::memcpy(&count_value, data + offset, size - offset);
+            offset = size;
         }
+        count_value = std::abs(count_value) % 10;
+        if (count_value == 0) count_value = -1;
         
         auto count_tensor = tensorflow::ops::Const(root, count_value);
         
-        // Use the raw op directly
-        auto take_dataset_op = tensorflow::Operation(root.WithOpName("TakeDataset")
-            .WithDevice("/cpu:0")
-            .WithAttr("output_types", output_types)
-            .WithAttr("output_shapes", output_shapes));
-        
-        tensorflow::ops::NodeBuilder builder = tensorflow::ops::NodeBuilder("TakeDataset", "TakeDataset")
-            .Input(range_dataset.output)
-            .Input(count_tensor.output)
-            .Attr("output_types", output_types)
-            .Attr("output_shapes", output_shapes);
-        
-        root.UpdateBuilder(&builder);
-        tensorflow::Node* take_dataset_node;
-        root.UpdateStatus(builder.Finalize(&root.graph(), &take_dataset_node));
-        auto take_dataset = tensorflow::Output(take_dataset_node);
+        tensorflow::Node* take_dataset_node = nullptr;
+        auto take_status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("TakeDataset"), "TakeDataset")
+                               .Input(range_dataset_node)
+                               .Input(count_tensor.node())
+                               .Attr("output_types", output_types)
+                               .Attr("output_shapes", output_shapes)
+                               .Finalize(root.graph(), &take_dataset_node);
+        if (!take_status.ok()) {
+            return 0;
+        }
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({take_dataset}, &outputs);
+        tensorflow::Status status = session.Run({tensorflow::Output(take_dataset_node)}, &outputs);
         if (!status.ok()) {
             return -1;
         }

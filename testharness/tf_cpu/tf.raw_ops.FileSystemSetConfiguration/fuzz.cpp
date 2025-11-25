@@ -6,6 +6,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -97,40 +98,48 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     try {
         tensorflow::DataType scheme_dtype = parseDataType(data[offset++]);
         uint8_t scheme_rank = parseRank(data[offset++]);
-        std::vector<int64_t> scheme_shape = parseShape(data, offset, size, scheme_rank);
+        (void)scheme_rank;
+        parseShape(data, offset, size, scheme_rank);
         
-        tensorflow::Tensor scheme_tensor(scheme_dtype, tensorflow::TensorShape(scheme_shape));
+        tensorflow::Tensor scheme_tensor(scheme_dtype, tensorflow::TensorShape({}));
         fillStringTensor(scheme_tensor, data, offset, size);
         
         tensorflow::DataType key_dtype = parseDataType(data[offset++]);
         uint8_t key_rank = parseRank(data[offset++]);
-        std::vector<int64_t> key_shape = parseShape(data, offset, size, key_rank);
+        (void)key_rank;
+        parseShape(data, offset, size, key_rank);
         
-        tensorflow::Tensor key_tensor(key_dtype, tensorflow::TensorShape(key_shape));
+        tensorflow::Tensor key_tensor(key_dtype, tensorflow::TensorShape({}));
         fillStringTensor(key_tensor, data, offset, size);
         
         tensorflow::DataType value_dtype = parseDataType(data[offset++]);
         uint8_t value_rank = parseRank(data[offset++]);
-        std::vector<int64_t> value_shape = parseShape(data, offset, size, value_rank);
+        (void)value_rank;
+        parseShape(data, offset, size, value_rank);
         
-        tensorflow::Tensor value_tensor(value_dtype, tensorflow::TensorShape(value_shape));
+        tensorflow::Tensor value_tensor(value_dtype, tensorflow::TensorShape({}));
         fillStringTensor(value_tensor, data, offset, size);
 
         auto scheme_input = tensorflow::ops::Const(root, scheme_tensor);
         auto key_input = tensorflow::ops::Const(root, key_tensor);
         auto value_input = tensorflow::ops::Const(root, value_tensor);
 
-        // Use raw op directly since FileSystemSetConfiguration is not available in the C++ API
-        auto file_system_set_config = tensorflow::Operation(
-            root.WithOpName("FileSystemSetConfiguration")
-                .WithAttr("scheme", scheme_input)
-                .WithAttr("key", key_input)
-                .WithAttr("value", value_input)
-                .WithDevice("/cpu:0")
-                .node()->name());
+        tensorflow::Node* fs_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("FileSystemSetConfiguration"),
+                                        "FileSystemSetConfiguration")
+                                        .Input(tensorflow::NodeBuilder::NodeOut(scheme_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(key_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(value_input.node()))
+                                        .Device("/cpu:0")
+                                        .Finalize(root.graph(), &fs_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("NodeBuilder failed: " + status.ToString(), data, size);
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
-        tensorflow::Status status = session.Run({file_system_set_config}, nullptr);
+        status = session.Run({}, {}, {tensorflow::Operation(fs_node)}, nullptr);
         if (!status.ok()) {
             return -1;
         }

@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include <algorithm>
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -22,7 +23,7 @@ void logError(const std::string& message, const uint8_t* data, size_t size) {
 
 tensorflow::DataType parseDataType(uint8_t selector) {
     tensorflow::DataType dtype;
-    switch (selector % 11) {
+    switch (selector % 13) {
         case 0:
             dtype = tensorflow::DT_FLOAT;
             break;
@@ -55,6 +56,12 @@ tensorflow::DataType parseDataType(uint8_t selector) {
             break;
         case 10:
             dtype = tensorflow::DT_UINT32;
+            break;
+        case 11:
+            dtype = tensorflow::DT_UINT64;
+            break;
+        case 12:
+            dtype = tensorflow::DT_BOOL;
             break;
         default:
             dtype = tensorflow::DT_FLOAT;
@@ -173,7 +180,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::Output writer = tensorflow::ops::Placeholder(root, tensorflow::DT_RESOURCE);
+        auto readString = [&](size_t max_len, const std::string& fallback) {
+            if (offset >= size) {
+                return fallback;
+            }
+            const uint8_t len = data[offset++] % max_len;
+            const size_t available = size - offset;
+            const size_t take = std::min<size_t>(len, available);
+            std::string result(reinterpret_cast<const char*>(data + offset), take);
+            offset += take;
+            if (result.empty()) {
+                return fallback;
+            }
+            return result;
+        };
+
+        const std::string shared_name = readString(16, "writer");
+        const std::string container = readString(16, "container");
+
+        tensorflow::Node* writer_node = nullptr;
+        tensorflow::NodeBuilder writer_builder("summary_writer", "SummaryWriter");
+        writer_builder.Attr("shared_name", shared_name);
+        writer_builder.Attr("container", container);
+        tensorflow::Status writer_status = writer_builder.Finalize(root.graph(), &writer_node);
+        root.UpdateStatus(writer_status);
+        if (!writer_status.ok() || writer_node == nullptr) {
+            return 0;
+        }
+        tensorflow::Output writer(writer_node, 0);
         
         int64_t step_value = 0;
         if (offset + sizeof(int64_t) <= size) {
@@ -219,18 +253,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         tensorflow::Output values = tensorflow::ops::Const(root, values_tensor);
 
-        // Use raw_ops directly instead of summary_ops.h
-        std::vector<tensorflow::Output> outputs;
-        tensorflow::Status status = tensorflow::ops::internal::WriteHistogramSummary(
-            root.WithOpName("WriteHistogramSummary"),
-            writer, step, tag, values,
-            &outputs);
-
-        if (status.ok()) {
-            tensorflow::ClientSession session(root);
-            std::vector<tensorflow::Tensor> outputs;
-            session.Run({}, &outputs);
-        }
+        tensorflow::Node* write_node = nullptr;
+        tensorflow::NodeBuilder write_builder("write_histogram_summary", "WriteHistogramSummary");
+        write_builder.Input(tensorflow::NodeBuilder::NodeOut(writer.node()));
+        write_builder.Input(tensorflow::NodeBuilder::NodeOut(step.node()));
+        write_builder.Input(tensorflow::NodeBuilder::NodeOut(tag.node()));
+        write_builder.Input(tensorflow::NodeBuilder::NodeOut(values.node()));
+        write_builder.Attr("T", values_dtype);
+        tensorflow::Status write_status = write_builder.Finalize(root.graph(), &write_node);
+        root.UpdateStatus(write_status);
+        (void)write_node;
         
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

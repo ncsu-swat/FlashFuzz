@@ -223,9 +223,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             return 0;
         }
         
-        // Convert vectors to InputList
-        tensorflow::InputList indices_input_list(indices_list.begin(), indices_list.end());
-        tensorflow::InputList data_input_list(data_list.begin(), data_list.end());
+        // Convert vectors to InputList using the provided vector-based ctor
+        tensorflow::InputList indices_input_list(indices_list);
+        tensorflow::InputList data_input_list(data_list);
         
         auto dynamic_stitch_op = tensorflow::ops::DynamicStitch(root, indices_input_list, data_input_list);
         

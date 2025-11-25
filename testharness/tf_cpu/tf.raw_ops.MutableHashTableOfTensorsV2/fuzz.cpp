@@ -6,6 +6,7 @@
 #include "tensorflow/cc/ops/lookup_ops.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -191,21 +192,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::cout << "use_node_name_sharing: " << use_node_name_sharing << std::endl;
         std::cout << "value_shape: " << value_shape.DebugString() << std::endl;
 
-        auto hash_table = tensorflow::ops::MutableHashTableOfTensors(
-            root,
-            key_dtype,
-            value_dtype,
-            tensorflow::ops::MutableHashTableOfTensors::Container(container)
-                .SharedName(shared_name)
-                .UseNodeNameSharing(use_node_name_sharing)
-                .ValueShape(value_shape)
-        );
+        tensorflow::Node* hash_table_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("MutableHashTableOfTensorsV2"),
+                                        "MutableHashTableOfTensorsV2")
+                                        .Attr("container", container)
+                                        .Attr("shared_name", shared_name)
+                                        .Attr("use_node_name_sharing", use_node_name_sharing)
+                                        .Attr("key_dtype", key_dtype)
+                                        .Attr("value_dtype", value_dtype)
+                                        .Attr("value_shape", value_shape)
+                                        .Finalize(root.graph(), &hash_table_node);
+        root.UpdateStatus(status);
+        if (!root.ok() || hash_table_node == nullptr) {
+            tf_fuzzer_utils::logError("NodeBuilder failed to create MutableHashTableOfTensorsV2: " +
+                                      status.ToString(), data, size);
+            return -1;
+        }
 
-        std::cout << "Created hash table operation" << std::endl;
+        tensorflow::Output table_handle(hash_table_node, 0);
+        std::cout << "Created MutableHashTableOfTensorsV2 operation" << std::endl;
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({hash_table}, &outputs);
+        status = session.Run({table_handle}, &outputs);
         
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;

@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -235,16 +236,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         for (uint8_t i = 0; i < num_output_types; ++i) {
             if (offset >= size) break;
             
-            tensorflow::DataType dtype = parseDataType(data[offset]);
-            output_types.push_back(dtype);
-            offset++;
-            
-            if (offset >= size) break;
-            uint8_t rank = parseRank(data[offset]);
-            offset++;
-            
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            output_shapes.push_back(tensorflow::PartialTensorShape(shape));
+        tensorflow::DataType dtype = parseDataType(data[offset]);
+        output_types.push_back(dtype);
+        offset++;
+        
+        if (offset >= size) break;
+        uint8_t rank = parseRank(data[offset]);
+        offset++;
+        
+        std::vector<int64_t> shape = parseShape(data, offset, size, rank);
+        output_shapes.push_back(tensorflow::PartialTensorShape(shape));
         }
         
         if (output_types.empty()) {
@@ -252,40 +253,54 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             output_shapes.push_back(tensorflow::PartialTensorShape({1}));
         }
 
-        tensorflow::Tensor element_tensor;
-        if (!output_shapes.empty() && output_shapes[0].IsFullyDefined()) {
-            tensorflow::TensorShape tensor_shape;
-            output_shapes[0].AsTensorShape(&tensor_shape);
-            element_tensor = tensorflow::Tensor(output_types[0], tensor_shape);
-            fillTensorWithDataByType(element_tensor, output_types[0], data, offset, size);
-        } else {
-            element_tensor = tensorflow::Tensor(output_types[0], tensorflow::TensorShape({1}));
-            fillTensorWithDataByType(element_tensor, output_types[0], data, offset, size);
+        tensorflow::DataType element_dtype = output_types.front();
+        tensorflow::PartialTensorShape element_partial_shape = output_shapes.front();
+
+        tensorflow::TensorShape tensor_shape;
+        if (!element_partial_shape.AsTensorShape(&tensor_shape)) {
+            tensor_shape = tensorflow::TensorShape({1});
+            element_partial_shape = tensorflow::PartialTensorShape({1});
         }
 
-        // Create a tensor handle op
-        auto tensor_op = tensorflow::ops::Const(root, element_tensor);
-        
-        // Create a tensor dataset
-        auto tensor_slice_dataset = tensorflow::ops::TensorSliceDataset(root, {tensor_op}, output_shapes);
+        tensorflow::Tensor element_tensor(element_dtype, tensor_shape);
+        fillTensorWithDataByType(element_tensor, element_dtype, data, offset, size);
 
-        std::string metadata = "";
-        if (offset < size) {
-            uint8_t metadata_len = data[offset] % 10;
-            offset++;
-            for (uint8_t i = 0; i < metadata_len && offset < size; ++i) {
-                metadata += static_cast<char>(data[offset]);
-                offset++;
-            }
+        auto element_placeholder = tensorflow::ops::Placeholder(root, element_dtype);
+
+        tensorflow::Node* tensor_dataset_node = nullptr;
+        auto tensor_dataset_builder =
+            tensorflow::NodeBuilder(root.GetUniqueNameForOp("TensorSliceDataset"), "TensorSliceDataset")
+                .Input(tensorflow::NodeBuilder::NodeOut(element_placeholder.node()))
+                .Attr("Toutput_types", {element_dtype})
+                .Attr("output_shapes", {element_partial_shape});
+
+        root.UpdateBuilder(&tensor_dataset_builder);
+        root.UpdateStatus(tensor_dataset_builder.Finalize(root.graph(), &tensor_dataset_node));
+        if (!root.ok()) {
+            return -1;
         }
 
-        // Create DatasetToSingleElement op
-        auto dataset_to_single_element_op = tensorflow::ops::DatasetToSingleElement(
-            root, tensor_slice_dataset, output_types);
+        tensorflow::Output tensor_dataset(tensor_dataset_node, 0);
+
+        tensorflow::Node* dataset_to_single_element_node = nullptr;
+        auto dataset_to_single_element_builder =
+            tensorflow::NodeBuilder(root.GetUniqueNameForOp("DatasetToSingleElement"), "DatasetToSingleElement")
+                .Input(tensorflow::NodeBuilder::NodeOut(tensor_dataset.node()))
+                .Attr("output_types", {element_dtype})
+                .Attr("output_shapes", {element_partial_shape});
+
+        root.UpdateBuilder(&dataset_to_single_element_builder);
+        root.UpdateStatus(dataset_to_single_element_builder.Finalize(root.graph(), &dataset_to_single_element_node));
+        if (!root.ok()) {
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({dataset_to_single_element_op}, &outputs);
+        tensorflow::Status status = session.Run(
+            {{element_placeholder, element_tensor}},
+            {tensorflow::Output(dataset_to_single_element_node, 0)},
+            &outputs);
         
         if (!status.ok()) {
             return -1;

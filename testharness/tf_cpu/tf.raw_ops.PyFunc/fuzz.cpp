@@ -10,6 +10,7 @@
 #include "tensorflow/core/framework/types.pb.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -234,7 +235,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t num_inputs = (data[offset] % 3) + 1;
         offset++;
 
-        std::vector<tensorflow::Input> input_tensors;
+        std::vector<tensorflow::Output> input_tensors;
         std::vector<tensorflow::DataType> input_dtypes;
 
         for (uint8_t i = 0; i < num_inputs; ++i) {
@@ -257,14 +258,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             tensorflow::Tensor tensor(dtype, tensor_shape);
             
             fillTensorWithDataByType(tensor, dtype, data, offset, size);
-            
+
             auto const_op = tensorflow::ops::Const(root, tensor);
             input_tensors.push_back(const_op);
             input_dtypes.push_back(dtype);
         }
 
         if (input_tensors.empty()) {
-            return 0;
+            tensorflow::Tensor dummy_tensor(tensorflow::DT_FLOAT, tensorflow::TensorShape({1}));
+            dummy_tensor.flat<float>()(0) = 0.0f;
+            auto const_op = tensorflow::ops::Const(root, dummy_tensor);
+            input_tensors.push_back(const_op);
+            input_dtypes.push_back(tensorflow::DT_FLOAT);
         }
 
         if (offset >= size) return 0;
@@ -293,17 +298,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             output_dtypes.push_back(tensorflow::DT_FLOAT);
         }
 
-        // Create a raw op for PyFunc
-        auto py_func_op = tensorflow::Operation(root.WithOpName("PyFunc")
-            .WithAttr("token", token)
-            .WithAttr("Tin", input_dtypes)
-            .WithAttr("Tout", output_dtypes)
-            .WithInputs(input_tensors));
+        std::vector<tensorflow::NodeBuilder::NodeOut> inputs;
+        inputs.reserve(input_tensors.size());
+        for (const auto& input : input_tensors) {
+            inputs.emplace_back(input.node(), input.index());
+        }
+
+        tensorflow::Node* pyfunc_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("pyfunc", "PyFunc")
+                                        .Input(inputs)
+                                        .Attr("Tin", input_dtypes)
+                                        .Attr("Tout", output_dtypes)
+                                        .Attr("token", token)
+                                        .Finalize(root.graph(), &pyfunc_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create PyFunc op: " + status.ToString(), data, size);
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
-        
-        // We don't actually run the session since PyFunc requires a Python function
-        // to be registered, which we can't do in this test harness
+        // Avoid running; PyFunc requires a registered Python callback, so graph
+        // construction coverage is sufficient here.
+        (void)pyfunc_node;
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

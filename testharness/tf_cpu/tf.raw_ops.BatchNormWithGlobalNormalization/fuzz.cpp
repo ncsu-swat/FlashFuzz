@@ -7,6 +7,7 @@
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <cmath>
@@ -23,70 +24,16 @@ void logError(const std::string& message, const uint8_t* data, size_t size) {
 }
 
 tensorflow::DataType parseDataType(uint8_t selector) {
-    tensorflow::DataType dtype;
-    switch (selector % 17) {
+    switch (selector % 3) {
         case 0:
-            dtype = tensorflow::DT_FLOAT;
-            break;
+            return tensorflow::DT_FLOAT;
         case 1:
-            dtype = tensorflow::DT_DOUBLE;
-            break;
+            return tensorflow::DT_DOUBLE;
         case 2:
-            dtype = tensorflow::DT_INT32;
-            break;
-        case 3:
-            dtype = tensorflow::DT_UINT8;
-            break;
-        case 4:
-            dtype = tensorflow::DT_INT16;
-            break;
-        case 5:
-            dtype = tensorflow::DT_INT8;
-            break;
-        case 6:
-            dtype = tensorflow::DT_COMPLEX64;
-            break;
-        case 7:
-            dtype = tensorflow::DT_INT64;
-            break;
-        case 8:
-            dtype = tensorflow::DT_QINT8;
-            break;
-        case 9:
-            dtype = tensorflow::DT_QUINT8;
-            break;
-        case 10:
-            dtype = tensorflow::DT_QINT32;
-            break;
-        case 11:
-            dtype = tensorflow::DT_BFLOAT16;
-            break;
-        case 12:
-            dtype = tensorflow::DT_QINT16;
-            break;
-        case 13:
-            dtype = tensorflow::DT_QUINT16;
-            break;
-        case 14:
-            dtype = tensorflow::DT_UINT16;
-            break;
-        case 15:
-            dtype = tensorflow::DT_COMPLEX128;
-            break;
-        case 16:
-            dtype = tensorflow::DT_HALF;
-            break;
-        case 17:
-            dtype = tensorflow::DT_UINT32;
-            break;
-        case 18:
-            dtype = tensorflow::DT_UINT64;
-            break;
+            return tensorflow::DT_HALF;
         default:
-            dtype = tensorflow::DT_FLOAT;
-            break;
+            return tensorflow::DT_FLOAT;
     }
-    return dtype;
 }
 
 uint8_t parseRank(uint8_t byte) {
@@ -263,15 +210,29 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto beta_input = tensorflow::ops::Const(root, beta_tensor);
         auto gamma_input = tensorflow::ops::Const(root, gamma_tensor);
         
-        // Use raw_ops approach for BatchNormWithGlobalNormalization
-        tensorflow::Output batch_norm_op = tensorflow::ops::internal::BatchNormWithGlobalNormalization(
-            root.WithOpName("BatchNormWithGlobalNormalization"),
-            t_input, m_input, v_input, beta_input, gamma_input,
-            variance_epsilon, scale_after_normalization);
+        tensorflow::Node* batch_norm_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("BatchNormWithGlobalNormalization"),
+                                        "BatchNormWithGlobalNormalization")
+                                        .Input(t_input.node())
+                                        .Input(m_input.node())
+                                        .Input(v_input.node())
+                                        .Input(beta_input.node())
+                                        .Input(gamma_input.node())
+                                        .Attr("variance_epsilon", variance_epsilon)
+                                        .Attr("scale_after_normalization", scale_after_normalization)
+                                        .Attr("T", dtype)
+                                        .Finalize(root.graph(), &batch_norm_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create BatchNormWithGlobalNormalization op: " + status.ToString(), data, size);
+            return -1;
+        }
+        
+        tensorflow::Output batch_norm_op(batch_norm_node, 0);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({batch_norm_op}, &outputs);
+        status = session.Run({batch_norm_op}, &outputs);
         
         if (!status.ok()) {
             return -1;

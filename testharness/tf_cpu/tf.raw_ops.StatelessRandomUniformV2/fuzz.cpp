@@ -4,6 +4,7 @@
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/random_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/types.h"
 #include <cstring>
 #include <vector>
@@ -209,13 +210,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto counter_op = tensorflow::ops::Const(root, counter_tensor);
         auto alg_op = tensorflow::ops::Const(root, alg_tensor);
 
-        // Use raw_ops namespace for StatelessRandomUniformV2
-        auto random_op = tensorflow::ops::StatelessRandomUniform(
-            root, shape_op, key_op, output_dtype);
+        tensorflow::Node* node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("stateless_random_uniform_v2"),
+                                        "StatelessRandomUniformV2")
+                                        .Input(tensorflow::NodeBuilder::NodeOut(shape_op.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(key_op.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(counter_op.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(alg_op.node()))
+                                        .Attr("dtype", output_dtype)
+                                        .Attr("Tshape", shape_tensor.dtype())
+                                        .Finalize(root.graph(), &node);
+        if (!status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output random_op(node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({random_op}, &outputs);
+        status = session.Run({random_op}, &outputs);
         if (!status.ok()) {
             return -1;
         }

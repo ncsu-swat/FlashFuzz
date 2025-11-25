@@ -1,5 +1,6 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -217,20 +218,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto node_ids = tensorflow::ops::Const(root, node_ids_tensor);
         auto gradients = tensorflow::ops::Const(root, gradients_tensor);
         auto hessians = tensorflow::ops::Const(root, hessians_tensor);
-        
-        tensorflow::ops::BoostedTreesMakeStatsSummary::Attrs attrs;
-        attrs = attrs.MaxSplits(max_splits);
-        attrs = attrs.NumBuckets(num_buckets);
-        
-        auto result = tensorflow::ops::BoostedTreesMakeStatsSummary(
-            root,
-            node_ids,
-            gradients,
-            hessians,
-            bucketized_features_list,
-            attrs
-        );
-        
+
+        std::vector<tensorflow::NodeBuilder::NodeOut> bucketized_feature_nodes;
+        bucketized_feature_nodes.reserve(bucketized_features_list.size());
+        for (const auto& feature : bucketized_features_list) {
+            bucketized_feature_nodes.push_back(
+                tensorflow::ops::AsNodeOut(root, feature));
+        }
+
+        tensorflow::Node* op_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("BoostedTreesMakeStatsSummary"),
+                           "BoostedTreesMakeStatsSummary")
+                           .Input(tensorflow::ops::AsNodeOut(root, node_ids))
+                           .Input(tensorflow::ops::AsNodeOut(root, gradients))
+                           .Input(tensorflow::ops::AsNodeOut(root, hessians))
+                           .Input(bucketized_feature_nodes)
+                           .Attr("max_splits", max_splits)
+                           .Attr("num_buckets", num_buckets)
+                           .Attr("num_features",
+                                 static_cast<int>(bucketized_feature_nodes.size()));
+        root.UpdateStatus(builder.Finalize(root.graph(), &op_node));
+        if (!root.ok() || op_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output result(op_node, 0);
+
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         tensorflow::Status status = session.Run({result}, &outputs);

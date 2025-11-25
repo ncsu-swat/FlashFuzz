@@ -308,7 +308,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
                     .Finalize(&graph, &node);
 
         if (!status.ok()) {
-            std::cerr << "Failed to create node: " << status.error_message() << std::endl;
+            std::cerr << "Failed to create node: " << status.message() << std::endl;
             return 0;
         }
 

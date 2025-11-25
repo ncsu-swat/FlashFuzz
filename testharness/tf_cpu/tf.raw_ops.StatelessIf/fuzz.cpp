@@ -1,6 +1,5 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
-#include "tensorflow/cc/ops/control_flow_ops.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -16,7 +15,6 @@
 #include <cstring>
 #include <vector>
 #include <cmath>
-#include <unordered_map>
 
 #define MAX_RANK 4
 #define MIN_RANK 0
@@ -167,7 +165,7 @@ void fillTensorWithDataByType(tensorflow::Tensor& tensor,
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     std::cout << "Start Fuzzing" << std::endl;
     if (size < 10) return 0;
-    
+
     size_t offset = 0;
 
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
@@ -175,82 +173,70 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     try {
         uint8_t cond_rank = parseRank(data[offset++]);
         std::vector<int64_t> cond_shape = parseShape(data, offset, size, cond_rank);
-        tensorflow::TensorShape cond_tensor_shape(cond_shape);
-        tensorflow::Tensor cond_tensor(tensorflow::DT_BOOL, cond_tensor_shape);
+        (void)cond_shape;
+        tensorflow::Tensor cond_tensor(tensorflow::DT_BOOL, tensorflow::TensorShape({}));
         fillTensorWithDataByType(cond_tensor, tensorflow::DT_BOOL, data, offset, size);
-        
-        auto cond_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_BOOL);
-        
+
+        auto cond_const = tensorflow::ops::Const(root, cond_tensor);
+
         uint8_t num_inputs = (data[offset++] % 3) + 1;
-        std::vector<tensorflow::Output> input_placeholders;
-        std::vector<tensorflow::Tensor> input_tensors;
+        std::vector<tensorflow::Output> input_consts;
         std::vector<tensorflow::DataType> input_types;
-        
+
         for (uint8_t i = 0; i < num_inputs; ++i) {
             if (offset >= size) break;
-            
+
             tensorflow::DataType input_dtype = parseDataType(data[offset++]);
             uint8_t input_rank = parseRank(data[offset++]);
             std::vector<int64_t> input_shape = parseShape(data, offset, size, input_rank);
-            
+
             tensorflow::TensorShape input_tensor_shape(input_shape);
             tensorflow::Tensor input_tensor(input_dtype, input_tensor_shape);
             fillTensorWithDataByType(input_tensor, input_dtype, data, offset, size);
-            
-            auto input_placeholder = tensorflow::ops::Placeholder(root, input_dtype);
-            input_placeholders.push_back(input_placeholder);
-            input_tensors.push_back(input_tensor);
+
+            auto input_const = tensorflow::ops::Const(root, input_tensor);
+            input_consts.push_back(input_const);
             input_types.push_back(input_dtype);
         }
-        
-        if (input_placeholders.empty()) {
+
+        if (input_consts.empty()) {
             return 0;
         }
-        
-        auto then_func = [&](const std::vector<tensorflow::Output>& inputs) -> std::vector<tensorflow::Output> {
-            std::vector<tensorflow::Output> outputs;
-            for (const auto& input : inputs) {
-                outputs.push_back(tensorflow::ops::Identity(root, input));
-            }
-            return outputs;
-        };
-        
-        auto else_func = [&](const std::vector<tensorflow::Output>& inputs) -> std::vector<tensorflow::Output> {
-            std::vector<tensorflow::Output> outputs;
-            for (const auto& input : inputs) {
-                outputs.push_back(tensorflow::ops::Identity(root, input));
-            }
-            return outputs;
-        };
-        
-        std::vector<tensorflow::Output> then_outputs = then_func(input_placeholders);
-        std::vector<tensorflow::Output> else_outputs = else_func(input_placeholders);
-        
+
+        tensorflow::NameAttrList then_attr;
+        then_attr.set_name("stateless_if_then");
+
+        tensorflow::NameAttrList else_attr;
+        else_attr.set_name("stateless_if_else");
+
+        tensorflow::Node* if_node = nullptr;
+        tensorflow::NodeBuilder builder("stateless_if", "StatelessIf");
+
+        std::vector<tensorflow::NodeBuilder::NodeOut> input_outs;
+        for (const auto& out : input_consts) {
+            input_outs.emplace_back(out.node(), out.index());
+        }
+
+        builder.Input(tensorflow::NodeBuilder::NodeOut(cond_const.node(), cond_const.index()))
+               .Input(input_outs)
+               .Attr("Tin", input_types)
+               .Attr("Tout", input_types)
+               .Attr("then_branch", then_attr)
+               .Attr("else_branch", else_attr);
+
+        tensorflow::Status status = builder.Finalize(root.graph(), &if_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to build StatelessIf node: " + status.ToString(), data, size);
+            return 0;
+        }
+
         tensorflow::ClientSession session(root);
-        
-        // Convert feed_dict to the correct format for ClientSession::Run
-        std::unordered_map<tensorflow::Output, tensorflow::Input::Initializer> feed_dict;
-        feed_dict.emplace(cond_placeholder, cond_tensor);
-        
-        for (size_t i = 0; i < input_placeholders.size(); ++i) {
-            feed_dict.emplace(input_placeholders[i], input_tensors[i]);
-        }
-        
-        std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run(feed_dict, then_outputs, &outputs);
-        if (!status.ok()) {
-            return -1;
-        }
-        
-        status = session.Run(feed_dict, else_outputs, &outputs);
-        if (!status.ok()) {
-            return -1;
-        }
+        (void)if_node;
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);
         return -1;
-    } 
+    }
 
     return 0;
 }

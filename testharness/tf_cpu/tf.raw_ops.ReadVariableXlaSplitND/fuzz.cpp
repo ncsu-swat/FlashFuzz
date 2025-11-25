@@ -240,32 +240,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             total_splits *= splits;
         }
         
-        // Convert num_splits to a tensor
-        tensorflow::Tensor num_splits_tensor(tensorflow::DT_INT32, {static_cast<int64_t>(num_splits.size())});
-        auto num_splits_flat = num_splits_tensor.flat<int32_t>();
-        for (size_t i = 0; i < num_splits.size(); ++i) {
-            num_splits_flat(i) = num_splits[i];
+        std::vector<int32_t> num_splits_attr(num_splits.begin(), num_splits.end());
+        std::vector<int32_t> paddings_attr(paddings.begin(), paddings.end());
+
+        auto var_node = tensorflow::ops::AsNodeOut(root, var);
+        tensorflow::Node* read_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("ReadVariableXlaSplitND"),
+                           "ReadVariableXlaSplitND")
+                           .Input(var_node)
+                           .Attr("num_splits", num_splits_attr)
+                           .Attr("paddings", paddings_attr)
+                           .Attr("T", dtype)
+                           .Attr("N", static_cast<int64_t>(total_splits));
+        root.UpdateBuilder(&builder);
+        root.UpdateStatus(builder.Finalize(root.graph(), &read_node));
+        if (!root.ok() || read_node == nullptr) {
+            return 0;
         }
-        
-        // Convert paddings to a tensor
-        tensorflow::Tensor paddings_tensor(tensorflow::DT_INT32, {static_cast<int64_t>(paddings.size())});
-        auto paddings_flat = paddings_tensor.flat<int32_t>();
-        for (size_t i = 0; i < paddings.size(); ++i) {
-            paddings_flat(i) = paddings[i];
-        }
-        
-        // Use raw_ops directly
-        auto read_split = tensorflow::ops::_Internal::ReadVariableXlaSplitND(
-            root, var, num_splits_tensor, paddings_tensor, dtype);
-        
+
         tensorflow::ClientSession session(root);
-        
-        // Run the assign operation first
-        TF_CHECK_OK(session.Run({assign}, nullptr));
-        
-        // Then run the read_split operation
+
+        TF_CHECK_OK(session.Run({}, {}, {assign.operation}, nullptr));
+
+        std::vector<tensorflow::Output> fetch_outputs;
+        for (int i = 0; i < total_splits; ++i) {
+            fetch_outputs.emplace_back(read_node, i);
+        }
+
         std::vector<tensorflow::Tensor> outputs;
-        TF_CHECK_OK(session.Run({read_split.output}, &outputs));
+        TF_CHECK_OK(session.Run(fetch_outputs, &outputs));
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

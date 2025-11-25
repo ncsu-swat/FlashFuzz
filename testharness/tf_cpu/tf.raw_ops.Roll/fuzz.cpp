@@ -2,10 +2,11 @@
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/array_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
-#include "tensorflow/core/framework/types.h"
-#include "tensorflow/core/lib/core/status.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -232,31 +233,35 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::Tensor shift_tensor(tensorflow::DT_INT32, shift_tensor_shape);
         fillTensorWithDataByType(shift_tensor, tensorflow::DT_INT32, data, offset, size);
         
-        uint8_t axis_rank = parseRank(data[offset++]);
-        if (axis_rank > 1) axis_rank = 1;
-        std::vector<int64_t> axis_shape = parseShape(data, offset, size, axis_rank);
-        
+        // Keep axis shape aligned with shift to satisfy shape constraints.
+        std::vector<int64_t> axis_shape = shift_shape;
         tensorflow::TensorShape axis_tensor_shape(axis_shape);
         tensorflow::Tensor axis_tensor(tensorflow::DT_INT32, axis_tensor_shape);
         fillTensorWithDataByType(axis_tensor, tensorflow::DT_INT32, data, offset, size);
         
-        auto input_placeholder = tensorflow::ops::Placeholder(root, input_dtype);
-        auto shift_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT32);
-        auto axis_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT32);
+        auto input_const = tensorflow::ops::Const(root.WithOpName("input"), input_tensor);
+        auto shift_const = tensorflow::ops::Const(root.WithOpName("shift"), shift_tensor);
+        auto axis_const = tensorflow::ops::Const(root.WithOpName("axis"), axis_tensor);
         
-        // Use raw_ops namespace for Roll operation
-        auto roll_op = tensorflow::ops::Roll(root.WithOpName("Roll"), 
-                                            input_placeholder, 
-                                            shift_placeholder, 
-                                            axis_placeholder);
+        tensorflow::Node* roll_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("Roll"), "Roll")
+                                        .Input(input_const.node())
+                                        .Input(shift_const.node())
+                                        .Input(axis_const.node())
+                                        .Attr("T", input_dtype)
+                                        .Attr("Tshift", tensorflow::DT_INT32)
+                                        .Attr("Taxis", tensorflow::DT_INT32)
+                                        .Finalize(root.graph(), &roll_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create Roll node: " + status.ToString(), data, size);
+            return -1;
+        }
         
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({{input_placeholder, input_tensor}, 
-                                                 {shift_placeholder, shift_tensor}, 
-                                                 {axis_placeholder, axis_tensor}}, 
-                                                {roll_op}, &outputs);
+        tensorflow::Output roll_output(roll_node, 0);
+        status = session.Run({roll_output}, &outputs);
         
         if (!status.ok()) {
             return -1;

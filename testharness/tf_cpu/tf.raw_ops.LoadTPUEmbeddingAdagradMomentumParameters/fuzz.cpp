@@ -3,8 +3,12 @@
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
+#include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/lib/core/status.h"
 #include <iostream>
 #include <cstring>
+#include <string>
+#include <vector>
 #include <cmath>
 
 #define MAX_RANK 4
@@ -184,50 +188,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto accumulators_input = tensorflow::ops::Const(root, accumulators_tensor);
         auto momenta_input = tensorflow::ops::Const(root, momenta_tensor);
         
-        // Use raw_ops API instead of the missing tpu_ops.h
-        std::vector<tensorflow::Output> inputs = {parameters_input, accumulators_input, momenta_input};
-        tensorflow::NodeBuilder node_builder = tensorflow::NodeBuilder("LoadTPUEmbeddingAdagradMomentumParameters", "LoadTPUEmbeddingAdagradMomentumParameters")
-            .Input(inputs)
-            .Attr("num_shards", num_shards)
-            .Attr("shard_id", shard_id)
-            .Attr("table_id", table_id)
-            .Attr("table_name", table_name)
-            .Attr("config", config);
-            
-        tensorflow::Node* node;
-        tensorflow::Status status = root.graph()->AddNode(node_builder, &node);
-        if (!status.ok()) {
-            std::cout << "Error creating node: " << status.ToString() << std::endl;
-            return -1;
-        }
-        
-        tensorflow::ClientSession session(root);
-        
-        std::cout << "Parameters tensor shape: ";
-        for (int i = 0; i < parameters_tensor.shape().dims(); ++i) {
-            std::cout << parameters_tensor.shape().dim_size(i) << " ";
-        }
-        std::cout << std::endl;
-        
-        std::cout << "Accumulators tensor shape: ";
-        for (int i = 0; i < accumulators_tensor.shape().dims(); ++i) {
-            std::cout << accumulators_tensor.shape().dim_size(i) << " ";
-        }
-        std::cout << std::endl;
-        
-        std::cout << "Momenta tensor shape: ";
-        for (int i = 0; i < momenta_tensor.shape().dims(); ++i) {
-            std::cout << momenta_tensor.shape().dim_size(i) << " ";
-        }
-        std::cout << std::endl;
-        
-        std::cout << "num_shards: " << num_shards << ", shard_id: " << shard_id << ", table_id: " << table_id << std::endl;
+        tensorflow::NodeBuilder builder(
+            root.GetUniqueNameForOp("LoadTPUEmbeddingAdagradMomentumParameters"),
+            "LoadTPUEmbeddingAdagradMomentumParameters");
+        builder.Input(parameters_input.node());
+        builder.Input(accumulators_input.node());
+        builder.Input(momenta_input.node());
+        builder.Attr("num_shards", num_shards);
+        builder.Attr("shard_id", shard_id);
+        builder.Attr("table_id", table_id);
+        builder.Attr("table_name", table_name);
+        builder.Attr("config", config);
 
-        status = session.Run({}, {});
-        if (!status.ok()) {
-            std::cout << "Error running session: " << status.ToString() << std::endl;
-            return -1;
-        }
+        tensorflow::Node* node = nullptr;
+        TF_CHECK_OK(builder.Finalize(root.graph(), &node));
+
+        tensorflow::ClientSession session(root);
+        tensorflow::Operation load_op(node);
+        TF_CHECK_OK(session.Run({}, {}, {load_op}, nullptr));
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

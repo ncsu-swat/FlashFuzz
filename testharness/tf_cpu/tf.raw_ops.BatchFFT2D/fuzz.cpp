@@ -8,6 +8,7 @@
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/cc/framework/ops.h"
 #include "tensorflow/cc/framework/scope.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -115,21 +116,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         tensorflow::TensorShape input_tensor_shape;
         for (int64_t dim : input_shape) {
-            input_tensor_shape.AddDim(dim);
+            tensorflow::Status dim_status = input_tensor_shape.AddDimWithStatus(dim);
+            if (!dim_status.ok()) {
+                return 0;
+            }
         }
         
         tensorflow::Tensor input_tensor(input_dtype, input_tensor_shape);
         fillTensorWithDataByType(input_tensor, input_dtype, data, offset, size);
         
-        auto input_placeholder = tensorflow::ops::Placeholder(root, input_dtype);
-        
-        // Use raw_ops namespace for BatchFFT2D
-        auto batch_fft2d_op = tensorflow::ops::FFT2D(root, input_placeholder);
+        auto input_const = tensorflow::ops::Const(root, input_tensor);
+        tensorflow::Node* batch_fft2d_node = nullptr;
+        tensorflow::Status build_status =
+            tensorflow::NodeBuilder("batch_fft2d", "BatchFFT2D")
+                .Input(input_const.node())
+                .Finalize(root.graph(), &batch_fft2d_node);
+        if (!build_status.ok()) {
+            tf_fuzzer_utils::logError("Failed to build BatchFFT2D node: " + build_status.ToString(), data, size);
+            return 0;
+        }
+        tensorflow::Output batch_fft2d_output(batch_fft2d_node, 0);
         
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({{input_placeholder, input_tensor}}, {batch_fft2d_op}, &outputs);
+        tensorflow::Status status = session.Run({batch_fft2d_output}, &outputs);
         
         if (!status.ok()) {
             return -1;

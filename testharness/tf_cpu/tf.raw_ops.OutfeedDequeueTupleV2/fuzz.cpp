@@ -1,11 +1,16 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
+#include "tensorflow/core/framework/partial_tensor_shape.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
+#include <cmath>
 
 #define MAX_RANK 4
 #define MIN_RANK 0
@@ -224,15 +229,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     try {
         if (offset >= size) return 0;
-        int32_t device_ordinal_value = static_cast<int32_t>(data[offset]);
-        offset++;
-        
-        tensorflow::Tensor device_ordinal_tensor(tensorflow::DT_INT32, tensorflow::TensorShape({}));
-        device_ordinal_tensor.scalar<int32_t>()() = device_ordinal_value;
-        
-        auto device_ordinal = tensorflow::ops::Const(root, device_ordinal_tensor);
-        
-        if (offset >= size) return 0;
         uint8_t num_outputs = (data[offset] % 3) + 1;
         offset++;
         
@@ -257,19 +253,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             shapes.push_back(shape);
         }
         
-        std::cout << "Device ordinal: " << device_ordinal_value << std::endl;
-        std::cout << "Number of outputs: " << static_cast<int>(num_outputs) << std::endl;
-        for (size_t i = 0; i < dtypes.size(); ++i) {
-            std::cout << "Output " << i << " dtype: " << dtypes[i] << ", shape: ";
-            for (int j = 0; j < shapes[i].dims(); ++j) {
-                std::cout << shapes[i].dim_size(j) << " ";
-            }
-            std::cout << std::endl;
+        int32_t device_ordinal_raw;
+        if (offset + sizeof(int32_t) <= size) {
+            std::memcpy(&device_ordinal_raw, data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+        } else {
+            device_ordinal_raw = -1;
         }
-        
-        // Use raw_ops API instead of ops::OutfeedDequeueTupleV2
-        auto outfeed_op = tensorflow::ops::OutfeedDequeueTuple(root, dtypes, shapes);
-        
+        int32_t device_ordinal = (device_ordinal_raw % 3) - 1;
+
+        std::vector<tensorflow::PartialTensorShape> partial_shapes;
+        partial_shapes.reserve(shapes.size());
+        for (const auto& shape : shapes) {
+            partial_shapes.emplace_back(shape);
+        }
+
+        tensorflow::Tensor device_ordinal_tensor(tensorflow::DT_INT32, tensorflow::TensorShape({}));
+        device_ordinal_tensor.scalar<int32_t>()() = device_ordinal;
+        auto device_ordinal_const = tensorflow::ops::Const(root, device_ordinal_tensor);
+
+        tensorflow::Node* outfeed_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("outfeed_dequeue_tuple_v2", "OutfeedDequeueTupleV2")
+                                        .Input(device_ordinal_const.node())
+                                        .Attr("dtypes", dtypes)
+                                        .Attr("shapes", partial_shapes)
+                                        .Finalize(root.graph(), &outfeed_node);
+        if (!status.ok()) {
+            std::cerr << "Failed to build OutfeedDequeueTupleV2 node: " << status.ToString() << std::endl;
+            return 0;
+        }
+
         tensorflow::ClientSession session(root);
         
     } catch (const std::exception& e) {

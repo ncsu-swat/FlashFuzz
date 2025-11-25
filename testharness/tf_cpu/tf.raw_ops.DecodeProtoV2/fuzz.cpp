@@ -6,6 +6,7 @@
 #include "tensorflow/cc/ops/parsing_ops.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <vector>
 #include <string>
@@ -220,33 +221,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::string message_format = "binary";
         bool sanitize = false;
 
-        auto bytes = tensorflow::ops::Const(root, bytes_tensor);
-        auto message_type_const = tensorflow::ops::Const(root, message_type);
-        auto field_names_const = tensorflow::ops::Const(root, field_names);
-        auto output_types_const = tensorflow::ops::Const(root, output_types);
-        auto descriptor_source_const = tensorflow::ops::Const(root, descriptor_source);
-        auto message_format_const = tensorflow::ops::Const(root, message_format);
-        auto sanitize_const = tensorflow::ops::Const(root, sanitize);
+        auto bytes = tensorflow::ops::Const(root.WithOpName("bytes"), bytes_tensor);
+
+        tensorflow::Node* decode_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("DecodeProtoV2"),
+                                                            "DecodeProtoV2")
+                                        .Input(tensorflow::NodeBuilder::NodeOut(bytes.node(), bytes.index()))
+                                        .Attr("message_type", message_type)
+                                        .Attr("field_names", field_names)
+                                        .Attr("output_types", output_types)
+                                        .Attr("descriptor_source", descriptor_source)
+                                        .Attr("message_format", message_format)
+                                        .Attr("sanitize", sanitize)
+                                        .Finalize(root.graph(), &decode_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("NodeBuilder failed: " + status.ToString(), data, size);
+            return -1;
+        }
 
         std::vector<tensorflow::Output> outputs;
-        
-        tensorflow::Operation decode_proto_op = tensorflow::Operation(
-            root.WithOpName("DecodeProtoV2")
-                .WithDevice("/cpu:0")
-                .WithAttr("message_type", message_type)
-                .WithAttr("field_names", field_names)
-                .WithAttr("output_types", output_types)
-                .WithAttr("descriptor_source", descriptor_source)
-                .WithAttr("message_format", message_format)
-                .WithAttr("sanitize", sanitize)
-                .AddInput(bytes)
-                .Finalize(&outputs)
-                .operation);
+        for (int i = 0; i < decode_node->num_outputs(); ++i) {
+            outputs.emplace_back(decode_node, i);
+        }
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> output_tensors;
         
-        tensorflow::Status status = session.Run({decode_proto_op.name()}, &output_tensors);
+        status = session.Run(outputs, &output_tensors);
         if (!status.ok()) {
             return -1;
         }

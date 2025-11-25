@@ -134,9 +134,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         auto init_op = tensorflow::ops::AssignVariableOp(root, var_handle, init_value);
         
-        // Use raw_ops namespace for ResourceCountUpTo
-        auto count_up_op = tensorflow::ops::ResourceCountUpTo(root, var_handle, limit);
-        count_up_op.operation.node()->set_attr("T", dtype);
+        // Call wrapper with explicit dtype to satisfy op signature
+        auto count_up_op = tensorflow::ops::ResourceCountUpTo(root, var_handle, limit, dtype);
 
         tensorflow::ClientSession session(root);
         

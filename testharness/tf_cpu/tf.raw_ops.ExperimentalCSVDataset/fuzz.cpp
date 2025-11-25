@@ -178,8 +178,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t num_defaults = (offset < size) ? (data[offset] % 3 + 1) : 1;
         offset++;
 
-        std::vector<tensorflow::Input> record_defaults;
+        std::vector<tensorflow::Tensor> record_defaults;
         std::vector<tensorflow::DataType> output_types;
+        std::vector<tensorflow::TensorShape> output_shapes;
 
         for (uint8_t i = 0; i < num_defaults; ++i) {
             tensorflow::DataType dtype = parseDataType((offset < size) ? data[offset] : 0);
@@ -187,37 +188,49 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
             tensorflow::Tensor default_tensor(dtype, tensorflow::TensorShape({}));
             fillTensorWithDataByType(default_tensor, dtype, data, offset, size);
-            record_defaults.push_back(tensorflow::Input(default_tensor));
+            record_defaults.push_back(default_tensor);
             output_types.push_back(dtype);
+            output_shapes.push_back(default_tensor.shape());
         }
 
-        auto filenames_input = tensorflow::Input(filenames_tensor);
-        auto compression_type_input = tensorflow::Input(compression_type_tensor);
-        auto buffer_size_input = tensorflow::Input(buffer_size_tensor);
-        auto header_input = tensorflow::Input(header_tensor);
-        auto field_delim_input = tensorflow::Input(field_delim_tensor);
-        auto use_quote_delim_input = tensorflow::Input(use_quote_delim_tensor);
-        auto na_value_input = tensorflow::Input(na_value_tensor);
-        auto select_cols_input = tensorflow::Input(select_cols_tensor);
+        auto filenames_node = tensorflow::ops::Const(root.WithOpName("filenames"), filenames_tensor).node();
+        auto compression_type_node = tensorflow::ops::Const(root.WithOpName("compression_type"), compression_type_tensor).node();
+        auto buffer_size_node = tensorflow::ops::Const(root.WithOpName("buffer_size"), buffer_size_tensor).node();
+        auto header_node = tensorflow::ops::Const(root.WithOpName("header"), header_tensor).node();
+        auto field_delim_node = tensorflow::ops::Const(root.WithOpName("field_delim"), field_delim_tensor).node();
+        auto use_quote_delim_node = tensorflow::ops::Const(root.WithOpName("use_quote_delim"), use_quote_delim_tensor).node();
+        auto na_value_node = tensorflow::ops::Const(root.WithOpName("na_value"), na_value_tensor).node();
+        auto select_cols_node = tensorflow::ops::Const(root.WithOpName("select_cols"), select_cols_tensor).node();
 
-        // Use raw_ops approach instead of ops::ExperimentalCSVDataset
-        auto experimental_csv_dataset = tensorflow::ops::experimental::CSVDatasetV2(
-            root,
-            filenames_input,
-            compression_type_input,
-            buffer_size_input,
-            header_input,
-            field_delim_input,
-            use_quote_delim_input,
-            na_value_input,
-            select_cols_input,
-            record_defaults,
-            output_types
-        );
+        auto op_builder = tensorflow::NodeBuilder("ExperimentalCSVDataset", "ExperimentalCSVDataset")
+            .Input(tensorflow::NodeBuilder::NodeOut(filenames_node))
+            .Input(tensorflow::NodeBuilder::NodeOut(compression_type_node))
+            .Input(tensorflow::NodeBuilder::NodeOut(buffer_size_node))
+            .Input(tensorflow::NodeBuilder::NodeOut(header_node))
+            .Input(tensorflow::NodeBuilder::NodeOut(field_delim_node))
+            .Input(tensorflow::NodeBuilder::NodeOut(use_quote_delim_node))
+            .Input(tensorflow::NodeBuilder::NodeOut(na_value_node))
+            .Input(tensorflow::NodeBuilder::NodeOut(select_cols_node));
+
+        for (size_t i = 0; i < record_defaults.size(); ++i) {
+            std::string input_name = "record_defaults_" + std::to_string(i);
+            auto default_node = tensorflow::ops::Const(root.WithOpName(input_name), record_defaults[i]).node();
+            op_builder.Input(tensorflow::NodeBuilder::NodeOut(default_node));
+        }
+
+        op_builder.Attr("output_types", output_types);
+        op_builder.Attr("output_shapes", output_shapes);
+
+        tensorflow::Node* csv_dataset_node = nullptr;
+        tensorflow::Status status = op_builder.Finalize(root.graph(), &csv_dataset_node);
+
+        if (!status.ok()) {
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({experimental_csv_dataset.handle}, &outputs);
+        status = session.Run({tensorflow::Output(csv_dataset_node, 0)}, &outputs);
         
         if (!status.ok()) {
             return -1;

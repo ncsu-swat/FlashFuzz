@@ -1,11 +1,14 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
+#include <cstdint>
 #include <iostream>
 #include <cstring>
 #include <cmath>
+#include <vector>
 
 #define MAX_RANK 4
 #define MIN_RANK 0
@@ -254,23 +257,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::cout << "table_name: " << table_name << std::endl;
         std::cout << "config: " << config << std::endl;
 
-        // Use raw_ops API instead of ops::RetrieveTPUEmbeddingCenteredRMSPropParameters
-        auto op_attrs = tensorflow::ops::Raw::Attrs()
-            .TableId(table_id)
-            .TableName(table_name)
-            .Config(config);
+        tensorflow::Node* retrieve_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                "RetrieveTPUEmbeddingCenteredRMSPropParameters",
+                "RetrieveTPUEmbeddingCenteredRMSPropParameters")
+            .Attr("table_id", static_cast<int64_t>(table_id))
+            .Attr("table_name", table_name)
+            .Attr("num_shards", static_cast<int64_t>(num_shards))
+            .Attr("shard_id", static_cast<int64_t>(shard_id))
+            .Attr("config", config)
+            .Finalize(root.graph(), &retrieve_node);
+        if (!status.ok()) {
+            std::cout << "Error creating node: " << status.ToString() << std::endl;
+            return -1;
+        }
 
-        auto retrieve_op = tensorflow::ops::Raw::RetrieveTPUEmbeddingCenteredRMSPropParameters(
-            root,
-            tensorflow::Input(num_shards),
-            tensorflow::Input(shard_id),
-            op_attrs);
+        tensorflow::Output parameters(retrieve_node, 0);
+        tensorflow::Output ms(retrieve_node, 1);
+        tensorflow::Output mom(retrieve_node, 2);
+        tensorflow::Output mg(retrieve_node, 3);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
 
         std::cout << "Running session..." << std::endl;
-        auto status = session.Run({retrieve_op.parameters, retrieve_op.ms, retrieve_op.mom, retrieve_op.mg}, &outputs);
+        status = session.Run({parameters, ms, mom, mg}, &outputs);
         
         if (!status.ok()) {
             std::cout << "Session run failed: " << status.ToString() << std::endl;

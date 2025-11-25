@@ -227,75 +227,70 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        uint8_t num_output_types = (data[offset] % 3) + 1;
-        offset++;
+        auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
+        auto stop = tensorflow::ops::Const(root, static_cast<int64_t>(10));
+        auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
 
-        std::vector<tensorflow::DataType> output_types;
-        std::vector<tensorflow::PartialTensorShape> output_shapes;
-        
-        for (uint8_t i = 0; i < num_output_types; ++i) {
-            if (offset >= size) break;
-            tensorflow::DataType dtype = parseDataType(data[offset]);
-            output_types.push_back(dtype);
-            offset++;
-            
-            if (offset >= size) break;
-            uint8_t rank = parseRank(data[offset]);
-            offset++;
-            
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            output_shapes.push_back(tensorflow::PartialTensorShape(shape));
-        }
+        std::vector<tensorflow::DataType> dataset_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> dataset_shapes = {
+            tensorflow::PartialTensorShape({})};
 
-        if (output_types.empty()) {
-            output_types.push_back(tensorflow::DT_FLOAT);
-            output_shapes.push_back(tensorflow::PartialTensorShape({1}));
+        tensorflow::Node* range_dataset_node = nullptr;
+        auto range_status = tensorflow::NodeBuilder("range_dataset", "RangeDataset")
+                                .Input(start.node())
+                                .Input(stop.node())
+                                .Input(step.node())
+                                .Attr("output_types", dataset_types)
+                                .Attr("output_shapes", dataset_shapes)
+                                .Finalize(root.graph(), &range_dataset_node);
+        if (!range_status.ok()) {
+            return -1;
         }
 
         if (offset >= size) return 0;
         uint8_t batch_sizes_count = (data[offset] % 3) + 1;
         offset++;
 
-        tensorflow::TensorShape batch_sizes_shape({batch_sizes_count});
-        tensorflow::Tensor batch_sizes_tensor(tensorflow::DT_INT64, batch_sizes_shape);
+        tensorflow::Tensor batch_sizes_tensor(tensorflow::DT_INT64,
+                                              tensorflow::TensorShape({batch_sizes_count}));
         auto batch_sizes_flat = batch_sizes_tensor.flat<int64_t>();
         for (int i = 0; i < batch_sizes_count; ++i) {
+            int64_t batch_size = 1;
             if (offset + sizeof(int64_t) <= size) {
-                int64_t batch_size;
                 std::memcpy(&batch_size, data + offset, sizeof(int64_t));
                 offset += sizeof(int64_t);
-                batch_size = std::abs(batch_size) % 10 + 1;
-                batch_sizes_flat(i) = batch_size;
-            } else {
-                batch_sizes_flat(i) = 1;
             }
+            batch_sizes_flat(i) = std::abs(batch_size) % 16 + 1;
         }
 
-        if (offset >= size) return 0;
-        bool drop_remainder = data[offset] % 2;
-        offset++;
+        bool drop_remainder = false;
+        if (offset < size) {
+            drop_remainder = data[offset] % 2;
+            offset++;
+        }
 
-        tensorflow::TensorShape drop_remainder_shape({});
-        tensorflow::Tensor drop_remainder_tensor(tensorflow::DT_BOOL, drop_remainder_shape);
+        tensorflow::Tensor drop_remainder_tensor(tensorflow::DT_BOOL,
+                                                 tensorflow::TensorShape({}));
         drop_remainder_tensor.scalar<bool>()() = drop_remainder;
-
-        tensorflow::TensorShape input_dataset_shape({});
-        tensorflow::Tensor input_dataset_tensor(tensorflow::DT_VARIANT, input_dataset_shape);
 
         auto batch_sizes_input = tensorflow::ops::Const(root, batch_sizes_tensor);
         auto drop_remainder_input = tensorflow::ops::Const(root, drop_remainder_tensor);
-        auto input_dataset_input = tensorflow::ops::Const(root, input_dataset_tensor);
 
-        auto rebatch_dataset = tensorflow::ops::RawOp(
-            root.WithOpName("RebatchDatasetV2"),
-            "RebatchDatasetV2",
-            {input_dataset_input.output, batch_sizes_input.output, drop_remainder_input.output},
-            {{"output_types", output_types}, {"output_shapes", output_shapes}}
-        );
+        tensorflow::Node* rebatch_node = nullptr;
+        auto rebatch_status = tensorflow::NodeBuilder("rebatch_dataset_v2", "RebatchDatasetV2")
+                                  .Input(range_dataset_node)
+                                  .Input(batch_sizes_input.node())
+                                  .Input(drop_remainder_input.node())
+                                  .Attr("output_types", dataset_types)
+                                  .Attr("output_shapes", dataset_shapes)
+                                  .Finalize(root.graph(), &rebatch_node);
+        if (!rebatch_status.ok()) {
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({rebatch_dataset}, &outputs);
+        tensorflow::Status status = session.Run({tensorflow::Output(rebatch_node)}, &outputs);
         if (!status.ok()) {
             return -1;
         }

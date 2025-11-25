@@ -1,7 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
-#include "tensorflow/cc/ops/dataset_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -233,25 +233,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     try {
         tensorflow::DataType element_dtype = parseDataType(data[offset++]);
-        
+
         tensorflow::TensorShape element_shape({});
         tensorflow::Tensor element_tensor(element_dtype, element_shape);
         fillTensorWithDataByType(element_tensor, element_dtype, data, offset, size);
-        
+
         auto element_placeholder = tensorflow::ops::Placeholder(root, element_dtype);
-        
-        // Create a tensor dataset using tensor_slice_dataset
-        auto tensor_dataset = tensorflow::ops::TensorSliceDataset(
-            root, {element_placeholder}, {tensorflow::PartialTensorShape({})});
-        
+
+        tensorflow::Node* tensor_dataset_node = nullptr;
+        auto tensor_dataset_builder =
+            tensorflow::NodeBuilder(root.GetUniqueNameForOp("TensorSliceDataset"), "TensorSliceDataset")
+                .Input(tensorflow::NodeBuilder::NodeOut(element_placeholder.node()))
+                .Attr("Toutput_types", {element_dtype})
+                .Attr("output_shapes", {tensorflow::PartialTensorShape(element_shape)});
+
+        root.UpdateBuilder(&tensor_dataset_builder);
+        root.UpdateStatus(tensor_dataset_builder.Finalize(root.graph(), &tensor_dataset_node));
+        if (!root.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output tensor_dataset(tensor_dataset_node, 0);
+
         std::string filename_str = "/tmp/test_output_";
         if (offset < size) {
             filename_str += std::to_string(data[offset++] % 1000);
         }
         filename_str += ".tfrecord";
-        
+
         auto filename = tensorflow::ops::Const(root, filename_str);
-        
+
         std::string compression_type_str;
         if (offset < size) {
             uint8_t comp_selector = data[offset++];
@@ -269,24 +280,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         } else {
             compression_type_str = "";
         }
-        
+
         auto compression_type = tensorflow::ops::Const(root, compression_type_str);
-        
-        // Use the raw op directly
-        tensorflow::Output dataset_to_tfrecord = tensorflow::Operation(
-            root.WithOpName("DatasetToTFRecord"),
-            "DatasetToTFRecord",
-            {tensor_dataset, filename, compression_type},
-            0);
-        
+
+        tensorflow::Node* dataset_to_tfrecord_node = nullptr;
+        auto dataset_to_tfrecord_builder =
+            tensorflow::NodeBuilder(root.GetUniqueNameForOp("DatasetToTFRecord"), "DatasetToTFRecord")
+                .Input(tensorflow::NodeBuilder::NodeOut(tensor_dataset.node()))
+                .Input(tensorflow::NodeBuilder::NodeOut(filename.node()))
+                .Input(tensorflow::NodeBuilder::NodeOut(compression_type.node()));
+
+        root.UpdateBuilder(&dataset_to_tfrecord_builder);
+        root.UpdateStatus(dataset_to_tfrecord_builder.Finalize(root.graph(), &dataset_to_tfrecord_node));
+        if (!root.ok()) {
+            return -1;
+        }
+
         tensorflow::ClientSession session(root);
-        
+
         std::vector<tensorflow::Tensor> outputs;
         tensorflow::Status status = session.Run(
-            {{element_placeholder, element_tensor}}, 
-            {dataset_to_tfrecord}, 
+            {{element_placeholder, element_tensor}},
+            {},
+            {tensorflow::Operation(dataset_to_tfrecord_node)},
             &outputs);
-            
+
         if (!status.ok()) {
             return -1;
         }

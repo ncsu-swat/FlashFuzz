@@ -6,6 +6,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -174,6 +175,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::TensorShape alg_shape({});
         tensorflow::Tensor alg_tensor(tensorflow::DT_INT32, alg_shape);
         fillTensorWithData<int32_t>(alg_tensor, data, offset, size);
+        int32_t alg_val = alg_tensor.scalar<int32_t>()();
+        alg_tensor.scalar<int32_t>()() = std::abs(alg_val % 3) + 1;
         
         tensorflow::TensorShape minval_shape({});
         tensorflow::Tensor minval_tensor(minmax_dtype, minval_shape);
@@ -183,20 +186,85 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::Tensor maxval_tensor(minmax_dtype, maxval_shape);
         fillTensorWithDataByType(maxval_tensor, minmax_dtype, data, offset, size);
         
+        // Normalize min/max to a valid range for integer generation.
+        switch (minmax_dtype) {
+            case tensorflow::DT_INT32: {
+                int32_t min_v = minval_tensor.scalar<int32_t>()();
+                int32_t max_v = maxval_tensor.scalar<int32_t>()();
+                if (max_v <= min_v) {
+                    min_v = 0;
+                    max_v = 1;
+                }
+                minval_tensor.scalar<int32_t>()() = min_v;
+                maxval_tensor.scalar<int32_t>()() = max_v;
+                break;
+            }
+            case tensorflow::DT_INT64: {
+                int64_t min_v = minval_tensor.scalar<int64_t>()();
+                int64_t max_v = maxval_tensor.scalar<int64_t>()();
+                if (max_v <= min_v) {
+                    min_v = 0;
+                    max_v = 1;
+                }
+                minval_tensor.scalar<int64_t>()() = min_v;
+                maxval_tensor.scalar<int64_t>()() = max_v;
+                break;
+            }
+            case tensorflow::DT_UINT32: {
+                uint32_t min_v = minval_tensor.scalar<uint32_t>()();
+                uint32_t max_v = maxval_tensor.scalar<uint32_t>()();
+                if (max_v <= min_v) {
+                    min_v = 0;
+                    max_v = 1;
+                }
+                minval_tensor.scalar<uint32_t>()() = min_v;
+                maxval_tensor.scalar<uint32_t>()() = max_v;
+                break;
+            }
+            case tensorflow::DT_UINT64: {
+                uint64_t min_v = minval_tensor.scalar<uint64_t>()();
+                uint64_t max_v = maxval_tensor.scalar<uint64_t>()();
+                if (max_v <= min_v) {
+                    min_v = 0;
+                    max_v = 1;
+                }
+                minval_tensor.scalar<uint64_t>()() = min_v;
+                maxval_tensor.scalar<uint64_t>()() = max_v;
+                break;
+            }
+            default:
+                break;
+        }
+
         auto shape_input = tensorflow::ops::Const(root, shape_tensor);
         auto key_input = tensorflow::ops::Const(root, key_tensor);
         auto counter_input = tensorflow::ops::Const(root, counter_tensor);
         auto alg_input = tensorflow::ops::Const(root, alg_tensor);
         auto minval_input = tensorflow::ops::Const(root, minval_tensor);
         auto maxval_input = tensorflow::ops::Const(root, maxval_tensor);
-        
-        // Use raw operation instead of ops namespace
-        auto result = tensorflow::ops::StatelessRandomUniformInt(
-            root, shape_input, minval_input, maxval_input, key_input);
-        
+
+        tensorflow::Node* node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("stateless_random_uniform_int_v2"),
+                                        "StatelessRandomUniformIntV2")
+                                        .Input(tensorflow::NodeBuilder::NodeOut(shape_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(key_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(counter_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(alg_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(minval_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(maxval_input.node()))
+                                        .Attr("dtype", minmax_dtype)
+                                        .Attr("Tshape", shape_tensor.dtype())
+                                        .Finalize(root.graph(), &node);
+        if (!status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output result(node, 0);
+
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({result}, &outputs);
+        status = session.Run({result}, &outputs);
         if (!status.ok()) {
             return -1;
         }

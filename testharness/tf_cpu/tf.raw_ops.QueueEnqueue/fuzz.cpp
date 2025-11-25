@@ -299,7 +299,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             tensorflow::ops::QueueEnqueue::Attrs().TimeoutMs(timeout_ms));
         
         tensorflow::ClientSession session(root);
-        tensorflow::Status status = session.Run({enqueue_op}, nullptr);
+        // Run the enqueue op as a side-effect only; no fetches needed.
+        tensorflow::Status status = session.Run({}, {}, {enqueue_op}, nullptr);
         if (!status.ok()) {
             return -1;
         }

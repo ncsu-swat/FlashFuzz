@@ -1,8 +1,10 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -254,24 +256,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::cout << "table_name: " << table_name << std::endl;
         std::cout << "config: " << config << std::endl;
 
-        // Using raw_ops approach instead of ops::RetrieveTPUEmbeddingMDLAdagradLightParameters
-        auto op_attrs = tensorflow::ops::Attrs()
-            .WithAttr("table_id", table_id)
-            .WithAttr("table_name", table_name)
-            .WithAttr("config", config);
+        tensorflow::Node* retrieve_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                "RetrieveTPUEmbeddingMDLAdagradLightParameters",
+                "RetrieveTPUEmbeddingMDLAdagradLightParameters")
+            .Attr("table_id", static_cast<int64_t>(table_id))
+            .Attr("table_name", table_name)
+            .Attr("num_shards", static_cast<int64_t>(num_shards))
+            .Attr("shard_id", static_cast<int64_t>(shard_id))
+            .Attr("config", config)
+            .Finalize(root.graph(), &retrieve_node);
+        if (!status.ok()) {
+            std::cout << "Error creating node: " << status.ToString() << std::endl;
+            return -1;
+        }
 
-        auto op = tensorflow::Operation(root.WithOpName("RetrieveTPUEmbeddingMDLAdagradLightParameters")
-            .WithAttr("num_shards", num_shards)
-            .WithAttr("shard_id", shard_id)
-            .WithAttrs(op_attrs));
+        tensorflow::Output parameters(retrieve_node, 0);
+        tensorflow::Output accumulators(retrieve_node, 1);
+        tensorflow::Output weights(retrieve_node, 2);
+        tensorflow::Output benefits(retrieve_node, 3);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({tensorflow::Output(op, 0), 
-                                                tensorflow::Output(op, 1),
-                                                tensorflow::Output(op, 2),
-                                                tensorflow::Output(op, 3)}, &outputs);
+        status = session.Run({parameters, accumulators, weights, benefits}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

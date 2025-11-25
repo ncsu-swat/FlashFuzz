@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -56,19 +57,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::cout << "Container: '" << container << "'" << std::endl;
         std::cout << "Shared name: '" << shared_name << "'" << std::endl;
         
-        auto op = tensorflow::ops::RawOp(
-            root.WithOpName("test_op"),
-            "BoostedTreesEnsembleResourceHandleOp",
-            {},
-            {{"container", container}, {"shared_name", shared_name}}
-        );
+        tensorflow::Node* op_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("BoostedTreesEnsembleResourceHandleOp"),
+                           "BoostedTreesEnsembleResourceHandleOp")
+                           .Attr("container", container)
+                           .Attr("shared_name", shared_name);
+        root.UpdateStatus(builder.Finalize(root.graph(), &op_node));
+        if (!root.ok() || op_node == nullptr) {
+            return 0;
+        }
+
+        tensorflow::Output op(op_node, 0);
         
         std::cout << "Operation created successfully" << std::endl;
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({op.output(0)}, &outputs);
+        tensorflow::Status status = session.Run({op}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

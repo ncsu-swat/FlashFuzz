@@ -1,5 +1,6 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -206,43 +207,68 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto keys_input = tensorflow::ops::Const(root, keys_tensor);
         auto default_value_input = tensorflow::ops::Const(root, default_value_tensor);
         
-        // Create a hash table
-        auto table_handle = tensorflow::ops::Placeholder(root.WithOpName("table_handle"), tensorflow::DT_RESOURCE);
-        
         tensorflow::Tensor init_keys_tensor(key_dtype, tensorflow::TensorShape({2}));
         tensorflow::Tensor init_values_tensor(value_dtype, tensorflow::TensorShape({2}));
         fillTensorWithDataByType(init_keys_tensor, key_dtype, data, offset, size);
         fillTensorWithDataByType(init_values_tensor, value_dtype, data, offset, size);
         
-        auto init_keys = tensorflow::ops::Const(root, init_keys_tensor);
-        auto init_values = tensorflow::ops::Const(root, init_values_tensor);
-        
-        // Use raw ops for lookup operations
-        tensorflow::ops::Scope lookup_scope = root.WithOpName("LookupTableFindV2");
-        auto lookup_result = tensorflow::Output(
-            tensorflow::Operation(
-                root.WithOpName("LookupTableFindV2")
-                    .WithDevice("/cpu:0")
-                    .WithAttr("Tin", key_dtype)
-                    .WithAttr("Tout", value_dtype),
-                {table_handle, keys_input, default_value_input},
-                1));
-        
-        // Create a dummy table handle tensor
-        tensorflow::Tensor table_handle_tensor(tensorflow::DT_RESOURCE, tensorflow::TensorShape({}));
-        auto flat = table_handle_tensor.flat<tensorflow::ResourceHandle>();
-        flat(0) = tensorflow::ResourceHandle();
-        
+        auto init_keys = tensorflow::ops::Const(root.WithOpName("init_keys"), init_keys_tensor);
+        auto init_values = tensorflow::ops::Const(root.WithOpName("init_values"), init_values_tensor);
+
+        tensorflow::Node* table_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("HashTableV2"),
+                                        "HashTableV2")
+                                        .Attr("key_dtype", key_dtype)
+                                        .Attr("value_dtype", value_dtype)
+                                        .Finalize(root.graph(), &table_node);
+        root.UpdateStatus(status);
+        if (!root.ok() || table_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output table_handle(table_node, 0);
+
+        tensorflow::Node* insert_node = nullptr;
+        status = tensorflow::NodeBuilder(
+                     root.GetUniqueNameForOp("LookupTableInsertV2"),
+                     "LookupTableInsertV2")
+                     .Input(tensorflow::NodeBuilder::NodeOut(table_handle.node()))
+                     .Input(tensorflow::NodeBuilder::NodeOut(init_keys.node()))
+                     .Input(tensorflow::NodeBuilder::NodeOut(init_values.node()))
+                     .Attr("Tin", key_dtype)
+                     .Attr("Tout", value_dtype)
+                     .Finalize(root.graph(), &insert_node);
+        root.UpdateStatus(status);
+        if (!root.ok() || insert_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Node* lookup_node = nullptr;
+        status = tensorflow::NodeBuilder(
+                     root.GetUniqueNameForOp("LookupTableFindV2"),
+                     "LookupTableFindV2")
+                     .Input(tensorflow::NodeBuilder::NodeOut(table_handle.node()))
+                     .Input(tensorflow::NodeBuilder::NodeOut(keys_input.node()))
+                     .Input(tensorflow::NodeBuilder::NodeOut(default_value_input.node()))
+                     .Attr("Tin", key_dtype)
+                     .Attr("Tout", value_dtype)
+                     .ControlInput(insert_node)
+                     .Finalize(root.graph(), &lookup_node);
+        root.UpdateStatus(status);
+        if (!root.ok() || lookup_node == nullptr) {
+            return -1;
+        }
+
+        tensorflow::Output lookup_result(lookup_node, 0);
+
         tensorflow::ClientSession session(root);
-        
         std::vector<tensorflow::Tensor> outputs;
-        std::vector<std::pair<tensorflow::string, tensorflow::Tensor>> inputs = {
-            {"table_handle", table_handle_tensor}
-        };
-        
-        // We'll just run the lookup operation with a dummy table handle
-        // This will likely fail at runtime, but that's expected for a fuzzer
-        tensorflow::Status status = session.Run(inputs, {lookup_result}, &outputs);
+        status = session.Run({lookup_result}, &outputs);
+        if (!status.ok()) {
+            std::cout << "Session run error: " << status.ToString() << std::endl;
+            return -1;
+        }
         
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

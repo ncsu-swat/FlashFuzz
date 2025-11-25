@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -271,19 +272,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
         std::cout << std::endl;
         
-        // Use raw_ops.Enter instead of ops::Enter
-        auto enter_op = tensorflow::ops::_EnterOp(
-            root.WithOpName("Enter"),
-            data_input,
-            frame_name
-        );
-        enter_op.attr("is_constant", is_constant);
-        enter_op.attr("parallel_iterations", parallel_iterations);
+        tensorflow::Node* enter_node = nullptr;
+        auto build_status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("Enter"), "Enter")
+                                .Input(data_input.node())
+                                .Attr("T", dtype)
+                                .Attr("frame_name", frame_name)
+                                .Attr("is_constant", is_constant)
+                                .Attr("parallel_iterations", parallel_iterations)
+                                .Finalize(root.graph(), &enter_node);
+        if (!build_status.ok()) {
+            tf_fuzzer_utils::logError("Failed to build Enter node: " + build_status.ToString(), data, size);
+            return 0;
+        }
+
+        tensorflow::Output enter_output(enter_node);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({enter_op}, &outputs);
+        tensorflow::Status status = session.Run({enter_output}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

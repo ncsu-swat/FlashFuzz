@@ -7,6 +7,7 @@
 #include "tensorflow/core/framework/function.h"
 #include "tensorflow/core/framework/op_def_builder.h"
 #include "tensorflow/core/framework/node_def_builder.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/graph/graph.h"
 #include "tensorflow/core/common_runtime/function.h"
 #include "tensorflow/core/framework/types.h"
@@ -287,65 +288,62 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         for (size_t i = 0; i < state_types.size(); ++i) {
             output_shapes.push_back(tensorflow::PartialTensorShape({1}));
         }
+        std::vector<tensorflow::DataType> argument_types;
+        argument_types.reserve(other_arguments_outputs.size());
+        for (const auto& arg : other_arguments_outputs) {
+            argument_types.push_back(arg.type());
+        }
         
         bool preserve_cardinality = (data[offset % size] % 2) == 0;
         
         tensorflow::NameAttrList f_attr;
         f_attr.set_name("identity_func");
         
-        auto input_dataset_const = tensorflow::ops::Const(root, input_dataset);
-        
-        // Create a NodeDef for ExperimentalScanDataset
-        tensorflow::NodeDef node_def;
-        node_def.set_op("ExperimentalScanDataset");
-        node_def.set_name("scan_dataset");
-        
-        // Add inputs to the NodeDef
-        tensorflow::NodeDefBuilder builder("scan_dataset", "ExperimentalScanDataset");
-        builder.Input(tensorflow::NodeDefBuilder::NodeOut(input_dataset_const.node()->name(), 0, tensorflow::DT_VARIANT));
-        
-        // Add initial_state inputs
-        for (const auto& state : initial_state_outputs) {
-            builder.Input(tensorflow::NodeDefBuilder::NodeOut(state.node()->name(), 0, state.type()));
-        }
-        
-        // Add other_arguments inputs
-        for (const auto& arg : other_arguments_outputs) {
-            builder.Input(tensorflow::NodeDefBuilder::NodeOut(arg.node()->name(), 0, arg.type()));
-        }
-        
-        // Add attributes
-        builder.Attr("f", f_attr);
-        builder.Attr("Tstate", state_types);
-        builder.Attr("Targuments", tensorflow::DataTypeVector{});
-        builder.Attr("output_types", output_types);
-        builder.Attr("output_shapes", output_shapes);
-        builder.Attr("preserve_cardinality", preserve_cardinality);
-        
-        tensorflow::Status status = builder.Finalize(&node_def);
-        if (!status.ok()) {
-            tf_fuzzer_utils::logError("Failed to create NodeDef: " + status.ToString(), data, size);
+        // Build a simple RangeDataset to serve as input_dataset.
+        auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
+        auto stop = tensorflow::ops::Const(root, static_cast<int64_t>(10));
+        auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
+        std::vector<tensorflow::DataType> dataset_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> dataset_shapes = {tensorflow::PartialTensorShape({})};
+
+        tensorflow::Node* range_dataset_node = nullptr;
+        auto range_status = tensorflow::NodeBuilder("range_dataset", "RangeDataset")
+                                .Input(start.node())
+                                .Input(stop.node())
+                                .Input(step.node())
+                                .Attr("output_types", dataset_types)
+                                .Attr("output_shapes", dataset_shapes)
+                                .Finalize(root.graph(), &range_dataset_node);
+        if (!range_status.ok()) {
+            tf_fuzzer_utils::logError("Failed to build RangeDataset: " + range_status.ToString(), data, size);
             return -1;
         }
-        
-        // Add the node to the graph
-        tensorflow::Node* scan_dataset_node;
-        status = root.graph()->AddNode(node_def, &scan_dataset_node);
-        if (!status.ok()) {
-            tf_fuzzer_utils::logError("Failed to add node to graph: " + status.ToString(), data, size);
-            return -1;
-        }
-        
-        // Connect the inputs
-        root.graph()->AddEdge(input_dataset_const.node(), 0, scan_dataset_node, 0);
-        
-        int input_idx = 1;
+
+        std::vector<tensorflow::NodeBuilder::NodeOut> initial_state_nodes;
         for (const auto& state : initial_state_outputs) {
-            root.graph()->AddEdge(state.node(), 0, scan_dataset_node, input_idx++);
+            initial_state_nodes.emplace_back(state.node());
         }
-        
+
+        std::vector<tensorflow::NodeBuilder::NodeOut> other_argument_nodes;
         for (const auto& arg : other_arguments_outputs) {
-            root.graph()->AddEdge(arg.node(), 0, scan_dataset_node, input_idx++);
+            other_argument_nodes.emplace_back(arg.node());
+        }
+
+        tensorflow::Node* scan_dataset_node = nullptr;
+        auto scan_status = tensorflow::NodeBuilder("scan_dataset", "ExperimentalScanDataset")
+                               .Input(range_dataset_node)
+                               .Input(initial_state_nodes)
+                               .Input(other_argument_nodes)
+                               .Attr("f", f_attr)
+                               .Attr("Tstate", state_types)
+                               .Attr("Targuments", argument_types)
+                               .Attr("output_types", output_types)
+                               .Attr("output_shapes", output_shapes)
+                               .Attr("preserve_cardinality", preserve_cardinality)
+                               .Finalize(root.graph(), &scan_dataset_node);
+        if (!scan_status.ok()) {
+            tf_fuzzer_utils::logError("Failed to add node to graph: " + scan_status.ToString(), data, size);
+            return -1;
         }
         
         tensorflow::ClientSession session(root);

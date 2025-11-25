@@ -3,6 +3,7 @@
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/cc/ops/random_ops.h"
 #include <iostream>
 #include <cstring>
@@ -139,37 +140,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         for (size_t i = 0; i < shape_dims.size(); ++i) {
             shape_flat(i) = static_cast<int32_t>(shape_dims[i]);
         }
-        
-        tensorflow::TensorShape seed_tensor_shape({2});
-        tensorflow::Tensor seed_tensor(tensorflow::DT_INT32, seed_tensor_shape);
-        fillTensorWithDataByType(seed_tensor, tensorflow::DT_INT32, data, offset, size);
-        
         auto shape_input = tensorflow::ops::Const(root, shape_tensor);
+        tensorflow::TensorShape seed_tensor_shape({2});
+        tensorflow::Tensor seed_tensor(tensorflow::DT_INT64, seed_tensor_shape);
+        fillTensorWithDataByType(seed_tensor, tensorflow::DT_INT64, data, offset, size);
         auto seed_input = tensorflow::ops::Const(root, seed_tensor);
-        
-        std::cout << "Shape tensor: ";
-        for (int i = 0; i < shape_tensor.NumElements(); ++i) {
-            std::cout << shape_flat(i) << " ";
+
+        tensorflow::Node* node;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("StatelessTruncatedNormal"),
+                                        "StatelessTruncatedNormal")
+                                        .Input(shape_input.node())
+                                        .Input(seed_input.node())
+                                        .Attr("dtype", output_dtype)
+                                        .Attr("T", tensorflow::DT_INT32)
+                                        .Attr("Tseed", seed_tensor.dtype())
+                                        .Finalize(root.graph(), &node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError(status.ToString(), data, size);
+            return -1;
         }
-        std::cout << std::endl;
-        
-        std::cout << "Seed tensor: ";
-        auto seed_flat = seed_tensor.flat<int32_t>();
-        for (int i = 0; i < seed_tensor.NumElements(); ++i) {
-            std::cout << seed_flat(i) << " ";
-        }
-        std::cout << std::endl;
-        
-        std::cout << "Output dtype: " << output_dtype << std::endl;
-        
-        // Use the raw_ops API to call StatelessTruncatedNormal
-        auto result = tensorflow::ops::StatelessRandomNormal(
-            root, shape_input, seed_input,
-            tensorflow::ops::StatelessRandomNormal::Dtype(output_dtype));
-        
+
+        auto result = tensorflow::Output(node, 0);
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({result}, &outputs);
+        status = session.Run({result}, &outputs);
         
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;

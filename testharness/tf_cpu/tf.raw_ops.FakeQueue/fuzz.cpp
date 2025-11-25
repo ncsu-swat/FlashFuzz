@@ -250,7 +250,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         node_builder.Input(resource_input.node());
         
         tensorflow::Node* fake_queue_node;
-        tensorflow::Status status = root.graph()->AddNode(node_builder, &fake_queue_node);
+        tensorflow::Status status = node_builder.Finalize(root.graph(), &fake_queue_node);
         if (!status.ok()) {
             std::cout << "Error creating FakeQueue node: " << status.ToString() << std::endl;
             return -1;

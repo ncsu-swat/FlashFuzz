@@ -7,6 +7,7 @@
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <iostream>
 #include <vector>
@@ -130,6 +131,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     try {
         tensorflow::DataType input_dtype = parseInputDataType(data[offset++]);
         tensorflow::DataType complex_dtype = parseComplexDataType(data[offset++]);
+
+        if (input_dtype == tensorflow::DT_DOUBLE) {
+            complex_dtype = tensorflow::DT_COMPLEX128;
+        }
         
         uint8_t input_rank = parseRank(data[offset++]);
         std::vector<int64_t> input_shape = parseShape(data, offset, size, input_rank);
@@ -152,19 +157,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto input = tensorflow::ops::Placeholder(root, input_dtype);
         auto fft_length = tensorflow::ops::Placeholder(root, tensorflow::DT_INT32);
         
-        // Use raw_ops.RFFT via Operation constructor
-        tensorflow::Output rfft_op = tensorflow::Operation(
-            root.WithOpName("RFFT"),
-            "RFFT",
-            {input, fft_length},
-            {{"Tcomplex", complex_dtype}});
+        tensorflow::NodeBuilder node_builder("rfft", "RFFT");
+        node_builder.Input(input.node());
+        node_builder.Input(fft_length.node());
+        node_builder.Attr("T", input_dtype);
+        node_builder.Attr("Tcomplex", complex_dtype);
+
+        tensorflow::Node* rfft_node = nullptr;
+        tensorflow::Status status = node_builder.Finalize(root.graph(), &rfft_node);
+        if (!status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output rfft_op(rfft_node);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({{input, input_tensor}, 
-                                                {fft_length, fft_length_tensor}}, 
-                                               {rfft_op}, &outputs);
+        status = session.Run({{input, input_tensor}, 
+                              {fft_length, fft_length_tensor}}, 
+                             {rfft_op}, &outputs);
         
         if (!status.ok()) {
             return -1;

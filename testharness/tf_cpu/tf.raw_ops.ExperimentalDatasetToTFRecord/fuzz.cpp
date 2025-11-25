@@ -1,7 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
-#include "tensorflow/cc/ops/dataset_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -245,10 +245,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::Tensor element_tensor(element_dtype, element_tensor_shape);
         fillTensorWithDataByType(element_tensor, element_dtype, data, offset, size);
         
-        auto element_placeholder = tensorflow::ops::Placeholder(root, element_dtype, 
-            tensorflow::ops::Placeholder::Shape(element_tensor_shape));
+        auto element_placeholder = tensorflow::ops::Placeholder(
+            root, element_dtype, tensorflow::ops::Placeholder::Shape(element_tensor_shape));
         
-        auto tensor_slice_dataset = tensorflow::ops::TensorSliceDataset(root, {element_placeholder});
+        tensorflow::Node* tensor_dataset_node = nullptr;
+        auto tensor_dataset_builder =
+            tensorflow::NodeBuilder(root.GetUniqueNameForOp("TensorSliceDataset"), "TensorSliceDataset")
+                .Input(tensorflow::NodeBuilder::NodeOut(element_placeholder.node()))
+                .Attr("Toutput_types", {element_dtype})
+                .Attr("output_shapes", {tensorflow::PartialTensorShape(element_tensor_shape)});
+
+        root.UpdateBuilder(&tensor_dataset_builder);
+        root.UpdateStatus(tensor_dataset_builder.Finalize(root.graph(), &tensor_dataset_node));
+        if (!root.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output tensor_dataset(tensor_dataset_node, 0);
         
         std::string filename = "/tmp/test_output.tfrecord";
         auto filename_tensor = tensorflow::ops::Const(root, filename);
@@ -264,24 +277,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         }
         auto compression_tensor = tensorflow::ops::Const(root, compression_type);
         
-        // Create a raw op node for ExperimentalDatasetToTFRecord
-        tensorflow::NodeBuilder node_builder("dataset_to_tfrecord", "ExperimentalDatasetToTFRecord");
-        tensorflow::Node* dataset_to_tfrecord_node;
-        
-        node_builder.Input(tensor_slice_dataset.output)
-                   .Input(filename_tensor.output)
-                   .Input(compression_tensor.output);
-        
-        tensorflow::Status status = root.graph()->AddNode(node_builder, &dataset_to_tfrecord_node);
-        if (!status.ok()) {
+        tensorflow::Node* dataset_to_tfrecord_node = nullptr;
+        auto dataset_to_tfrecord_builder =
+            tensorflow::NodeBuilder(root.GetUniqueNameForOp("ExperimentalDatasetToTFRecord"),
+                                    "ExperimentalDatasetToTFRecord")
+                .Input(tensorflow::NodeBuilder::NodeOut(tensor_dataset.node()))
+                .Input(tensorflow::NodeBuilder::NodeOut(filename_tensor.node()))
+                .Input(tensorflow::NodeBuilder::NodeOut(compression_tensor.node()));
+
+        root.UpdateBuilder(&dataset_to_tfrecord_builder);
+        root.UpdateStatus(dataset_to_tfrecord_builder.Finalize(root.graph(), &dataset_to_tfrecord_node));
+        if (!root.ok()) {
             return -1;
         }
         
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        status = session.Run({{element_placeholder, element_tensor}}, 
-                            {tensorflow::Output(dataset_to_tfrecord_node, 0)}, &outputs);
+        tensorflow::Status status = session.Run(
+            {{element_placeholder, element_tensor}},
+            {},
+            {tensorflow::Operation(dataset_to_tfrecord_node)},
+            &outputs);
         
         if (!status.ok()) {
             return -1;

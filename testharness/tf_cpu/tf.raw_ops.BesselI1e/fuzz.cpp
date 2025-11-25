@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/math_ops.h"
@@ -141,13 +142,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         auto x = tensorflow::ops::Const(root, input_tensor);
         
-        // Use raw_ops namespace for BesselI1e
-        auto bessel_result = tensorflow::ops::BesselI1e(root.WithOpName("BesselI1e"), x);
+        tensorflow::Node* bessel_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("BesselI1e"), "BesselI1e")
+                                        .Input(x.node())
+                                        .Attr("T", dtype)
+                                        .Finalize(root.graph(), &bessel_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create BesselI1e node: " + status.ToString(), data, size);
+            return -1;
+        }
+
+        tensorflow::Output bessel_result(bessel_node, 0);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({bessel_result}, &outputs);
+        status = session.Run({bessel_result}, &outputs);
         if (!status.ok()) {
             return -1;
         }

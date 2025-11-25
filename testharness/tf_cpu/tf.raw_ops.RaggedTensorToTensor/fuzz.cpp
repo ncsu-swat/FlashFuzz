@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/array_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -162,104 +163,112 @@ void fillTensorWithDataByType(tensorflow::Tensor& tensor,
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    std::cout << "Start Fuzzing" << std::endl;
-    if (size < 20) return 0;
-    
+    if (size < 8) {
+        return 0;
+    }
+
     size_t offset = 0;
 
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
         tensorflow::DataType values_dtype = parseDataType(data[offset++]);
-        tensorflow::DataType partition_dtype = parsePartitionDataType(data[offset++]);
-        
-        uint8_t num_partitions = (data[offset++] % 3) + 1;
-        
-        uint8_t values_size = (data[offset++] % 10) + 1;
-        tensorflow::Tensor values_tensor(values_dtype, tensorflow::TensorShape({values_size}));
+        tensorflow::DataType index_dtype = parsePartitionDataType(data[offset++]);
+        tensorflow::DataType shape_dtype = index_dtype;
+
+        const int values_size = (data[offset++ % size] % 16) + 1;
+        tensorflow::Tensor values_tensor(values_dtype,
+                                         tensorflow::TensorShape({values_size}));
         fillTensorWithDataByType(values_tensor, values_dtype, data, offset, size);
-        
+
         tensorflow::Tensor default_value_tensor(values_dtype, tensorflow::TensorShape({}));
         fillTensorWithDataByType(default_value_tensor, values_dtype, data, offset, size);
-        
-        std::vector<tensorflow::Tensor> partition_tensors;
-        std::vector<std::string> partition_types;
-        
-        for (uint8_t i = 0; i < num_partitions; ++i) {
-            uint8_t partition_size = (data[offset % size] % 10) + 2;
-            offset++;
-            
-            tensorflow::Tensor partition_tensor(partition_dtype, tensorflow::TensorShape({partition_size}));
-            
-            if (partition_dtype == tensorflow::DT_INT32) {
-                auto flat = partition_tensor.flat<int32_t>();
-                for (int j = 0; j < partition_size; ++j) {
-                    if (offset < size) {
-                        int32_t val = static_cast<int32_t>(data[offset++] % (values_size + 1));
-                        flat(j) = (j == 0) ? 0 : std::max(flat(j-1), val);
-                    } else {
-                        flat(j) = (j == 0) ? 0 : flat(j-1);
-                    }
-                }
-            } else {
-                auto flat = partition_tensor.flat<int64_t>();
-                for (int j = 0; j < partition_size; ++j) {
-                    if (offset < size) {
-                        int64_t val = static_cast<int64_t>(data[offset++] % (values_size + 1));
-                        flat(j) = (j == 0) ? 0 : std::max(flat(j-1), val);
-                    } else {
-                        flat(j) = (j == 0) ? 0 : flat(j-1);
-                    }
-                }
+
+        const int num_rows = std::max<int>(1, (data[offset++ % size] % 6) + 1);
+        std::vector<int64_t> row_splits_vec;
+        row_splits_vec.reserve(num_rows + 1);
+        row_splits_vec.push_back(0);
+        int64_t remaining = values_size;
+        for (int i = 1; i < num_rows; ++i) {
+            int64_t step = 0;
+            if (offset < size) {
+                step = static_cast<int64_t>(data[offset++] % (remaining + 1));
             }
-            
-            partition_tensors.push_back(partition_tensor);
-            partition_types.push_back("ROW_SPLITS");
+            int64_t next_split = std::min<int64_t>(values_size, row_splits_vec.back() + step);
+            row_splits_vec.push_back(next_split);
+            remaining = values_size - next_split;
         }
-        
-        uint8_t shape_rank = parseRank(data[offset % size]);
-        offset++;
-        std::vector<int64_t> shape_dims = parseShape(data, offset, size, shape_rank);
-        tensorflow::Tensor shape_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({static_cast<int64_t>(shape_dims.size())}));
-        auto shape_flat = shape_tensor.flat<int64_t>();
-        for (size_t i = 0; i < shape_dims.size(); ++i) {
-            shape_flat(i) = shape_dims[i];
+        row_splits_vec.push_back(values_size);
+
+        int64_t max_row_len = 0;
+        for (int i = 1; i < static_cast<int>(row_splits_vec.size()); ++i) {
+            max_row_len = std::max<int64_t>(max_row_len, row_splits_vec[i] - row_splits_vec[i - 1]);
         }
-        
+        if (max_row_len <= 0) {
+            max_row_len = 1;
+        }
+
+        tensorflow::TensorShape shape_tensor_shape({2});
+        tensorflow::Tensor shape_tensor(shape_dtype, shape_tensor_shape);
+        if (shape_dtype == tensorflow::DT_INT32) {
+            auto flat_shape = shape_tensor.flat<int32_t>();
+            flat_shape(0) = static_cast<int32_t>(num_rows);
+            flat_shape(1) = static_cast<int32_t>(max_row_len);
+        } else {
+            auto flat_shape = shape_tensor.flat<int64_t>();
+            flat_shape(0) = static_cast<int64_t>(num_rows);
+            flat_shape(1) = static_cast<int64_t>(max_row_len);
+        }
+
+        tensorflow::TensorShape row_splits_shape({static_cast<int64_t>(row_splits_vec.size())});
+        tensorflow::Tensor row_splits_tensor(index_dtype, row_splits_shape);
+        if (index_dtype == tensorflow::DT_INT32) {
+            auto flat_splits = row_splits_tensor.flat<int32_t>();
+            for (size_t i = 0; i < row_splits_vec.size(); ++i) {
+                flat_splits(i) = static_cast<int32_t>(row_splits_vec[i]);
+            }
+        } else {
+            auto flat_splits = row_splits_tensor.flat<int64_t>();
+            for (size_t i = 0; i < row_splits_vec.size(); ++i) {
+                flat_splits(i) = row_splits_vec[i];
+            }
+        }
+
         auto shape_input = tensorflow::ops::Const(root, shape_tensor);
         auto values_input = tensorflow::ops::Const(root, values_tensor);
         auto default_value_input = tensorflow::ops::Const(root, default_value_tensor);
-        
-        std::vector<tensorflow::Output> partition_inputs;
-        for (const auto& tensor : partition_tensors) {
-            partition_inputs.push_back(tensorflow::ops::Const(root, tensor));
-        }
-        
-        // Use raw_ops namespace to access RaggedTensorToTensor
-        auto ragged_to_tensor_op = tensorflow::ops::RaggedTensorToSparse(
-            root,
-            partition_inputs,
-            values_input,
-            partition_types
-        );
-        
-        // Convert sparse back to dense as a workaround
-        auto sparse_to_dense = tensorflow::ops::SparseToDense(
-            root.WithOpName("SparseToDense"),
-            ragged_to_tensor_op.indices,
-            shape_input,
-            ragged_to_tensor_op.values,
-            default_value_input
-        );
-        
-        tensorflow::ClientSession session(root);
-        std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({sparse_to_dense}, &outputs);
-        
+        auto row_splits_input = tensorflow::ops::Const(root, row_splits_tensor);
+
+        std::vector<std::string> row_partition_types = {"ROW_SPLITS"};
+        std::vector<tensorflow::NodeBuilder::NodeOut> partition_inputs;
+        partition_inputs.emplace_back(row_splits_input.node());
+
+        tensorflow::Node* ragged_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("RaggedTensorToTensor"),
+                                               "RaggedTensorToTensor")
+                           .Input(tensorflow::NodeBuilder::NodeOut(shape_input.node()))
+                           .Input(tensorflow::NodeBuilder::NodeOut(values_input.node()))
+                           .Input(tensorflow::NodeBuilder::NodeOut(default_value_input.node()))
+                           .Input(partition_inputs)
+                           .Attr("T", values_dtype)
+                           .Attr("Tindex", index_dtype)
+                           .Attr("Tshape", shape_dtype)
+                           .Attr("num_row_partition_tensors",
+                                 static_cast<int>(partition_inputs.size()))
+                           .Attr("row_partition_types", row_partition_types);
+
+        tensorflow::Status status = builder.Finalize(root.graph(), &ragged_node);
         if (!status.ok()) {
-            return -1;
+            tf_fuzzer_utils::logError("Failed to build RaggedTensorToTensor: " + status.ToString(), data, size);
+            return 0;
         }
 
+        tensorflow::ClientSession session(root);
+        std::vector<tensorflow::Tensor> outputs;
+        status = session.Run({tensorflow::Output(ragged_node, 0)}, &outputs);
+        if (!status.ok()) {
+            return 0;
+        }
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);
         return -1;

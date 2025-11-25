@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -254,24 +255,35 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         if (offset >= size) return 0;
         int parallel_iterations = (data[offset++] % 20) + 1;
-        
-        auto placeholder = tensorflow::ops::Placeholder(root, dtype, 
-            tensorflow::ops::Placeholder::Shape(tensor_shape));
-        
-        // Use raw_ops.RefEnter instead of ops::RefEnter
-        auto ref_enter_op = tensorflow::ops::_RefEnter(
-            root.WithOpName("RefEnter"),
-            placeholder,
-            frame_name,
-            tensorflow::ops::_RefEnter::Attrs()
-                .IsConstant(is_constant)
-                .ParallelIterations(parallel_iterations));
-        
+
+        auto variable = tensorflow::ops::Variable(root.WithOpName("ref_var"), tensor_shape, dtype);
+        auto init_value = tensorflow::ops::Const(root.WithOpName("init_value"), input_tensor);
+        auto assign_var = tensorflow::ops::Assign(root.WithOpName("init_assign"), variable, init_value);
+
+        tensorflow::Node* ref_enter_node = nullptr;
+        auto build_status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("RefEnter"), "RefEnter")
+                                .Input(variable.node())
+                                .Attr("T", dtype)
+                                .Attr("frame_name", frame_name)
+                                .Attr("is_constant", is_constant)
+                                .Attr("parallel_iterations", parallel_iterations)
+                                .Finalize(root.graph(), &ref_enter_node);
+        if (!build_status.ok()) {
+            tf_fuzzer_utils::logError("Failed to build RefEnter node: " + build_status.ToString(), data, size);
+            return 0;
+        }
+
+        tensorflow::Output ref_enter_output(ref_enter_node);
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        
-        tensorflow::Status status = session.Run({{placeholder, input_tensor}}, 
-                                               {ref_enter_op}, &outputs);
+
+        tensorflow::Status status = session.Run({assign_var}, nullptr);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Variable init failed: " + status.ToString(), data, size);
+            return -1;
+        }
+
+        status = session.Run({ref_enter_output}, &outputs);
         if (!status.ok()) {
             return -1;
         }

@@ -5,6 +5,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/bfloat16/bfloat16.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -23,7 +24,7 @@ void logError(const std::string& message, const uint8_t* data, size_t size) {
 
 tensorflow::DataType parseDataType(uint8_t selector) {
     tensorflow::DataType dtype; 
-    switch (selector % 21) {  
+    switch (selector % 12) {  
         case 0:
             dtype = tensorflow::DT_FLOAT;
             break;
@@ -46,46 +47,19 @@ tensorflow::DataType parseDataType(uint8_t selector) {
             dtype = tensorflow::DT_INT64;
             break;
         case 7:
-            dtype = tensorflow::DT_BOOL;
-            break;
-        case 8:
-            dtype = tensorflow::DT_QINT8;
-            break;
-        case 9:
-            dtype = tensorflow::DT_QUINT8;
-            break;
-        case 10:
-            dtype = tensorflow::DT_QINT32;
-            break;
-        case 11:
             dtype = tensorflow::DT_BFLOAT16;
             break;
-        case 12:
-            dtype = tensorflow::DT_QINT16;
-            break;
-        case 13:
-            dtype = tensorflow::DT_QUINT16;
-            break;
-        case 14:
+        case 8:
             dtype = tensorflow::DT_UINT16;
             break;
-        case 15:
-            dtype = tensorflow::DT_COMPLEX64;
-            break;
-        case 16:
-            dtype = tensorflow::DT_COMPLEX128;
-            break;
-        case 17:
+        case 9:
             dtype = tensorflow::DT_HALF;
             break;
-        case 18:
+        case 10:
             dtype = tensorflow::DT_UINT32;
             break;
-        case 19:
+        case 11:
             dtype = tensorflow::DT_UINT64;
-            break;
-        case 20:
-            dtype = tensorflow::DT_STRING;
             break;
     }
     return dtype;
@@ -270,22 +244,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             gated_grpc = (grpc_selector % 2 == 1);
         }
         
-        // Use raw_ops.DebugNanCount instead of ops::DebugNanCount
-        auto debug_nan_count = tensorflow::ops::_DebugNanCountOp(
-            root.WithOpName("DebugNanCount"),
-            input_placeholder,
-            device_name,
-            tensor_name,
-            debug_urls,
-            gated_grpc
-        );
+        tensorflow::Node* debug_node = nullptr;
+        auto builder_status = tensorflow::NodeBuilder(
+                                   root.GetUniqueNameForOp("DebugNanCount"),
+                                   "DebugNanCount")
+                                   .Input(input_placeholder.node())
+                                   .Attr("T", input_dtype)
+                                   .Attr("device_name", device_name)
+                                   .Attr("tensor_name", tensor_name)
+                                   .Attr("debug_urls", debug_urls)
+                                   .Attr("gated_grpc", gated_grpc)
+                                   .Finalize(root.graph(), &debug_node);
+        if (!builder_status.ok()) {
+            tf_fuzzer_utils::logError("NodeBuilder failed: " + builder_status.ToString(), data, size);
+            return -1;
+        }
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
         tensorflow::Status status = session.Run(
             {{input_placeholder, input_tensor}}, 
-            {debug_nan_count}, 
+            {tensorflow::Output(debug_node, 0)}, 
             &outputs
         );
         

@@ -7,6 +7,7 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -229,42 +230,51 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     try {
         tensorflow::DataType value_dtype = parseDataType(data[offset++]);
-        uint8_t value_rank = parseRank(data[offset++]);
-        std::vector<int64_t> value_shape = parseShape(data, offset, size, value_rank);
-        
-        if (value_shape.empty() && value_rank > 0) {
-            value_shape.push_back(1);
+        // Keep the TensorArray size small and positive to avoid shape errors.
+        int32_t array_size = 4;
+        if (offset + sizeof(int32_t) <= size) {
+            std::memcpy(&array_size, data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+            array_size = std::abs(array_size) % 6 + 1;
         }
-        
-        tensorflow::TensorShape value_tensor_shape;
-        for (int64_t dim : value_shape) {
-            value_tensor_shape.AddDim(dim);
-        }
-        
+
+        // Build a tensor shaped [array_size, ...] so it can be unpacked.
+        uint8_t trailing_rank = parseRank(data[offset++]);
+        trailing_rank = std::max<uint8_t>(1, trailing_rank);
+        std::vector<int64_t> value_shape = parseShape(data, offset, size, trailing_rank - 1);
+        value_shape.insert(value_shape.begin(), array_size);
+
+        tensorflow::TensorShape value_tensor_shape(value_shape);
         tensorflow::Tensor value_tensor(value_dtype, value_tensor_shape);
         fillTensorWithDataByType(value_tensor, value_dtype, data, offset, size);
-        
-        // Create a TensorArray
-        auto handle = tensorflow::ops::TensorArrayV3(
-            root, 
-            tensorflow::ops::Const(root, static_cast<int32_t>(value_tensor_shape.dim_size(0))), 
-            value_dtype);
-        
-        // Unpack the tensor into the TensorArray
-        auto unpack_op = tensorflow::ops::TensorArrayUnpackV3(
-            root, 
-            handle.handle, 
-            tensorflow::ops::Placeholder(root, value_dtype), 
-            handle.flow);
-        
+
+        // Create the TensorArray handle (legacy ref variant) and reuse its flow.
+        tensorflow::Tensor size_tensor(tensorflow::DT_INT32, {});
+        size_tensor.scalar<int32_t>()() = array_size;
+        auto size_const = tensorflow::ops::Const(root, size_tensor);
+        auto tensor_array = tensorflow::ops::TensorArray(root, size_const, value_dtype);
+
+        auto value_op = tensorflow::ops::Const(root, value_tensor);
+
+        tensorflow::Node* unpack_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(root.GetUniqueNameForOp("TensorArrayUnpack"),
+                                                            "TensorArrayUnpack")
+                                        .Input(tensor_array.handle.node())
+                                        .Input(value_op.node())
+                                        .Input(tensor_array.flow.node())
+                                        .Attr("T", value_dtype)
+                                        .Device("/cpu:0")
+                                        .Finalize(root.graph(), &unpack_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create TensorArrayUnpack node: " + status.ToString(), data, size);
+            return -1;
+        }
+
+        tensorflow::Output unpack_output(unpack_node, 0);
         tensorflow::ClientSession session(root);
-        
+
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run(
-            {{unpack_op.operation.node()->input(1), value_tensor}},
-            {unpack_op.flow_out}, 
-            &outputs);
-            
+        status = session.Run({unpack_output}, &outputs);
         if (!status.ok()) {
             return -1;
         }

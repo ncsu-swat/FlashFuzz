@@ -236,31 +236,48 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto epsilon_const = tensorflow::ops::Const(root, epsilon_tensor);
         auto grad_const = tensorflow::ops::Const(root, grad_tensor);
 
-        bool use_locking = (data[0] % 2) == 1;
-        bool update_slots = (data[1] % 2) == 1;
+        if (offset >= size) return 0;
+        bool use_locking = (data[offset++] % 2) == 1;
+        if (offset >= size) return 0;
+        bool update_slots = (data[offset++] % 2) == 1;
 
-        // Create a ResourceApplyAdagradV2 op using raw_ops
-        tensorflow::NodeDef node_def;
-        node_def.set_op("ResourceApplyAdagradV2");
-        node_def.set_name("ResourceApplyAdagradV2");
-        node_def.add_input(var_resource.node()->name());
-        node_def.add_input(accum_resource.node()->name());
-        node_def.add_input(lr_const.node()->name());
-        node_def.add_input(epsilon_const.node()->name());
-        node_def.add_input(grad_const.node()->name());
-        
-        auto attr = node_def.mutable_attr();
-        (*attr)["use_locking"].set_b(use_locking);
-        (*attr)["update_slots"].set_b(update_slots);
-        (*attr)["T"].set_type(lr_dtype);
-        
-        auto apply_adagrad = root.AddNode(node_def);
+        auto var_node = tensorflow::ops::AsNodeOut(root, var_resource);
+        auto accum_node = tensorflow::ops::AsNodeOut(root, accum_resource);
+        auto lr_node = tensorflow::ops::AsNodeOut(root, lr_const);
+        auto epsilon_node = tensorflow::ops::AsNodeOut(root, epsilon_const);
+        auto grad_node = tensorflow::ops::AsNodeOut(root, grad_const);
+
+        tensorflow::Node* apply_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(
+                           root.GetUniqueNameForOp("ResourceApplyAdagradV2"),
+                           "ResourceApplyAdagradV2")
+                           .Input(var_node)
+                           .Input(accum_node)
+                           .Input(lr_node)
+                           .Input(epsilon_node)
+                           .Input(grad_node)
+                           .Attr("T", lr_dtype)
+                           .Attr("use_locking", use_locking)
+                           .Attr("update_slots", update_slots)
+                           .Device("/cpu:0");
+        root.UpdateStatus(builder.Finalize(root.graph(), &apply_node));
+        if (!root.ok() || apply_node == nullptr) {
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
-        
-        std::vector<tensorflow::Tensor> outputs;
-        TF_CHECK_OK(session.Run({assign_var.node()->name(), assign_accum.node()->name()}, &outputs));
-        TF_CHECK_OK(session.Run({apply_adagrad.node()->name()}, &outputs));
+
+        std::vector<tensorflow::Operation> init_ops = {
+            assign_var.operation, assign_accum.operation};
+        if (!session.Run({}, {}, init_ops, nullptr).ok()) {
+            return -1;
+        }
+
+        tensorflow::Operation apply_op(apply_node);
+        std::vector<tensorflow::Operation> run_ops = {apply_op};
+        if (!session.Run({}, {}, run_ops, nullptr).ok()) {
+            return -1;
+        }
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

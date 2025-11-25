@@ -1,12 +1,14 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/dataset_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
 #include <cstring>
+#include <algorithm>
 #include <vector>
 #include <iostream>
 #include <cmath>
@@ -230,17 +232,42 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::DataType input_dtype = parseDataType(data[offset++]);
         uint8_t input_rank = parseRank(data[offset++]);
         std::vector<int64_t> input_shape = parseShape(data, offset, size, input_rank);
-        
+        // Ensure we have at least one dimension so TensorSliceDataset can slice.
+        if (input_shape.empty()) {
+            input_shape.push_back(1);
+        }
+
         tensorflow::TensorShape input_tensor_shape;
         for (int64_t dim : input_shape) {
             input_tensor_shape.AddDim(dim);
         }
-        
+
         tensorflow::Tensor input_tensor(input_dtype, input_tensor_shape);
         fillTensorWithDataByType(input_tensor, input_dtype, data, offset, size);
-        
-        auto input_dataset = tensorflow::ops::Placeholder(root, tensorflow::DT_VARIANT);
-        
+
+        int64_t dataset_stop = std::max<int64_t>(1, static_cast<int64_t>(input_tensor.NumElements()));
+        auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
+        auto stop = tensorflow::ops::Const(root, dataset_stop);
+        auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
+
+        // Build a simple range dataset as the input variant handle.
+        std::vector<tensorflow::DataType> range_output_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> range_output_shapes = {tensorflow::PartialTensorShape({})};
+        tensorflow::Node* range_dataset_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                         root.GetUniqueNameForOp("range_dataset"),
+                                         "RangeDataset")
+                                         .Input(start.node(), start.index())
+                                         .Input(stop.node(), stop.index())
+                                         .Input(step.node(), step.index())
+                                         .Attr("output_types", range_output_types)
+                                         .Attr("output_shapes", range_output_shapes)
+                                         .Finalize(root.graph(), &range_dataset_node);
+        if (!status.ok()) {
+            return 0;
+        }
+        tensorflow::Output range_dataset(range_dataset_node);
+
         int64_t window_size_val = 1;
         if (offset + sizeof(int64_t) <= size) {
             std::memcpy(&window_size_val, data + offset, sizeof(int64_t));
@@ -265,36 +292,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto window_size = tensorflow::ops::Const(root, window_size_val);
         auto window_shift = tensorflow::ops::Const(root, window_shift_val);
         auto window_stride = tensorflow::ops::Const(root, window_stride_val);
-        
-        std::vector<tensorflow::DataType> output_types = {input_dtype};
-        std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape(input_shape)};
+
+        std::vector<tensorflow::DataType> output_types = range_output_types;
+
+        std::vector<tensorflow::PartialTensorShape> output_shapes;
+        tensorflow::PartialTensorShape window_shape({-1});
+        window_shape.Concatenate(range_output_shapes[0]);
+        output_shapes.push_back(window_shape);
         
         bool drop_remainder = (offset < size) ? (data[offset++] % 2 == 0) : true;
-        
-        // Use raw_ops namespace for SlidingWindowDataset
-        auto sliding_window_dataset = tensorflow::ops::internal::SlidingWindowDataset(
-            root, 
-            input_dataset, 
-            window_size, 
-            window_shift, 
-            window_stride,
-            output_types,
-            output_shapes,
-            drop_remainder
-        );
+
+        tensorflow::Node* sliding_window_node = nullptr;
+        status = tensorflow::NodeBuilder(
+                     root.GetUniqueNameForOp("sliding_window_dataset"),
+                     "SlidingWindowDataset")
+                     .Input(range_dataset.node(), range_dataset.index())
+                     .Input(window_size.node(), window_size.index())
+                     .Input(window_shift.node(), window_shift.index())
+                     .Input(window_stride.node(), window_stride.index())
+                     .Attr("drop_remainder", drop_remainder)
+                     .Attr("output_types", output_types)
+                     .Attr("output_shapes", output_shapes)
+                     .Finalize(root.graph(), &sliding_window_node);
+
+        if (!status.ok()) {
+            return 0;
+        }
+
+        tensorflow::Output sliding_window_dataset(sliding_window_node);
 
         tensorflow::ClientSession session(root);
-        
-        std::cout << "Input tensor shape: ";
-        for (int i = 0; i < input_tensor_shape.dims(); ++i) {
-            std::cout << input_tensor_shape.dim_size(i) << " ";
+        std::vector<tensorflow::Tensor> outputs;
+        status = session.Run({sliding_window_dataset}, &outputs);
+        if (!status.ok()) {
+            return 0;
         }
-        std::cout << std::endl;
-        
-        std::cout << "Window size: " << window_size_val << std::endl;
-        std::cout << "Window shift: " << window_shift_val << std::endl;
-        std::cout << "Window stride: " << window_stride_val << std::endl;
-        std::cout << "Drop remainder: " << drop_remainder << std::endl;
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

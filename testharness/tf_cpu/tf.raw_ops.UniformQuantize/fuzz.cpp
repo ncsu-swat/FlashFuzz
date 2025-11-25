@@ -8,8 +8,10 @@
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
+#include <limits>
 #include <vector>
 #include <cmath>
 
@@ -135,69 +137,61 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::Tensor input_tensor(input_dtype, input_tensor_shape);
         fillTensorWithDataByType(input_tensor, input_dtype, data, offset, size);
         
-        uint8_t scales_rank = parseRank(data[offset++]);
-        std::vector<int64_t> scales_shape = parseShape(data, offset, size, scales_rank);
-        
-        tensorflow::TensorShape scales_tensor_shape;
-        for (int64_t dim : scales_shape) {
-            scales_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::Tensor scales_tensor(tensorflow::DT_FLOAT, scales_tensor_shape);
-        fillTensorWithData<float>(scales_tensor, data, offset, size);
-        
-        uint8_t zero_points_rank = parseRank(data[offset++]);
-        std::vector<int64_t> zero_points_shape = parseShape(data, offset, size, zero_points_rank);
-        
-        tensorflow::TensorShape zero_points_tensor_shape;
-        for (int64_t dim : zero_points_shape) {
-            zero_points_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::Tensor zero_points_tensor(tensorflow::DT_INT32, zero_points_tensor_shape);
-        fillTensorWithData<int32_t>(zero_points_tensor, data, offset, size);
-        
-        int quantization_min_val = -128;
-        int quantization_max_val = 127;
-        if (output_dtype == tensorflow::DT_QINT32) {
-            quantization_min_val = -2147483648;
-            quantization_max_val = 2147483647;
-        }
-        
         int quantization_axis = -1;
         if (offset < size) {
             quantization_axis = static_cast<int8_t>(data[offset++]);
             if (quantization_axis >= 0 && quantization_axis >= input_rank) {
                 quantization_axis = -1;
+            } else if (quantization_axis < -1) {
+                quantization_axis = -1;
             }
+        }
+
+        tensorflow::TensorShape scales_tensor_shape;
+        tensorflow::TensorShape zero_points_tensor_shape;
+        if (quantization_axis == -1 || input_shape.empty()) {
+            scales_tensor_shape = tensorflow::TensorShape({});
+            zero_points_tensor_shape = tensorflow::TensorShape({});
+        } else {
+            int64_t axis_size = input_shape[quantization_axis];
+            scales_tensor_shape = tensorflow::TensorShape({axis_size});
+            zero_points_tensor_shape = tensorflow::TensorShape({axis_size});
+        }
+
+        tensorflow::Tensor scales_tensor(tensorflow::DT_FLOAT, scales_tensor_shape);
+        tensorflow::Tensor zero_points_tensor(tensorflow::DT_INT32, zero_points_tensor_shape);
+
+        fillTensorWithData<float>(scales_tensor, data, offset, size);
+        fillTensorWithData<int32_t>(zero_points_tensor, data, offset, size);
+
+        int quantization_min_val = -128;
+        int quantization_max_val = 127;
+        if (output_dtype == tensorflow::DT_QINT32) {
+            quantization_min_val = std::numeric_limits<int>::min();
+            quantization_max_val = std::numeric_limits<int>::max();
         }
         
         auto input_op = tensorflow::ops::Const(root, input_tensor);
         auto scales_op = tensorflow::ops::Const(root, scales_tensor);
         auto zero_points_op = tensorflow::ops::Const(root, zero_points_tensor);
-        
-        // Use raw_ops instead of ops namespace for UniformQuantize
-        tensorflow::NodeDef node_def;
-        node_def.set_op("UniformQuantize");
-        node_def.set_name("uniform_quantize");
-        node_def.add_input(input_op.node()->name());
-        node_def.add_input(scales_op.node()->name());
-        node_def.add_input(zero_points_op.node()->name());
-        
-        auto attr = node_def.mutable_attr();
-        (*attr)["Tin"].set_type(input_dtype);
-        (*attr)["Tout"].set_type(output_dtype);
-        (*attr)["quantization_min_val"].set_i(quantization_min_val);
-        (*attr)["quantization_max_val"].set_i(quantization_max_val);
-        (*attr)["quantization_axis"].set_i(quantization_axis);
-        
-        tensorflow::Status status;
-        auto uniform_quantize = root.AddNode(node_def, &status);
+
+        tensorflow::Node* uniform_quantize_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("uniform_quantize", "UniformQuantize")
+                                        .Input(input_op.node())
+                                        .Input(scales_op.node())
+                                        .Input(zero_points_op.node())
+                                        .Attr("Tin", input_dtype)
+                                        .Attr("Tout", output_dtype)
+                                        .Attr("quantization_min_val", quantization_min_val)
+                                        .Attr("quantization_max_val", quantization_max_val)
+                                        .Attr("quantization_axis", quantization_axis)
+                                        .Finalize(root.graph(), &uniform_quantize_node);
         if (!status.ok()) {
             tf_fuzzer_utils::logError("Failed to create UniformQuantize op: " + status.ToString(), data, size);
             return -1;
         }
         
+        tensorflow::Output uniform_quantize(uniform_quantize_node, 0);
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         status = session.Run({uniform_quantize}, &outputs);

@@ -5,6 +5,8 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/framework/partial_tensor_shape.h"
 #include <iostream>
 #include <vector>
 #include <cstring>
@@ -185,13 +187,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             std::cout << "]" << std::endl;
         }
 
-        // Use raw_ops API instead of ops namespace
-        auto outfeed_op = tensorflow::ops::OutfeedDequeueTuple(
-            root,
-            dtypes,
-            shapes,
-            tensorflow::ops::OutfeedDequeueTuple::DeviceOrdinal(device_ordinal)
-        );
+        std::vector<tensorflow::PartialTensorShape> partial_shapes;
+        partial_shapes.reserve(shapes.size());
+        for (const auto& shape : shapes) {
+            partial_shapes.emplace_back(shape);
+        }
+
+        tensorflow::Node* outfeed_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("outfeed_dequeue_tuple", "OutfeedDequeueTuple")
+                                        .Attr("dtypes", dtypes)
+                                        .Attr("shapes", partial_shapes)
+                                        .Attr("device_ordinal", device_ordinal)
+                                        .Finalize(root.graph(), &outfeed_node);
+        if (!status.ok()) {
+            std::cerr << "Failed to build OutfeedDequeueTuple node: " << status.ToString() << std::endl;
+            return 0;
+        }
 
         tensorflow::ClientSession session(root);
 

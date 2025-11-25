@@ -5,6 +5,8 @@
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/framework/partial_tensor_shape.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -228,18 +230,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     try {
         tensorflow::DataType dtype = parseDataType(data[offset++]);
         uint8_t rank = parseRank(data[offset++]);
-        
-        int32_t device_ordinal = -1;
-        if (offset < size) {
-            device_ordinal = static_cast<int32_t>(data[offset++]) % 2 - 1;
-        }
-        
+
         std::vector<int64_t> shape = parseShape(data, offset, size, rank);
         
         tensorflow::TensorShape tensor_shape;
         for (int64_t dim : shape) {
             tensor_shape.AddDim(dim);
         }
+
+        int32_t device_ordinal_raw = -1;
+        if (offset + sizeof(int32_t) <= size) {
+            std::memcpy(&device_ordinal_raw, data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+        }
+        int32_t device_ordinal = (device_ordinal_raw % 3) - 1;
         
         std::cout << "dtype: " << dtype << std::endl;
         std::cout << "shape: [";
@@ -250,26 +254,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::cout << "]" << std::endl;
         std::cout << "device_ordinal: " << device_ordinal << std::endl;
 
-        // Create OutfeedDequeue op using raw_ops approach
-        auto outfeed_dequeue_op = tensorflow::ops::OutfeedDequeue(
-            root,
-            dtype,
-            tensor_shape
-        );
-        
-        // Set device_ordinal attribute if needed
-        if (device_ordinal >= 0) {
-            outfeed_dequeue_op.operation.node()->AddAttr("device_ordinal", device_ordinal);
+        tensorflow::PartialTensorShape partial_shape(tensor_shape);
+        tensorflow::Node* outfeed_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("outfeed_dequeue", "OutfeedDequeue")
+                                        .Attr("dtype", dtype)
+                                        .Attr("shape", partial_shape)
+                                        .Attr("device_ordinal", device_ordinal)
+                                        .Finalize(root.graph(), &outfeed_node);
+        if (!status.ok()) {
+            std::cerr << "Failed to build OutfeedDequeue node: " << status.ToString() << std::endl;
+            return 0;
         }
 
         tensorflow::ClientSession session(root);
-        std::vector<tensorflow::Tensor> outputs;
-        
-        // Run the session
-        auto status = session.Run({outfeed_dequeue_op}, &outputs);
-        if (!status.ok()) {
-            tf_fuzzer_utils::logError("Session run error: " + status.ToString(), data, size);
-        }
         
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

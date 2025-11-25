@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/resource_mgr.h"
@@ -234,10 +235,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        auto tree_ensemble_handle = tensorflow::ops::VarHandleOp(
-            root.WithOpName("tree_ensemble_handle"),
-            tensorflow::DT_RESOURCE,
-            tensorflow::TensorShape({}));
+        tensorflow::Node* handle_node = nullptr;
+        auto handle_builder = tensorflow::NodeBuilder(
+                                  root.GetUniqueNameForOp("BoostedTreesEnsembleResourceHandleOp"),
+                                  "BoostedTreesEnsembleResourceHandleOp")
+                                  .Attr("container", "")
+                                  .Attr("shared_name", "bt_handle");
+        root.UpdateStatus(handle_builder.Finalize(root.graph(), &handle_node));
+        if (!root.ok() || handle_node == nullptr) {
+            return 0;
+        }
 
         if (offset >= size) return 0;
         int64_t stamp_token_value;
@@ -263,17 +270,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto tree_ensemble_serialized = tensorflow::ops::Const(
             root.WithOpName("tree_ensemble_serialized"), serialized_str);
 
-        // Use raw_ops namespace to access BoostedTreesDeserializeEnsemble
-        auto deserialize_op = tensorflow::ops::BoostedTreesDeserializeEnsemble(
-            root,
-            tree_ensemble_handle,
-            stamp_token,
-            tree_ensemble_serialized);
+        tensorflow::Node* deserialize_node = nullptr;
+        auto handle_out = tensorflow::NodeBuilder::NodeOut(handle_node, 0);
+        auto stamp_out = tensorflow::NodeBuilder::NodeOut(stamp_token.node(), stamp_token.index());
+        auto serialized_out = tensorflow::NodeBuilder::NodeOut(tree_ensemble_serialized.node(),
+                                                               tree_ensemble_serialized.index());
+        auto deserialize_builder = tensorflow::NodeBuilder(
+                                       root.GetUniqueNameForOp("BoostedTreesDeserializeEnsemble"),
+                                       "BoostedTreesDeserializeEnsemble")
+                                       .Input(handle_out)
+                                       .Input(stamp_out)
+                                       .Input(serialized_out);
+        root.UpdateStatus(deserialize_builder.Finalize(root.graph(), &deserialize_node));
+        if (!root.ok() || deserialize_node == nullptr) {
+            return 0;
+        }
 
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({deserialize_op.operation}, &outputs);
+        tensorflow::Status status =
+            session.Run({}, {}, {tensorflow::Operation(deserialize_node)}, &outputs);
         
         if (!status.ok()) {
             return -1;

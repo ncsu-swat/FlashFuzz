@@ -6,6 +6,9 @@
 #include "tensorflow/cc/ops/array_ops.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/framework/op.h"
+#include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -113,78 +116,84 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     try {
         tensorflow::DataType input_dtype = parseDataType(data[offset++]);
-        
+
         uint8_t input_rank = parseRank(data[offset++]);
         std::vector<int64_t> input_shape = parseShape(data, offset, size, input_rank);
-        
+
         tensorflow::TensorShape input_tensor_shape;
         for (int64_t dim : input_shape) {
             input_tensor_shape.AddDim(dim);
         }
-        
+
         tensorflow::Tensor input_tensor(input_dtype, input_tensor_shape);
         fillTensorWithDataByType(input_tensor, input_dtype, data, offset, size);
-        
-        auto input_op = tensorflow::ops::Const(root, input_tensor);
-        
-        uint8_t fft_length_rank = parseRank(data[offset % size]);
-        offset++;
-        std::vector<int64_t> fft_length_shape = {static_cast<int64_t>(fft_length_rank)};
-        
-        tensorflow::TensorShape fft_length_tensor_shape;
-        for (int64_t dim : fft_length_shape) {
-            fft_length_tensor_shape.AddDim(dim);
+
+        uint8_t fft_length_size = (offset < size) ? static_cast<uint8_t>(data[offset++] % input_rank + 1) : input_rank;
+        if (fft_length_size > input_rank) {
+            fft_length_size = input_rank;
         }
-        
-        tensorflow::Tensor fft_length_tensor(tensorflow::DT_INT32, fft_length_tensor_shape);
-        auto fft_length_flat = fft_length_tensor.flat<int32_t>();
-        for (int i = 0; i < fft_length_rank; ++i) {
-            if (i < input_shape.size()) {
-                fft_length_flat(i) = static_cast<int32_t>(input_shape[i]);
+
+        std::vector<int32_t> fft_length_data;
+        for (uint8_t i = 0; i < fft_length_size; ++i) {
+            if (offset + sizeof(int32_t) <= size) {
+                int32_t value;
+                std::memcpy(&value, data + offset, sizeof(int32_t));
+                offset += sizeof(int32_t);
+                value = std::abs(value) % 20 + 1;
+                fft_length_data.push_back(value);
             } else {
-                fft_length_flat(i) = 1;
+                fft_length_data.push_back(static_cast<int32_t>(input_shape[i % input_rank]));
             }
         }
-        
-        auto fft_length_op = tensorflow::ops::Const(root, fft_length_tensor);
-        
-        tensorflow::Tensor axes_tensor(tensorflow::DT_INT32, fft_length_tensor_shape);
+
+        tensorflow::TensorShape fft_length_shape;
+        fft_length_shape.AddDim(fft_length_size);
+        tensorflow::Tensor fft_length_tensor(tensorflow::DT_INT32, fft_length_shape);
+        auto fft_length_flat = fft_length_tensor.flat<int32_t>();
+        for (size_t i = 0; i < fft_length_data.size(); ++i) {
+            fft_length_flat(i) = fft_length_data[i];
+        }
+
+        std::vector<int32_t> axes_data;
+        for (uint8_t i = 0; i < fft_length_size; ++i) {
+            if (offset < size) {
+                int32_t axis = static_cast<int32_t>(data[offset++] % input_rank);
+                axes_data.push_back(axis);
+            } else {
+                axes_data.push_back(i % input_rank);
+            }
+        }
+
+        tensorflow::TensorShape axes_shape;
+        axes_shape.AddDim(fft_length_size);
+        tensorflow::Tensor axes_tensor(tensorflow::DT_INT32, axes_shape);
         auto axes_flat = axes_tensor.flat<int32_t>();
-        for (int i = 0; i < fft_length_rank; ++i) {
-            axes_flat(i) = i;
+        for (size_t i = 0; i < axes_data.size(); ++i) {
+            axes_flat(i) = axes_data[i];
         }
-        
+
+        auto input_op = tensorflow::ops::Const(root, input_tensor);
+        auto fft_length_op = tensorflow::ops::Const(root, fft_length_tensor);
         auto axes_op = tensorflow::ops::Const(root, axes_tensor);
-        
-        std::cout << "Input tensor shape: ";
-        for (int64_t dim : input_shape) {
-            std::cout << dim << " ";
+
+        tensorflow::Node* ifftnd_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("ifftnd", "IFFTND")
+                                        .Input(input_op.node())
+                                        .Input(fft_length_op.node())
+                                        .Input(axes_op.node())
+                                        .Attr("Tcomplex", input_dtype)
+                                        .Finalize(root.graph(), &ifftnd_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create IFFTND op: " + status.ToString(), data, size);
+            return -1;
         }
-        std::cout << std::endl;
-        
-        std::cout << "FFT length: ";
-        for (int i = 0; i < fft_length_rank; ++i) {
-            std::cout << fft_length_flat(i) << " ";
-        }
-        std::cout << std::endl;
-        
-        std::cout << "Axes: ";
-        for (int i = 0; i < fft_length_rank; ++i) {
-            std::cout << axes_flat(i) << " ";
-        }
-        std::cout << std::endl;
-        
-        // Use raw_ops namespace for IFFTND
-        auto ifftnd_op = tensorflow::ops::IFFT3D(root, input_op);
-        
-        // If we need to use the actual IFFTND with fft_length and axes parameters:
-        // auto attrs = tensorflow::ops::IFFT3D::Attrs();
-        // auto ifftnd_op = tensorflow::ops::IFFT3D(root, input_op, attrs);
+
+        tensorflow::Output ifftnd_op(ifftnd_node, 0);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({ifftnd_op}, &outputs);
+        status = session.Run({ifftnd_op}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

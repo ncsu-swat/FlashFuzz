@@ -3,12 +3,13 @@
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
-#include "tensorflow/cc/ops/data_flow_ops.h"
 #include "tensorflow/core/framework/types.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
 #include <cmath>
+#include <string>
 
 #define MAX_RANK 4
 #define MIN_RANK 0
@@ -227,38 +228,43 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::DataType handle_dtype = tensorflow::DT_STRING;
-        uint8_t handle_rank = parseRank(data[offset++]);
-        std::vector<int64_t> handle_shape = parseShape(data, offset, size, handle_rank);
-        
-        tensorflow::TensorShape handle_tensor_shape;
-        for (int64_t dim : handle_shape) {
-            handle_tensor_shape.AddDim(dim);
-        }
-        
-        tensorflow::Tensor handle_tensor(handle_dtype, handle_tensor_shape);
-        fillTensorWithDataByType(handle_tensor, handle_dtype, data, offset, size);
-        
-        std::cout << "Handle tensor shape: ";
-        for (int i = 0; i < handle_tensor_shape.dims(); ++i) {
-            std::cout << handle_tensor_shape.dim_size(i) << " ";
-        }
-        std::cout << std::endl;
-        
-        auto handle_input = tensorflow::ops::Placeholder(root, handle_dtype, 
-            tensorflow::ops::Placeholder::Shape(handle_tensor_shape));
-        
-        // Use raw op instead of tensorflow::ops::StackClose
-        auto stack_close_op = tensorflow::ops::internal::StackClose(root, handle_input);
-        
-        tensorflow::ClientSession session(root);
-        
-        std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({{handle_input, handle_tensor}}, 
-                                               {stack_close_op.operation}, &outputs);
-        
+        std::vector<tensorflow::DataType> allowed_types = {
+            tensorflow::DT_FLOAT,
+            tensorflow::DT_INT32,
+            tensorflow::DT_BOOL,
+            tensorflow::DT_STRING
+        };
+        tensorflow::DataType elem_type = allowed_types[data[offset++] % allowed_types.size()];
+
+        tensorflow::Node* stack_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("Stack"),
+                                        "Stack")
+                                        .Attr("elem_type", elem_type)
+                                        .Attr("stack_name", std::string())
+                                        .Device("/cpu:0")
+                                        .Finalize(root.graph(), &stack_node);
         if (!status.ok()) {
-            std::cout << "Error running session: " << status.ToString() << std::endl;
+            tf_fuzzer_utils::logError("Failed to create Stack node: " + status.ToString(), data, size);
+            return -1;
+        }
+
+        tensorflow::Node* close_node = nullptr;
+        status = tensorflow::NodeBuilder(
+                     root.GetUniqueNameForOp("StackClose"),
+                     "StackClose")
+                     .Input(tensorflow::NodeBuilder::NodeOut(stack_node, 0))
+                     .Device("/cpu:0")
+                     .Finalize(root.graph(), &close_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create StackClose node: " + status.ToString(), data, size);
+            return -1;
+        }
+
+        tensorflow::ClientSession session(root);
+        status = session.Run({}, {}, {tensorflow::Operation(close_node)}, nullptr);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Error running session: " + status.ToString(), data, size);
             return -1;
         }
 

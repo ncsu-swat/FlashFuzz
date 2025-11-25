@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/dataset_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -229,9 +230,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::Tensor variant_tensor(tensorflow::DT_VARIANT, tensorflow::TensorShape({}));
-        
-        if (offset >= size) return 0;
         uint8_t path_len = data[offset] % 20 + 1;
         offset++;
         
@@ -243,101 +241,91 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         tensorflow::Tensor path_tensor(tensorflow::DT_STRING, tensorflow::TensorShape({}));
         path_tensor.scalar<tensorflow::tstring>()() = path_str;
+        auto path_const = tensorflow::ops::Const(root, path_tensor);
         
-        if (offset >= size) return 0;
-        uint8_t num_other_args = data[offset] % 3;
-        offset++;
-        
-        std::vector<tensorflow::Input> shard_func_other_args;
-        for (uint8_t i = 0; i < num_other_args && offset < size; ++i) {
-            tensorflow::DataType dtype = parseDataType(data[offset]);
-            offset++;
-            if (offset >= size) break;
-            
-            uint8_t rank = parseRank(data[offset]);
-            offset++;
-            
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            tensorflow::TensorShape tensor_shape;
-            for (int64_t dim : shape) {
-                tensor_shape.AddDim(dim);
-            }
-            
-            tensorflow::Tensor tensor(dtype, tensor_shape);
-            fillTensorWithDataByType(tensor, dtype, data, offset, size);
-            
-            auto placeholder = tensorflow::ops::Placeholder(root, dtype, 
-                tensorflow::ops::Placeholder::Shape(tensor_shape));
-            shard_func_other_args.push_back(placeholder);
+        // Build a small RangeDataset to serve as the input dataset handle.
+        int64_t stop_val = 8;
+        if (offset + sizeof(int64_t) <= size) {
+            std::memcpy(&stop_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+            stop_val = std::abs(stop_val) % 32 + 1;
         }
-        
-        if (offset >= size) return 0;
-        uint8_t num_output_types = (data[offset] % 3) + 1;
-        offset++;
-        
-        std::vector<tensorflow::DataType> output_types;
-        for (uint8_t i = 0; i < num_output_types && offset < size; ++i) {
-            output_types.push_back(parseDataType(data[offset]));
-            offset++;
+        auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
+        auto stop = tensorflow::ops::Const(root, stop_val);
+        auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
+
+        std::vector<tensorflow::DataType> dataset_output_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> dataset_output_shapes = {tensorflow::PartialTensorShape({})};
+
+        tensorflow::Node* range_dataset_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                         root.GetUniqueNameForOp("range_dataset"),
+                                         "RangeDataset")
+                                         .Input(start.node(), start.index())
+                                         .Input(stop.node(), stop.index())
+                                         .Input(step.node(), step.index())
+                                         .Attr("output_types", dataset_output_types)
+                                         .Attr("output_shapes", dataset_output_shapes)
+                                         .Finalize(root.graph(), &range_dataset_node);
+        if (!status.ok()) {
+            return 0;
         }
-        
-        std::vector<tensorflow::TensorShape> output_shapes;
-        for (uint8_t i = 0; i < num_output_types && offset < size; ++i) {
-            if (offset >= size) break;
-            uint8_t rank = parseRank(data[offset]);
-            offset++;
-            
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            tensorflow::TensorShape tensor_shape;
-            for (int64_t dim : shape) {
-                tensor_shape.AddDim(dim);
-            }
-            output_shapes.push_back(tensor_shape);
+        tensorflow::Output input_dataset(range_dataset_node);
+
+        std::vector<tensorflow::NodeBuilder::NodeOut> shard_func_other_args_nodes;
+        std::vector<tensorflow::DataType> shard_func_arg_types;
+
+        tensorflow::FunctionDef shard_func_def = tensorflow::FunctionDefHelper::Define(
+            "FuzzShardFunc",
+            {"x: int64"},
+            {"y: int64"},
+            {},
+            {{{"y"}, "Identity", {"x"}, {{"T", tensorflow::DT_INT64}}}});
+        status = root.graph()->mutable_flib_def()->AddFunctionDef(shard_func_def);
+        if (!status.ok()) {
+            return 0;
         }
-        
-        if (output_shapes.size() < output_types.size()) {
-            while (output_shapes.size() < output_types.size()) {
-                output_shapes.push_back(tensorflow::TensorShape({1}));
-            }
-        }
+
+        tensorflow::NameAttrList shard_func_attr;
+        shard_func_attr.set_name("FuzzShardFunc");
         
         std::string compression = "";
         if (offset < size) {
-            if (data[offset] % 2 == 1) {
-                compression = "GZIP";
-            }
+            compression = (data[offset] % 2 == 1) ? "GZIP" : "";
             offset++;
         }
         
-        bool use_shard_func = true;
+        bool use_shard_func = (offset < size) ? (data[offset] % 2 == 1) : false;
         if (offset < size) {
-            use_shard_func = (data[offset] % 2 == 1);
             offset++;
         }
-        
-        auto input_dataset = tensorflow::ops::Placeholder(root, tensorflow::DT_VARIANT);
-        auto path_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_STRING);
-        
-        tensorflow::NameAttrList shard_func_attr;
-        shard_func_attr.set_name("identity_func");
-        
-        // Using raw_ops directly
-        auto save_dataset = tensorflow::ops::internal::SaveDatasetV2(
-            root,
-            input_dataset,
-            path_placeholder,
-            shard_func_other_args,
-            compression,
-            use_shard_func,
-            shard_func_attr
-        );
-        
-        std::cout << "SaveDatasetV2 operation created successfully" << std::endl;
-        std::cout << "Path: " << path_str << std::endl;
-        std::cout << "Compression: " << compression << std::endl;
-        std::cout << "UseShardFunc: " << use_shard_func << std::endl;
-        std::cout << "Output types count: " << output_types.size() << std::endl;
-        std::cout << "Output shapes count: " << output_shapes.size() << std::endl;
+
+        tensorflow::Node* save_dataset_node = nullptr;
+        status = tensorflow::NodeBuilder(
+                     root.GetUniqueNameForOp("save_dataset_v2"),
+                     "SaveDatasetV2")
+                     .Input(input_dataset.node(), input_dataset.index())
+                     .Input(path_const.node(), path_const.index())
+                     .Input(shard_func_other_args_nodes)
+                     .Attr("compression", compression)
+                     .Attr("shard_func", shard_func_attr)
+                     .Attr("use_shard_func", use_shard_func)
+                     .Attr("Tshard_func_args", shard_func_arg_types)
+                     .Attr("output_types", dataset_output_types)
+                     .Attr("output_shapes", dataset_output_shapes)
+                     .Finalize(root.graph(), &save_dataset_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to build SaveDatasetV2 node: " + status.ToString(), data, size);
+            return 0;
+        }
+
+        tensorflow::ClientSession session(root);
+        std::vector<tensorflow::Tensor> outputs;
+        status = session.Run({tensorflow::Output(save_dataset_node)}, &outputs);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Session run error: " + status.ToString(), data, size);
+            return 0;
+        }
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

@@ -133,25 +133,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto parameters_input = tensorflow::ops::Const(root, parameters_tensor);
         auto momenta_input = tensorflow::ops::Const(root, momenta_tensor);
 
-        // Use raw_ops directly instead of the missing tpu_ops.h
-        auto load_op = tensorflow::ops::Operation(
-            root.WithOpName("LoadTPUEmbeddingMomentumParameters"),
-            "LoadTPUEmbeddingMomentumParameters",
-            {parameters_input.output, momenta_input.output},
-            {
-                {"num_shards", num_shards},
-                {"shard_id", shard_id},
-                {"table_id", table_id},
-                {"table_name", table_name},
-                {"config", config}
-            }
-        );
+        // Build the raw op via NodeBuilder since the generated wrapper is unavailable
+        tensorflow::NodeBuilder builder("LoadTPUEmbeddingMomentumParameters",
+                                        "LoadTPUEmbeddingMomentumParameters");
+        builder.Input(parameters_input.node());
+        builder.Input(momenta_input.node());
+        builder.Attr("num_shards", num_shards);
+        builder.Attr("shard_id", shard_id);
+        builder.Attr("table_id", table_id);
+        builder.Attr("table_name", table_name);
+        builder.Attr("config", config);
+
+        tensorflow::Node* node = nullptr;
+        TF_CHECK_OK(builder.Finalize(root.graph(), &node));
 
         tensorflow::ClientSession session(root);
-        tensorflow::Status status = session.Run({load_op}, nullptr);
-        if (!status.ok()) {
-            return -1;
-        }
+        tensorflow::Operation load_op(node);
+        TF_CHECK_OK(session.Run({}, {}, {load_op}, nullptr));
 
     } catch (const std::exception& e) {
         tf_fuzzer_utils::logError("CPU Execution error: " + std::string(e.what()), data, size);

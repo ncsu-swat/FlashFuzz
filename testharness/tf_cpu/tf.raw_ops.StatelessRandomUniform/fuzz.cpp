@@ -4,6 +4,8 @@
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/cc/ops/random_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
+#include "tensorflow/core/framework/types.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
@@ -73,6 +75,27 @@ std::vector<int64_t> parseShape(const uint8_t* data, size_t& offset, size_t tota
     return shape;
 }
 
+tensorflow::Tensor createShapeTensor(const std::vector<int64_t>& dims,
+                                     tensorflow::DataType dtype) {
+    tensorflow::TensorShape shape_tensor_shape(
+        {static_cast<int64_t>(dims.size())});
+    tensorflow::Tensor shape_tensor(dtype, shape_tensor_shape);
+
+    if (dtype == tensorflow::DT_INT32) {
+        auto flat = shape_tensor.flat<int32_t>();
+        for (size_t i = 0; i < dims.size(); ++i) {
+            flat(i) = static_cast<int32_t>(dims[i]);
+        }
+    } else {
+        auto flat = shape_tensor.flat<int64_t>();
+        for (size_t i = 0; i < dims.size(); ++i) {
+            flat(i) = dims[i];
+        }
+    }
+
+    return shape_tensor;
+}
+
 template <typename T>
 void fillTensorWithData(tensorflow::Tensor& tensor, const uint8_t* data,
                         size_t& offset, size_t total_size) {
@@ -121,29 +144,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         uint8_t shape_rank = parseRank(data[offset++]);
         std::vector<int64_t> shape_dims = parseShape(data, offset, size, shape_rank);
         
-        tensorflow::TensorShape shape_tensor_shape({static_cast<int64_t>(shape_dims.size())});
-        tensorflow::Tensor shape_tensor(tensorflow::DT_INT32, shape_tensor_shape);
-        auto shape_flat = shape_tensor.flat<int32_t>();
-        for (size_t i = 0; i < shape_dims.size(); ++i) {
-            shape_flat(i) = static_cast<int32_t>(shape_dims[i]);
-        }
+        tensorflow::DataType shape_dtype =
+            (data[offset++ % size] % 2 == 0) ? tensorflow::DT_INT32
+                                             : tensorflow::DT_INT64;
+        tensorflow::Tensor shape_tensor = createShapeTensor(shape_dims, shape_dtype);
         
         tensorflow::TensorShape seed_shape({2});
-        tensorflow::Tensor seed_tensor(tensorflow::DT_INT32, seed_shape);
-        fillTensorWithDataByType(seed_tensor, tensorflow::DT_INT32, data, offset, size);
+        tensorflow::DataType seed_dtype =
+            (data[offset++ % size] % 2 == 0) ? tensorflow::DT_INT32
+                                             : tensorflow::DT_INT64;
+        tensorflow::Tensor seed_tensor(seed_dtype, seed_shape);
+        fillTensorWithDataByType(seed_tensor, seed_dtype, data, offset, size);
         
         auto shape_input = tensorflow::ops::Const(root, shape_tensor);
         auto seed_input = tensorflow::ops::Const(root, seed_tensor);
-        
-        auto random_uniform = tensorflow::ops::StatelessRandomUniformV2(
-            root, shape_input, seed_input, 
-            tensorflow::Output(), // algorithm is empty
-            output_dtype);
+
+        tensorflow::Node* node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("stateless_random_uniform"),
+                                        "StatelessRandomUniform")
+                                        .Input(tensorflow::NodeBuilder::NodeOut(shape_input.node()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(seed_input.node()))
+                                        .Attr("dtype", output_dtype)
+                                        .Attr("T", shape_tensor.dtype())
+                                        .Attr("Tseed", seed_tensor.dtype())
+                                        .Finalize(root.graph(), &node);
+        if (!status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output random_uniform(node, 0);
         
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        
-        tensorflow::Status status = session.Run({random_uniform}, &outputs);
+
+        status = session.Run({random_uniform}, &outputs);
         if (!status.ok()) {
             std::cout << "Error running session: " << status.ToString() << std::endl;
             return -1;

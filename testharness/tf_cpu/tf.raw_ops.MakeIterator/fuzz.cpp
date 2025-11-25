@@ -227,55 +227,68 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        tensorflow::DataType dataset_dtype = parseDataType(data[offset++]);
-        uint8_t dataset_rank = parseRank(data[offset++]);
-        std::vector<int64_t> dataset_shape = parseShape(data, offset, size, dataset_rank);
-        
-        tensorflow::TensorShape dataset_tensor_shape;
-        for (int64_t dim : dataset_shape) {
-            dataset_tensor_shape.AddDim(dim);
+        int64_t start_val = 0;
+        int64_t stop_val = 10;
+        if (offset + sizeof(int64_t) * 2 <= size) {
+            std::memcpy(&start_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+            std::memcpy(&stop_val, data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
+        }
+        if (start_val == stop_val) {
+            stop_val = start_val + 1;
         }
 
-        tensorflow::Tensor dataset_tensor(tensorflow::DT_VARIANT, tensorflow::TensorShape({}));
-        
-        // Create a range dataset
-        auto start = tensorflow::ops::Const(root, 0);
-        auto stop = tensorflow::ops::Const(root, 10);
-        auto step = tensorflow::ops::Const(root, 1);
-        
-        std::vector<tensorflow::DataType> output_types = {dataset_dtype};
-        std::vector<tensorflow::PartialTensorShape> output_shapes = {tensorflow::PartialTensorShape(dataset_shape)};
-        
-        // Create a range dataset using standard ops
-        auto range_dataset = tensorflow::ops::RangeDataset(
-            root, 
-            start, 
-            stop, 
-            step, 
-            output_types, 
-            output_shapes
-        );
-        
-        // Create an iterator resource handle
-        auto iterator_resource = tensorflow::ops::Iterator(
-            root, 
-            "", 
-            "", 
-            output_types, 
-            output_shapes
-        );
-        
-        // Make the iterator
-        auto make_iterator_op = tensorflow::ops::MakeIterator(
-            root, 
-            range_dataset, 
-            iterator_resource
-        );
+        int64_t step_val = 1;
+        if (offset < size) {
+            step_val = static_cast<int64_t>(std::abs(static_cast<int8_t>(data[offset]))) + 1;
+            offset++;
+        }
+
+        auto start = tensorflow::ops::Const(root, start_val);
+        auto stop = tensorflow::ops::Const(root, stop_val);
+        auto step = tensorflow::ops::Const(root, step_val);
+
+        std::vector<tensorflow::DataType> output_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> output_shapes = {
+            tensorflow::PartialTensorShape({})};
+
+        tensorflow::Node* range_dataset_node = nullptr;
+        auto range_status = tensorflow::NodeBuilder("range_dataset", "RangeDataset")
+                                .Input(start.node())
+                                .Input(stop.node())
+                                .Input(step.node())
+                                .Attr("output_types", output_types)
+                                .Attr("output_shapes", output_shapes)
+                                .Finalize(root.graph(), &range_dataset_node);
+        if (!range_status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Node* iterator_node = nullptr;
+        auto iterator_status = tensorflow::NodeBuilder("iterator_resource", "Iterator")
+                                   .Attr("shared_name", "")
+                                   .Attr("container", "")
+                                   .Attr("output_types", output_types)
+                                   .Attr("output_shapes", output_shapes)
+                                   .Finalize(root.graph(), &iterator_node);
+        if (!iterator_status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Node* make_iterator_node = nullptr;
+        auto make_status = tensorflow::NodeBuilder("make_iterator", "MakeIterator")
+                               .Input(range_dataset_node)
+                               .Input(iterator_node)
+                               .Finalize(root.graph(), &make_iterator_node);
+        if (!make_status.ok()) {
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({make_iterator_op}, &outputs);
+        tensorflow::Status status = session.Run({tensorflow::Output(make_iterator_node)}, &outputs);
         
         if (!status.ok()) {
             return -1;

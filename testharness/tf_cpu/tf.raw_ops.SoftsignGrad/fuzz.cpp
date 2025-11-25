@@ -2,6 +2,7 @@
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/nn_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -131,16 +132,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         uint8_t features_rank = parseRank(data[offset++]);
         std::vector<int64_t> features_shape = parseShape(data, offset, size, features_rank);
+        (void)features_rank;
+        (void)features_shape;  // keep input consumption; shape must match gradients.
 
         tensorflow::TensorShape gradients_tensor_shape;
         for (int64_t dim : gradients_shape) {
             gradients_tensor_shape.AddDim(dim);
         }
         
-        tensorflow::TensorShape features_tensor_shape;
-        for (int64_t dim : features_shape) {
-            features_tensor_shape.AddDim(dim);
-        }
+        tensorflow::TensorShape features_tensor_shape = gradients_tensor_shape;
 
         tensorflow::Tensor gradients_tensor(dtype, gradients_tensor_shape);
         tensorflow::Tensor features_tensor(dtype, features_tensor_shape);
@@ -151,12 +151,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto gradients_input = tensorflow::ops::Const(root, gradients_tensor);
         auto features_input = tensorflow::ops::Const(root, features_tensor);
 
-        // Use raw ops for SoftsignGrad since it's not directly available in the C++ API
-        auto attrs = tensorflow::ops::WithAttr("T", dtype);
-        auto softsign_grad = tensorflow::ops::Raw(root.WithOpName("SoftsignGrad"), 
-                                                 "SoftsignGrad", 
-                                                 {gradients_input.output, features_input.output},
-                                                 attrs);
+        tensorflow::Node* softsign_grad_node = nullptr;
+        auto builder = tensorflow::NodeBuilder(root.GetUniqueNameForOp("SoftsignGrad"), "SoftsignGrad")
+                           .Input(gradients_input.node())
+                           .Input(features_input.node())
+                           .Attr("T", dtype);
+
+        tensorflow::Status node_status = builder.Finalize(root.graph(), &softsign_grad_node);
+        if (!node_status.ok()) {
+            tf_fuzzer_utils::logError("Failed to build SoftsignGrad node: " + node_status.ToString(), data, size);
+            return 0;
+        }
+
+        tensorflow::Output softsign_grad(softsign_grad_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;

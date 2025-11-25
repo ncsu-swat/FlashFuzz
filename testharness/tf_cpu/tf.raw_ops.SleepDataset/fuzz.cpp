@@ -226,35 +226,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     tensorflow::Scope root = tensorflow::Scope::NewRootScope().WithDevice("/cpu:0");
 
     try {
-        uint8_t num_output_types = (data[offset] % 3) + 1;
-        offset++;
+        auto start = tensorflow::ops::Const(root, static_cast<int64_t>(0));
+        auto stop = tensorflow::ops::Const(root, static_cast<int64_t>(10));
+        auto step = tensorflow::ops::Const(root, static_cast<int64_t>(1));
+        std::vector<tensorflow::DataType> dataset_types = {tensorflow::DT_INT64};
+        std::vector<tensorflow::PartialTensorShape> dataset_shapes = {
+            tensorflow::PartialTensorShape({})};
 
-        std::vector<tensorflow::DataType> output_types;
-        std::vector<tensorflow::PartialTensorShape> output_shapes;
-        
-        for (uint8_t i = 0; i < num_output_types; ++i) {
-            if (offset >= size) break;
-            tensorflow::DataType dtype = parseDataType(data[offset]);
-            output_types.push_back(dtype);
-            offset++;
-            
-            if (offset >= size) break;
-            uint8_t rank = parseRank(data[offset]);
-            offset++;
-            
-            std::vector<int64_t> shape = parseShape(data, offset, size, rank);
-            output_shapes.push_back(tensorflow::PartialTensorShape(shape));
+        tensorflow::Node* range_dataset_node = nullptr;
+        auto range_status = tensorflow::NodeBuilder("range_dataset", "RangeDataset")
+                                .Input(start.node())
+                                .Input(stop.node())
+                                .Input(step.node())
+                                .Attr("output_types", dataset_types)
+                                .Attr("output_shapes", dataset_shapes)
+                                .Finalize(root.graph(), &range_dataset_node);
+        if (!range_status.ok()) {
+            return 0;
         }
 
-        if (output_types.empty()) {
-            output_types.push_back(tensorflow::DT_FLOAT);
-            output_shapes.push_back(tensorflow::PartialTensorShape({1}));
-        }
-
-        if (offset >= size) return 0;
-        
-        tensorflow::Tensor input_dataset_tensor(tensorflow::DT_VARIANT, tensorflow::TensorShape({}));
-        
         if (offset >= size) return 0;
         int64_t sleep_microseconds_value = 1000;
         if (offset + sizeof(int64_t) <= size) {
@@ -265,27 +255,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         
         tensorflow::Tensor sleep_microseconds_tensor(tensorflow::DT_INT64, tensorflow::TensorShape({}));
         sleep_microseconds_tensor.scalar<int64_t>()() = sleep_microseconds_value;
+        auto sleep_microseconds = tensorflow::ops::Const(root, sleep_microseconds_tensor);
 
-        auto input_dataset = tensorflow::ops::Placeholder(root, tensorflow::DT_VARIANT);
-        auto sleep_microseconds = tensorflow::ops::Placeholder(root, tensorflow::DT_INT64);
-
-        // Create a SleepDataset operation using raw_ops
-        auto sleep_dataset_op = tensorflow::ops::internal::SleepDataset(
-            root,
-            input_dataset,
-            sleep_microseconds,
-            output_types,
-            output_shapes
-        );
+        tensorflow::Node* sleep_dataset_node = nullptr;
+        auto sleep_status = tensorflow::NodeBuilder("sleep_dataset", "SleepDataset")
+                                .Input(range_dataset_node)
+                                .Input(sleep_microseconds.node())
+                                .Attr("output_types", dataset_types)
+                                .Attr("output_shapes", dataset_shapes)
+                                .Finalize(root.graph(), &sleep_dataset_node);
+        if (!sleep_status.ok()) {
+            return 0;
+        }
 
         tensorflow::ClientSession session(root);
         
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run(
-            {{input_dataset, input_dataset_tensor}, {sleep_microseconds, sleep_microseconds_tensor}},
-            {sleep_dataset_op.output},
-            &outputs
-        );
+        tensorflow::Status status = session.Run({tensorflow::Output(sleep_dataset_node)}, &outputs);
 
         if (!status.ok()) {
             return -1;

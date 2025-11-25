@@ -6,13 +6,15 @@
 #include "tensorflow/cc/ops/array_ops.h"
 #include "tensorflow/core/framework/types.h"
 #include "tensorflow/core/lib/core/status.h"
+#include "tensorflow/core/lib/bfloat16/bfloat16.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <iostream>
 #include <cstring>
 #include <vector>
 #include <cmath>
 
 #define MAX_RANK 4
-#define MIN_RANK 0
+#define MIN_RANK 1
 #define MIN_TENSOR_SHAPE_DIMS_TF 1
 #define MAX_TENSOR_SHAPE_DIMS_TF 10
 
@@ -182,7 +184,6 @@ void fillTensorWithDataByType(tensorflow::Tensor& tensor,
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    std::cout << "Start Fuzzing" << std::endl;
     if (size < 10) return 0;
     
     size_t offset = 0;
@@ -227,18 +228,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             axis_flat(i) = axis_values[i];
         }
         
-        auto input_placeholder = tensorflow::ops::Placeholder(root, tensor_dtype);
-        auto axis_placeholder = tensorflow::ops::Placeholder(root, tensorflow::DT_INT32);
-        
-        auto reverse_op = tensorflow::ops::Reverse(root, input_placeholder, axis_placeholder);
-        
-        tensorflow::ClientSession session(root);
-        
-        std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({{input_placeholder, input_tensor}, {axis_placeholder, axis_tensor}}, 
-                                               {reverse_op}, &outputs);
-        
+        auto input_const = tensorflow::ops::Const(root, input_tensor);
+        auto axis_const = tensorflow::ops::Const(root, axis_tensor);
+
+        tensorflow::Node* reverse_v2_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("reverse_v2_node", "ReverseV2")
+                                        .Input(input_const.node())
+                                        .Input(axis_const.node())
+                                        .Attr("Tidx", tensorflow::DT_INT32)
+                                        .Finalize(root.graph(), &reverse_v2_node);
         if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create ReverseV2 op: " + status.ToString(), data, size);
+            return -1;
+        }
+
+        tensorflow::Output reverse_v2(reverse_v2_node, 0);
+        tensorflow::ClientSession session(root);
+        std::vector<tensorflow::Tensor> outputs;
+        status = session.Run({reverse_v2}, &outputs);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to run ReverseV2 op: " + status.ToString(), data, size);
             return -1;
         }
 

@@ -8,6 +8,7 @@
 #include "tensorflow/core/lib/core/status.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/op_kernel.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include <cstring>
 #include <vector>
 #include <iostream>
@@ -236,31 +237,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         std::string padding = parsePadding(data[offset++]);
         std::vector<int> dilations = parseDilations(data, offset, size);
 
-        // Use raw_ops API instead of ops namespace
-        auto attrs = tensorflow::ops::Raw::QuantizedConv2DWithBiasAndReluAndRequantize::Attrs()
-            .OutType(out_dtype)
-            .Dilations(dilations);
-
-        auto quantized_conv2d_op = tensorflow::ops::Raw::QuantizedConv2DWithBiasAndReluAndRequantize(
-            root,
-            input_op,
-            filter_op,
-            bias_op,
-            min_input_op,
-            max_input_op,
-            min_filter_op,
-            max_filter_op,
-            min_freezed_output_op,
-            max_freezed_output_op,
-            strides,
-            padding,
-            attrs
-        );
+        tensorflow::Node* quantized_conv2d_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder(
+                                        root.GetUniqueNameForOp("quantized_conv2d_with_bias_and_relu_and_requantize"),
+                                        "QuantizedConv2DWithBiasAndReluAndRequantize")
+                                        .Input(input_op.node())
+                                        .Input(filter_op.node())
+                                        .Input(bias_op.node())
+                                        .Input(min_input_op.node())
+                                        .Input(max_input_op.node())
+                                        .Input(min_filter_op.node())
+                                        .Input(max_filter_op.node())
+                                        .Input(min_freezed_output_op.node())
+                                        .Input(max_freezed_output_op.node())
+                                        .Attr("Tinput", input_dtype)
+                                        .Attr("Tfilter", filter_dtype)
+                                        .Attr("Tbias", bias_dtype)
+                                        .Attr("out_type", out_dtype)
+                                        .Attr("strides", strides)
+                                        .Attr("padding", padding)
+                                        .Attr("dilations", dilations)
+                                        .Finalize(root.graph(), &quantized_conv2d_node);
+        if (!status.ok()) {
+            tf_fuzzer_utils::logError("Failed to create QuantizedConv2DWithBiasAndReluAndRequantize: " + status.ToString(), data, size);
+            return -1;
+        }
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
         
-        tensorflow::Status status = session.Run({quantized_conv2d_op.output, quantized_conv2d_op.min_output, quantized_conv2d_op.max_output}, &outputs);
+        tensorflow::Output output(quantized_conv2d_node, 0);
+        tensorflow::Output min_output(quantized_conv2d_node, 1);
+        tensorflow::Output max_output(quantized_conv2d_node, 2);
+
+        status = session.Run({output, min_output, max_output}, &outputs);
         if (!status.ok()) {
             return -1;
         }

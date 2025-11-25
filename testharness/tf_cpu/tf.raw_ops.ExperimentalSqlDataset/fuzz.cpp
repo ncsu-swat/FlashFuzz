@@ -271,20 +271,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             output_shapes.push_back(tensorflow::PartialTensorShape({}));
         }
 
-        auto driver_name_op = tensorflow::ops::Const(root, driver_name_tensor);
-        auto data_source_name_op = tensorflow::ops::Const(root, data_source_name_tensor);
-        auto query_op = tensorflow::ops::Const(root, query_tensor);
+        auto driver_name_op = tensorflow::ops::Const(root.WithOpName("driver_name"), driver_name_tensor);
+        auto data_source_name_op = tensorflow::ops::Const(root.WithOpName("data_source_name"), data_source_name_tensor);
+        auto query_op = tensorflow::ops::Const(root.WithOpName("query"), query_tensor);
 
-        // Use raw_ops API to create the ExperimentalSqlDataset operation
-        tensorflow::Output sql_dataset = tensorflow::Operation(
-            root.WithOpName("ExperimentalSqlDataset"),
-            "ExperimentalSqlDataset",
-            {driver_name_op, data_source_name_op, query_op},
-            {{"output_types", output_types}, {"output_shapes", output_shapes}});
+        tensorflow::Node* sql_dataset_node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("experimental_sql_dataset", "ExperimentalSqlDataset")
+                                        .Input(driver_name_op.node())
+                                        .Input(data_source_name_op.node())
+                                        .Input(query_op.node())
+                                        .Attr("output_types", output_types)
+                                        .Attr("output_shapes", output_shapes)
+                                        .Finalize(root.graph(), &sql_dataset_node);
+        if (!status.ok()) {
+            return -1;
+        }
+
+        tensorflow::Output sql_dataset(sql_dataset_node, 0);
 
         tensorflow::ClientSession session(root);
         std::vector<tensorflow::Tensor> outputs;
-        tensorflow::Status status = session.Run({sql_dataset}, &outputs);
+        status = session.Run({sql_dataset}, &outputs);
         
         if (!status.ok()) {
             return -1;

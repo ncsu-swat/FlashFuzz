@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/cc/ops/random_ops.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
@@ -220,22 +221,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         auto counts_op = tensorflow::ops::Const(root, counts_tensor);
         auto probs_op = tensorflow::ops::Const(root, probs_tensor);
 
-        // Use raw_ops namespace for StatelessRandomBinomial
-        tensorflow::Output binomial_op = tensorflow::ops::StatelessRandomUniform(root, shape_op, seed_op);
-        
-        // Create a placeholder for the actual operation
-        // In a real implementation, you would use the correct raw op
-        // This is a workaround since StatelessRandomBinomial is not directly available in the C++ API
-        std::vector<tensorflow::Output> inputs = {shape_op, seed_op, counts_op, probs_op};
-        tensorflow::NodeBuilder node_builder = tensorflow::NodeBuilder("StatelessRandomBinomial", "StatelessRandomBinomial")
-            .Input(tensorflow::NodeBuilder::NodeOut(shape_op.node()))
-            .Input(tensorflow::NodeBuilder::NodeOut(seed_op.node()))
-            .Input(tensorflow::NodeBuilder::NodeOut(counts_op.node()))
-            .Input(tensorflow::NodeBuilder::NodeOut(probs_op.node()))
-            .Attr("dtype", output_dtype);
-            
-        tensorflow::Node* node;
-        tensorflow::Status status = root.graph()->AddNode(node_builder, &node);
+        tensorflow::Node* node = nullptr;
+        tensorflow::Status status = tensorflow::NodeBuilder("stateless_random_binomial", "StatelessRandomBinomial")
+                                        .Input(tensorflow::NodeBuilder::NodeOut(shape_op.node(), shape_op.index()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(seed_op.node(), seed_op.index()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(counts_op.node(), counts_op.index()))
+                                        .Input(tensorflow::NodeBuilder::NodeOut(probs_op.node(), probs_op.index()))
+                                        .Attr("dtype", output_dtype)
+                                        .Attr("T", counts_dtype)
+                                        .Attr("Tseed", seed_dtype)
+                                        .Finalize(root.graph(), &node);
         if (!status.ok()) {
             return -1;
         }

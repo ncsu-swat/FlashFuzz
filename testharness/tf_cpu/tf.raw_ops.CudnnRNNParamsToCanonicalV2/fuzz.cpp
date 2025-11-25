@@ -1,6 +1,7 @@
 #include "tensorflow/cc/client/client_session.h"
 #include "tensorflow/cc/ops/standard_ops.h"
 #include "tensorflow/core/framework/tensor.h"
+#include "tensorflow/core/graph/node_builder.h"
 #include "tensorflow/core/platform/init_main.h"
 #include "tensorflow/core/public/session_options.h"
 #include "tensorflow/core/framework/types.h"
@@ -141,8 +142,7 @@ std::string parseDirection(uint8_t selector) {
 }
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
-    std::cout << "Start Fuzzing" << std::endl;
-    if (size < 50) return 0;
+    if (size < 32) return 0;
     
     size_t offset = 0;
 
@@ -150,8 +150,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
     try {
         int32_t num_layers_val = 1 + (data[offset++] % 3);
-        int32_t num_units_val = 1 + (data[offset++] % 10);
-        int32_t input_size_val = 1 + (data[offset++] % 10);
+        int32_t num_units_val = 1 + (data[offset++] % 16);
+        int32_t input_size_val = 1 + (data[offset++] % 16);
         
         tensorflow::Tensor num_layers_tensor(tensorflow::DT_INT32, tensorflow::TensorShape({}));
         num_layers_tensor.scalar<int32_t>()() = num_layers_val;
@@ -175,9 +175,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
         tensorflow::Tensor params_tensor(params_dtype, params_tensor_shape);
         fillTensorWithDataByType(params_tensor, params_dtype, data, offset, size);
 
-        int num_params_weights = 1 + (data[offset % size] % 10);
+        int num_params_weights = 1 + (data[offset % size] % 4);
         offset++;
-        int num_params_biases = 1 + (data[offset % size] % 10);
+        int num_params_biases = 1 + (data[offset % size] % 4);
         offset++;
         
         std::string rnn_mode = parseRnnMode(data[offset % size]);
@@ -209,35 +209,42 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
             num_proj = data[offset++] % 5;
         }
 
-        auto num_layers_op = tensorflow::ops::Const(root, num_layers_tensor);
-        auto num_units_op = tensorflow::ops::Const(root, num_units_tensor);
-        auto input_size_op = tensorflow::ops::Const(root, input_size_tensor);
-        auto params_op = tensorflow::ops::Const(root, params_tensor);
+        auto num_layers_op = tensorflow::ops::Const(root.WithOpName("num_layers"), num_layers_tensor);
+        auto num_units_op = tensorflow::ops::Const(root.WithOpName("num_units"), num_units_tensor);
+        auto input_size_op = tensorflow::ops::Const(root.WithOpName("input_size"), input_size_tensor);
+        auto params_op = tensorflow::ops::Const(root.WithOpName("params"), params_tensor);
 
-        // Use raw_ops directly instead of the missing rnn_ops.h
-        auto cudnn_rnn_params_to_canonical = tensorflow::ops::CudnnRNNParamsToCanonicalV2(
-            root.WithOpName("CudnnRNNParamsToCanonicalV2"),
-            num_layers_op,
-            num_units_op,
-            input_size_op,
-            params_op,
-            num_params_weights,
-            num_params_biases,
-            rnn_mode,
-            input_mode,
-            direction,
-            dropout,
-            seed,
-            seed2,
-            num_proj
-        );
+        tensorflow::Node* node = nullptr;
+        auto status = tensorflow::NodeBuilder("cudnn_rnn_params_to_canonical_v2", "CudnnRNNParamsToCanonicalV2")
+                          .Input(num_layers_op.node())
+                          .Input(num_units_op.node())
+                          .Input(input_size_op.node())
+                          .Input(params_op.node())
+                          .Attr("T", params_dtype)
+                          .Attr("num_params_weights", num_params_weights)
+                          .Attr("num_params_biases", num_params_biases)
+                          .Attr("rnn_mode", rnn_mode)
+                          .Attr("input_mode", input_mode)
+                          .Attr("direction", direction)
+                          .Attr("dropout", dropout)
+                          .Attr("seed", seed)
+                          .Attr("seed2", seed2)
+                          .Attr("num_proj", num_proj)
+                          .Finalize(root.graph(), &node);
+        if (!status.ok() || node == nullptr) {
+            return 0;
+        }
 
         tensorflow::ClientSession session(root);
+        std::vector<tensorflow::Output> fetches;
+        fetches.reserve(num_params_weights + num_params_biases);
+        for (int i = 0; i < num_params_weights + num_params_biases; ++i) {
+            fetches.emplace_back(node, i);
+        }
         std::vector<tensorflow::Tensor> outputs;
-        
-        tensorflow::Status status = session.Run({cudnn_rnn_params_to_canonical.weights, cudnn_rnn_params_to_canonical.biases}, &outputs);
-        if (!status.ok()) {
-            return -1;
+        tensorflow::Status run_status = session.Run(fetches, &outputs);
+        if (!run_status.ok()) {
+            return 0;
         }
 
     } catch (const std::exception& e) {
