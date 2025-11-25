@@ -1,94 +1,146 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <vector>
+#include <optional>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
     try
     {
         size_t offset = 0;
-        
-        // Need at least a few bytes to create a tensor
-        if (Size < 4) {
+
+        // 1. Create the input tensor from fuzz data
+        // This handles parsing random shapes, ranks, dtypes, and data elements.
+        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+
+        // 2. Ensure we have enough data left for parameter selection
+        // If not, fallback to default global mean
+        if (offset >= Size)
+        {
+            torch::mean(input);
             return 0;
         }
+
+        // 3. Parse Control Byte
+        // We use a byte to decide which overload and optional arguments to use.
+        uint8_t control = Data[offset++];
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Bit 0: Mode Selection
+        // 0 -> Global reduction: mean(input, *, dtype)
+        // 1 -> Dimension reduction: mean(input, dim, keepdim, *, dtype)
+        bool use_dim_reduction = (control & 0x01);
+
+        // Bit 1: Provide explicit dtype?
+        bool provide_dtype = (control & 0x02);
         
-        // Extract dimension parameter if we have more data
-        int64_t dim = -1;
-        bool keepdim = false;
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        // Bit 2: Keepdim (only relevant for dim reduction path)
+        bool keepdim = (control & 0x04);
+
+        // 4. Parse 'dtype' argument if requested
+        std::optional<torch::ScalarType> dtype = std::nullopt;
+        if (provide_dtype)
+        {
+            if (offset >= Size) return 0;
+            dtype = fuzzer_utils::parseDataType(Data[offset++]);
+        }
+
+        if (use_dim_reduction)
+        {
+            // --- Dimension Reduction Path ---
+            // Target: torch.mean(input, dim, keepdim, *, dtype)
             
-            // Get keepdim parameter if available
-            if (offset < Size) {
-                keepdim = Data[offset++] & 0x1;
+            // Parse dimensions from the remaining fuzz data
+            std::vector<int64_t> dims;
+            
+            if (offset < Size)
+            {
+                uint8_t dim_params = Data[offset++];
+                int64_t rank = input.dim();
+                
+                // Determine how many dimensions to reduce over.
+                // Using modulo to map the random byte to a reasonable range [0, rank+1]
+                // (rank+1 allows us to test duplicate or slightly excessive dims)
+                int num_dims_to_pick = 0;
+                if (rank == 0) 
+                {
+                    // For scalar tensors, only empty list is strictly valid, 
+                    // but we fuzz 0 or 1 dimensions to hit error paths.
+                    num_dims_to_pick = dim_params % 2; 
+                } 
+                else 
+                {
+                    num_dims_to_pick = dim_params % (rank + 2);
+                }
+
+                for (int i = 0; i < num_dims_to_pick; ++i)
+                {
+                    if (offset >= Size) break;
+                    uint8_t val = Data[offset++];
+                    
+                    int64_t d;
+                    if (rank > 0) 
+                    {
+                        // Map byte to dimension index.
+                        // 200/256 chance to be valid-ish (modulo rank)
+                        // 56/256 chance to be raw (likely out of bounds)
+                        if (val < 200) 
+                        {
+                            d = val % rank;
+                            // Apply negation for negative indexing 50% of time (odd/even check)
+                            if (val % 2 != 0) 
+                            {
+                                d -= rank;
+                            }
+                        } 
+                        else 
+                        {
+                            d = val; // Raw value, likely OOB
+                        }
+                    } 
+                    else 
+                    {
+                        d = val; // Scalar tensor, any non-empty dim is usually invalid
+                    }
+                    dims.push_back(d);
+                }
+            }
+
+            // Execute the operation
+            if (dtype.has_value())
+            {
+                torch::mean(input, dims, keepdim, dtype.value());
+            }
+            else
+            {
+                torch::mean(input, dims, keepdim);
             }
         }
-        
-        // Apply torch.mean in different ways to test various code paths
-        torch::Tensor result;
-        
-        // Test different variants of mean
-        if (offset < Size) {
-            uint8_t variant = Data[offset++] % 4;
+        else
+        {
+            // --- Global Reduction Path ---
+            // Target: torch.mean(input, *, dtype)
             
-            switch (variant) {
-                case 0:
-                    // Mean over all dimensions
-                    result = torch::mean(input_tensor);
-                    break;
-                    
-                case 1:
-                    // Mean over specific dimension
-                    result = torch::mean(input_tensor, dim, keepdim);
-                    break;
-                    
-                case 2:
-                    // Mean with dtype specified
-                    if (offset < Size) {
-                        auto dtype_selector = Data[offset++];
-                        auto dtype = fuzzer_utils::parseDataType(dtype_selector);
-                        result = torch::mean(input_tensor, dtype);
-                    } else {
-                        result = torch::mean(input_tensor);
-                    }
-                    break;
-                    
-                case 3:
-                    // Mean with dimension and dtype
-                    if (offset < Size) {
-                        auto dtype_selector = Data[offset++];
-                        auto dtype = fuzzer_utils::parseDataType(dtype_selector);
-                        result = torch::mean(input_tensor, dim, keepdim, dtype);
-                    } else {
-                        result = torch::mean(input_tensor, dim, keepdim);
-                    }
-                    break;
+            if (dtype.has_value())
+            {
+                torch::mean(input, dtype.value());
             }
-        } else {
-            // Default case if no variant byte available
-            result = torch::mean(input_tensor);
-        }
-        
-        // Access result to ensure computation is performed
-        if (result.defined()) {
-            auto numel = result.numel();
-            if (numel > 0) {
-                auto item = result.item();
+            else
+            {
+                torch::mean(input);
             }
         }
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        // Catch exceptions to prevent the fuzzer from aborting.
+        // Expected exceptions include:
+        // - "input must be floating point or complex" (if input is Int and no dtype provided)
+        // - "Dimension out of range"
+        // - "Could not infer output dtype"
+        std::cout << "Exception caught: " << e.what() << std::endl;
+        return 0; // Discard input but keep fuzzing
     }
-    return 0; // keep the input
+
+    return 0;
 }

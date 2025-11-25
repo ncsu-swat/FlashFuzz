@@ -13,7 +13,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
-        return -1; // discard the input
+        return -1; // discard the input for libfuzzer
     }
     return 0; // keep the input
 }

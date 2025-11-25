@@ -1,141 +1,107 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <torch/torch.h>
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
     try
     {
         size_t offset = 0;
-        
-        // Need at least some data to create tensors
-        if (Size < 4) {
+
+        // Basic size check to ensure we can read at least some metadata
+        if (Size < 5)
+        {
             return 0;
         }
-        
-        // Create first tensor
-        torch::Tensor tensor1 = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create second tensor or scalar
-        bool use_scalar = false;
-        if (offset < Size) {
-            use_scalar = Data[offset++] % 2 == 0;
+
+        // 1. Create the 'input' Tensor
+        // This consumes bytes from Data based on the encoded rank and shape.
+        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+
+        // 2. Parse Control Flags and Alpha
+        // We need at least 1 byte for control and 4 bytes for alpha value
+        if (offset + 5 > Size)
+        {
+            return 0;
         }
+
+        uint8_t control_byte = Data[offset++];
         
-        if (use_scalar) {
-            // Use a scalar value for the second argument
-            double scalar_value = 0.0;
-            if (offset + sizeof(double) <= Size) {
-                std::memcpy(&scalar_value, Data + offset, sizeof(double));
-                offset += sizeof(double);
-            }
-            
-            // Test torch::add with scalar
-            torch::Tensor result = torch::add(tensor1, scalar_value);
-            
-            // Try with alpha parameter if we have more data
-            if (offset + sizeof(double) <= Size) {
-                double alpha;
-                std::memcpy(&alpha, Data + offset, sizeof(double));
-                offset += sizeof(double);
-                
-                torch::Tensor result_with_alpha = torch::add(tensor1, scalar_value, alpha);
-            }
+        // Control bits:
+        // Bit 0: 'other' is Tensor (1) or Scalar (0)
+        bool other_is_tensor = (control_byte & 0x01);
+        // Bit 1: Use the 'out' parameter variant (1) or functional (0)
+        bool use_out = (control_byte & 0x02);
+        // Bit 2: 'alpha' type is Int (1) or Float (0)
+        bool alpha_is_int = (control_byte & 0x04);
+
+        // Parse 'alpha' (Scalar)
+        torch::Scalar alpha = 1.0;
+        float raw_alpha_val;
+        std::memcpy(&raw_alpha_val, Data + offset, sizeof(float));
+        offset += sizeof(float);
+
+        if (alpha_is_int) {
+            alpha = static_cast<int>(raw_alpha_val);
         } else {
-            // Create a second tensor for tensor-tensor addition
-            torch::Tensor tensor2;
-            if (offset < Size) {
-                tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Try tensor-tensor addition
-                try {
-                    torch::Tensor result = torch::add(tensor1, tensor2);
-                } catch (const std::exception&) {
-                    // Shapes might be incompatible, that's expected in some cases
-                }
-                
-                // Try with alpha parameter if we have more data
-                if (offset + sizeof(double) <= Size) {
-                    double alpha;
-                    std::memcpy(&alpha, Data + offset, sizeof(double));
-                    offset += sizeof(double);
-                    
-                    try {
-                        torch::Tensor result_with_alpha = torch::add(tensor1, tensor2, alpha);
-                    } catch (const std::exception&) {
-                        // Shapes might be incompatible, that's expected in some cases
-                    }
-                }
-                
-                // Try in-place addition if we have more data
-                if (offset < Size && Data[offset++] % 2 == 0) {
-                    try {
-                        tensor1.add_(tensor2);
-                    } catch (const std::exception&) {
-                        // Shapes might be incompatible, that's expected in some cases
-                    }
-                    
-                    // Try with alpha
-                    if (offset + sizeof(double) <= Size) {
-                        double alpha;
-                        std::memcpy(&alpha, Data + offset, sizeof(double));
-                        offset += sizeof(double);
-                        
-                        try {
-                            tensor1.add_(tensor2, alpha);
-                        } catch (const std::exception&) {
-                            // Shapes might be incompatible, that's expected in some cases
-                        }
-                    }
-                }
+            alpha = raw_alpha_val;
+        }
+
+        // 3. Execute torch::add variants
+        if (other_is_tensor)
+        {
+            // Case A: torch.add(Tensor, Tensor, alpha=...)
+            // Create 'other' Tensor
+            // If createTensor fails due to lack of data, it throws runtime_error which is caught.
+            torch::Tensor other = fuzzer_utils::createTensor(Data, Size, offset);
+
+            if (use_out)
+            {
+                // Variant: with 'out' parameter
+                torch::Tensor out = fuzzer_utils::createTensor(Data, Size, offset);
+                torch::add_out(out, input, other, alpha);
+            }
+            else
+            {
+                // Variant: functional
+                torch::add(input, other, alpha);
             }
         }
-        
-        // Try in-place addition with scalar if we have more data
-        if (offset + sizeof(double) <= Size) {
-            double scalar_value;
-            std::memcpy(&scalar_value, Data + offset, sizeof(double));
-            offset += sizeof(double);
+        else
+        {
+            // Case B: torch.add(Tensor, Number, alpha=...)
+            // Parse 'other' as Scalar
+            torch::Scalar other_scalar = 1.0;
             
-            tensor1.add_(scalar_value);
-            
-            // Try with alpha
-            if (offset + sizeof(double) <= Size) {
-                double alpha;
-                std::memcpy(&alpha, Data + offset, sizeof(double));
-                offset += sizeof(double);
-                
-                tensor1.add_(scalar_value, alpha);
+            if (offset + sizeof(float) <= Size)
+            {
+                float raw_other;
+                std::memcpy(&raw_other, Data + offset, sizeof(float));
+                offset += sizeof(float);
+                other_scalar = raw_other;
+            }
+            // If not enough data for scalar, we rely on the default initialized value 1.0
+
+            if (use_out)
+            {
+                // Variant: with 'out' parameter
+                torch::Tensor out = fuzzer_utils::createTensor(Data, Size, offset);
+                torch::add_out(out, input, other_scalar, alpha);
+            }
+            else
+            {
+                // Variant: functional
+                torch::add(input, other_scalar, alpha);
             }
         }
-        
-        // Try out_variant if we have more data
-        if (offset < Size && Data[offset++] % 2 == 0) {
-            torch::Tensor out = torch::empty_like(tensor1);
-            
-            if (use_scalar && offset + sizeof(double) <= Size) {
-                double scalar_value;
-                std::memcpy(&scalar_value, Data + offset, sizeof(double));
-                offset += sizeof(double);
-                
-                torch::add_out(out, tensor1, scalar_value);
-            } else if (!use_scalar && offset < Size) {
-                torch::Tensor tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                try {
-                    torch::add_out(out, tensor1, tensor2);
-                } catch (const std::exception&) {
-                    // Shapes might be incompatible, that's expected in some cases
-                }
-            }
-        }
+
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        std::cout << "Exception caught: " << e.what() << std::endl; // do not change this, I need to know the exception.
+        return 0; // keep the input
     }
-    return 0; // keep the input
+
+    return 0;
 }

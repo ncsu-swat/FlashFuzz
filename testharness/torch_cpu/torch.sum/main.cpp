@@ -1,88 +1,107 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <vector>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
     try
     {
         size_t offset = 0;
-        
-        // Need at least a few bytes to create a tensor
-        if (Size < 4) {
+
+        // 1. Create Input Tensor
+        // Uses fuzzer_utils to generate a tensor with varied shape, rank, and dtype.
+        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+
+        // Check if we have enough data left for control bits
+        if (offset >= Size)
+        {
+            // With no extra data, just run the default sum on the tensor
+            torch::sum(input);
             return 0;
         }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for sum operation if we have more data
-        int64_t dim = 0;
-        bool keepdim = false;
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            // Extract dimension parameter
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Use the dimension as is - let PyTorch handle invalid dimensions
-            
-            // Extract keepdim parameter if we have more data
-            if (offset < Size) {
-                keepdim = Data[offset++] & 0x1; // Use lowest bit to determine boolean value
+
+        // 2. Parse Control Byte
+        // Bit 0: Select between global sum vs dim-specific sum
+        // Bit 1: Specify output dtype
+        // Bit 2: keepdim (only relevant for dim-specific sum)
+        uint8_t control = Data[offset++];
+        bool use_dim_args = control & 0x01;
+        bool use_dtype = control & 0x02;
+        bool keepdim = control & 0x04;
+
+        // 3. Parse Optional Output Dtype
+        c10::optional<torch::ScalarType> dtype = c10::nullopt;
+        if (use_dtype)
+        {
+            if (offset < Size)
+            {
+                uint8_t dtype_selector = Data[offset++];
+                dtype = fuzzer_utils::parseDataType(dtype_selector);
             }
         }
-        
-        // Try different variants of torch::sum
-        try {
-            // Variant 1: Sum over all dimensions
-            torch::Tensor result1 = torch::sum(input);
-            
-            // Variant 2: Sum over specific dimension
-            torch::Tensor result2 = torch::sum(input, dim);
-            
-            // Variant 3: Sum over specific dimension with keepdim
-            torch::Tensor result3 = torch::sum(input, dim, keepdim);
-            
-            // Variant 4: Sum with dtype specified
-            if (offset < Size) {
-                auto dtype_selector = Data[offset++];
-                auto dtype = fuzzer_utils::parseDataType(dtype_selector);
-                torch::Tensor result4 = torch::sum(input, torch::ScalarType(dtype));
-            }
-            
-            // Variant 5: Sum with named dimension (if tensor has named dimensions)
-            if (input.dim() > 0) {
-                try {
-                    // This might throw if named dimensions aren't supported
-                    at::Dimname dimname = at::Dimname::fromSymbol(at::Symbol::dimname("dim_0"));
-                    torch::Tensor result5 = torch::sum(input, {dimname});
-                } catch (...) {
-                    // Ignore errors for named dimensions
+
+        // 4. Execute Target API
+        if (!use_dim_args)
+        {
+            // Variant 1: sum(input, *, dtype=None)
+            // Reduces all dimensions
+            torch::sum(input, dtype);
+        }
+        else
+        {
+            // Variant 2: sum(input, dim, keepdim=False, *, dtype=None)
+            std::vector<int64_t> dims;
+            int64_t rank = input.dim();
+
+            // Parse dimensions
+            // We determine how many dimensions to reduce based on the next byte
+            if (offset < Size)
+            {
+                uint8_t dim_count_byte = Data[offset++];
+                
+                // If rank > 0, we allow picking [0, rank] dimensions generally, 
+                // but also allow fuzzing slightly larger lists or duplicates.
+                size_t num_dims_to_pick = 0;
+                if (rank > 0) 
+                {
+                    num_dims_to_pick = dim_count_byte % (rank + 2); 
+                }
+                else 
+                {
+                    // For rank 0, dimensions list should usually be empty.
+                    // Randomly try to inject a dimension to test error handling.
+                    if (dim_count_byte % 5 == 0) num_dims_to_pick = 1;
+                }
+
+                dims.reserve(num_dims_to_pick);
+                for (size_t i = 0; i < num_dims_to_pick; ++i)
+                {
+                    if (offset >= Size) break;
+                    uint8_t dim_byte = Data[offset++];
+
+                    if (rank > 0)
+                    {
+                        // Convert byte to range [-rank, rank-1] to ensure valid indices
+                        // while also testing negative indexing.
+                        int64_t dim_val = (static_cast<int64_t>(dim_byte) % (rank * 2)) - rank;
+                        dims.push_back(dim_val);
+                    }
+                    else
+                    {
+                        // For rank 0, any integer is invalid, but we fuzz it anyway.
+                        dims.push_back(static_cast<int64_t>(dim_byte % 3)); 
+                    }
                 }
             }
-            
-            // Variant 6: Sum with out tensor
-            if (input.dim() > 0) {
-                try {
-                    auto out_options = torch::TensorOptions().dtype(input.dtype());
-                    torch::Tensor out = torch::empty({}, out_options);
-                    torch::sum_out(out, input);
-                } catch (...) {
-                    // Ignore errors for out tensor
-                }
-            }
-        } catch (const c10::Error &e) {
-            // PyTorch specific errors are expected and part of testing
-            // We don't want to discard these inputs
+
+            torch::sum(input, dims, keepdim, dtype);
         }
     }
     catch (const std::exception &e)
     {
-        std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        std::cout << "Exception caught: " << e.what() << std::endl;
+        return -1; 
     }
-    return 0; // keep the input
+    return 0;
 }

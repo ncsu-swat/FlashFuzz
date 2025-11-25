@@ -11,6 +11,7 @@ version = "0.1.0"
 python = "==3.12"
 anthropic = ">=0.66.0,<0.67"
 numpy = ">=2.3.2,<3"
+google-genai = ">=1.52.0,<2"
 
 [pypi-dependencies]
 torch = "==2.7.0"
