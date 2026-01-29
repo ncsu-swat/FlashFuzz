@@ -1,12 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <algorithm>      // For std::max
+#include <algorithm>      // For std::max, std::min
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -16,36 +20,54 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create the source tensor
-        torch::Tensor src = fuzzer_utils::createTensor(Data, Size, offset);
-        
         // Create the tensor to be modified (destination)
         torch::Tensor self = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create index tensor (must be 1D LongTensor)
-        torch::Tensor index;
-        try {
-            // Create a raw index tensor
-            torch::Tensor raw_index = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Convert to 1D LongTensor
-            if (raw_index.dim() == 0) {
-                // If scalar, convert to 1D tensor with one element
-                index = raw_index.reshape({1}).to(torch::kInt64);
-            } else {
-                // Flatten and convert to LongTensor
-                index = raw_index.flatten().to(torch::kInt64);
-            }
-        } catch (const std::exception&) {
-            // If index creation fails, create a simple index tensor
-            index = torch::tensor({0}, torch::kInt64);
+        // Ensure self has at least 1 dimension
+        if (self.dim() == 0) {
+            self = self.unsqueeze(0);
         }
         
         // Get a dimension to index along
         int64_t dim = 0;
         if (offset < Size && self.dim() > 0) {
-            dim = static_cast<int64_t>(Data[offset++]) % std::max(static_cast<int64_t>(1), static_cast<int64_t>(self.dim()));
+            dim = static_cast<int64_t>(Data[offset++]) % self.dim();
         }
+        
+        // Get the size along the dimension
+        int64_t dim_size = self.size(dim);
+        if (dim_size == 0) {
+            return 0; // Can't index into empty dimension
+        }
+        
+        // Determine number of indices (1 to min(dim_size, 10))
+        int64_t num_indices = 1;
+        if (offset < Size) {
+            num_indices = 1 + (static_cast<int64_t>(Data[offset++]) % std::min(dim_size, static_cast<int64_t>(10)));
+        }
+        
+        // Create valid index tensor with values in [0, dim_size)
+        std::vector<int64_t> index_values;
+        for (int64_t i = 0; i < num_indices && offset < Size; i++) {
+            int64_t idx = static_cast<int64_t>(Data[offset++]) % dim_size;
+            index_values.push_back(idx);
+        }
+        if (index_values.empty()) {
+            index_values.push_back(0);
+        }
+        torch::Tensor index = torch::tensor(index_values, torch::kInt64);
+        
+        // Create source tensor with compatible shape
+        // src shape must match self shape except at dim, where it equals index.size(0)
+        std::vector<int64_t> src_shape;
+        for (int64_t d = 0; d < self.dim(); d++) {
+            if (d == dim) {
+                src_shape.push_back(index.size(0));
+            } else {
+                src_shape.push_back(self.size(d));
+            }
+        }
+        torch::Tensor src = torch::randn(src_shape, self.options());
         
         // Try different variants of index_copy
         try {
@@ -70,28 +92,65 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Ignore exceptions from the operation
         }
         
-        // Try with negative dimension
+        // Try with negative dimension (equivalent to dim - self.dim())
         if (self.dim() > 0) {
             try {
-                int64_t neg_dim = -1;
+                int64_t neg_dim = dim - self.dim();
                 torch::Tensor result4 = self.index_copy(neg_dim, index, src);
             } catch (const std::exception&) {
                 // Ignore exceptions from the operation
             }
         }
         
-        // Try with out-of-bounds indices
+        // Try with different dtypes
         try {
-            torch::Tensor out_of_bounds_index = torch::tensor({-100, 100}, torch::kInt64);
-            torch::Tensor result5 = self.index_copy(dim, out_of_bounds_index, src);
+            torch::Tensor self_float = self.to(torch::kFloat32);
+            torch::Tensor src_float = src.to(torch::kFloat32);
+            torch::Tensor result5 = self_float.index_copy(dim, index, src_float);
         } catch (const std::exception&) {
             // Ignore exceptions from the operation
         }
         
-        // Try with empty index tensor
         try {
-            torch::Tensor empty_index = torch::tensor({}, torch::kInt64);
-            torch::Tensor result6 = self.index_copy(dim, empty_index, src);
+            torch::Tensor self_double = self.to(torch::kFloat64);
+            torch::Tensor src_double = src.to(torch::kFloat64);
+            torch::Tensor result6 = self_double.index_copy(dim, index, src_double);
+        } catch (const std::exception&) {
+            // Ignore exceptions from the operation
+        }
+        
+        // Try with empty index tensor (should result in no-op)
+        try {
+            torch::Tensor empty_index = torch::empty({0}, torch::kInt64);
+            // src must have 0 size along dim for empty index
+            std::vector<int64_t> empty_src_shape = src_shape;
+            empty_src_shape[dim] = 0;
+            torch::Tensor empty_src = torch::empty(empty_src_shape, self.options());
+            torch::Tensor result7 = self.index_copy(dim, empty_index, empty_src);
+        } catch (const std::exception&) {
+            // Ignore exceptions from the operation
+        }
+        
+        // Try with higher-dimensional tensors
+        try {
+            torch::Tensor self_3d = torch::randn({4, 5, 6});
+            int64_t test_dim = (offset < Size) ? (Data[offset++] % 3) : 0;
+            int64_t test_dim_size = self_3d.size(test_dim);
+            int64_t test_num_idx = 1 + ((offset < Size) ? (Data[offset++] % std::min(test_dim_size, static_cast<int64_t>(4))) : 0);
+            
+            std::vector<int64_t> test_idx_vals;
+            for (int64_t i = 0; i < test_num_idx; i++) {
+                test_idx_vals.push_back(i % test_dim_size);
+            }
+            torch::Tensor test_index = torch::tensor(test_idx_vals, torch::kInt64);
+            
+            std::vector<int64_t> test_src_shape;
+            for (int64_t d = 0; d < 3; d++) {
+                test_src_shape.push_back(d == test_dim ? test_num_idx : self_3d.size(d));
+            }
+            torch::Tensor test_src = torch::randn(test_src_shape);
+            
+            torch::Tensor result8 = self_3d.index_copy(test_dim, test_index, test_src);
         } catch (const std::exception&) {
             // Ignore exceptions from the operation
         }

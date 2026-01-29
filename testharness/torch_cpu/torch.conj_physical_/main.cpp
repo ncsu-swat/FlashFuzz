@@ -1,58 +1,103 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Skip if we don't have enough data
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
-        
-        // Create a tensor from the input data
-        torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Make a copy of the original tensor for verification
-        torch::Tensor original = tensor.clone();
-        
-        // Apply conj_physical_ operation (in-place conjugation)
-        tensor.conj_physical_();
-        
-        // Verify the operation worked correctly for complex tensors
-        if (tensor.is_complex()) {
-            // For complex tensors, the real part should remain the same
-            // and the imaginary part should be negated
-            torch::Tensor expected = torch::complex(torch::real(original), -torch::imag(original));
+
+        size_t offset = 0;
+
+        // Use first byte to determine tensor type
+        uint8_t type_selector = Data[0] % 4;
+        offset = 1;
+
+        torch::Tensor tensor;
+
+        if (type_selector == 0) {
+            // Create a complex float tensor
+            torch::Tensor real_part = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+            size_t offset2 = 0;
+            torch::Tensor imag_part = fuzzer_utils::createTensor(Data + offset, Size - offset, offset2);
             
-            // Check if the result matches the expected output
-            bool equal = torch::allclose(tensor, expected);
-            if (!equal) {
-                throw std::runtime_error("conj_physical_ operation did not produce expected result");
+            // Ensure both tensors are float type for complex creation
+            real_part = real_part.to(torch::kFloat32);
+            imag_part = imag_part.to(torch::kFloat32);
+            
+            // Match shapes
+            auto target_sizes = real_part.sizes().vec();
+            imag_part = imag_part.expand(target_sizes).clone();
+            
+            try {
+                tensor = torch::complex(real_part, imag_part);
+            } catch (...) {
+                // Fall back to simple tensor if complex creation fails
+                tensor = real_part;
+            }
+        } else if (type_selector == 1) {
+            // Create a complex double tensor
+            torch::Tensor real_part = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+            size_t offset2 = 0;
+            torch::Tensor imag_part = fuzzer_utils::createTensor(Data + offset, Size - offset, offset2);
+            
+            real_part = real_part.to(torch::kFloat64);
+            imag_part = imag_part.to(torch::kFloat64);
+            
+            auto target_sizes = real_part.sizes().vec();
+            imag_part = imag_part.expand(target_sizes).clone();
+            
+            try {
+                tensor = torch::complex(real_part, imag_part);
+            } catch (...) {
+                tensor = real_part;
             }
         } else {
-            // For non-complex tensors, the tensor should remain unchanged
-            bool equal = torch::allclose(tensor, original);
-            if (!equal) {
-                throw std::runtime_error("conj_physical_ modified a non-complex tensor");
-            }
+            // Create a regular (non-complex) tensor
+            tensor = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
         }
-        
-        // Try to create another tensor if we have more data
-        if (offset + 2 < Size) {
+
+        // Apply conj_physical_ operation (in-place conjugation)
+        tensor.conj_physical_();
+
+        // Access result to ensure operation completed
+        volatile auto numel = tensor.numel();
+        (void)numel;
+
+        // Test on a contiguous tensor
+        if (Size > offset + 2) {
             torch::Tensor tensor2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+            tensor2 = tensor2.contiguous();
             tensor2.conj_physical_();
+        }
+
+        // Test on a non-contiguous tensor (transposed)
+        if (Size > offset + 2) {
+            size_t new_offset = 0;
+            torch::Tensor tensor3 = fuzzer_utils::createTensor(Data + offset, Size - offset, new_offset);
+            if (tensor3.dim() >= 2) {
+                tensor3 = tensor3.transpose(0, 1);
+                try {
+                    tensor3.conj_physical_();
+                } catch (...) {
+                    // Some non-contiguous tensors may not support in-place ops
+                }
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

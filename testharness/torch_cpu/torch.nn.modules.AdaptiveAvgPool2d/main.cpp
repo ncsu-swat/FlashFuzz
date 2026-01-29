@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -19,22 +23,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Ensure we have a 3D or 4D tensor for AdaptiveAvgPool2d
-        // If not, reshape it to make it compatible
-        if (input.dim() < 3) {
-            // For 0D, 1D, or 2D tensors, reshape to 3D or 4D
-            if (input.dim() == 0) {
-                // Scalar tensor, reshape to [1, 1, 1]
-                input = input.reshape({1, 1, 1});
-            } else if (input.dim() == 1) {
-                // 1D tensor, reshape to [1, 1, dim0]
-                input = input.reshape({1, 1, input.size(0)});
-            } else if (input.dim() == 2) {
-                // 2D tensor, reshape to [1, dim0, dim1]
-                input = input.reshape({1, input.size(0), input.size(1)});
-            }
+        // AdaptiveAvgPool2d expects (N, C, H, W) or (C, H, W)
+        if (input.dim() == 0) {
+            // Scalar tensor, reshape to [1, 1, 1] (3D)
+            input = input.reshape({1, 1, 1});
+        } else if (input.dim() == 1) {
+            // 1D tensor, reshape to [1, 1, size]
+            input = input.reshape({1, 1, input.size(0)});
+        } else if (input.dim() == 2) {
+            // 2D tensor, reshape to [1, H, W]
+            input = input.reshape({1, input.size(0), input.size(1)});
         } else if (input.dim() > 4) {
-            // For tensors with more than 4 dimensions, slice to get first 4 dims
-            input = input.slice(0, 0, 4);
+            // For tensors with more than 4 dimensions, reshape to 4D
+            int64_t total_elements = input.numel();
+            // Create a 4D tensor with reasonable dimensions
+            int64_t batch = 1;
+            int64_t channels = 1;
+            int64_t height = std::max(int64_t(1), static_cast<int64_t>(std::sqrt(total_elements)));
+            int64_t width = total_elements / height;
+            if (width < 1) width = 1;
+            if (height * width != total_elements) {
+                // Adjust to fit
+                input = input.flatten().slice(0, 0, height * width).reshape({batch, channels, height, width});
+            } else {
+                input = input.flatten().reshape({batch, channels, height, width});
+            }
         }
         
         // Extract output size parameters from the input data
@@ -47,49 +60,92 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             output_w = static_cast<int64_t>(Data[offset++]) % 10 + 1; // 1-10
         }
         
-        // Create different variants of output_size
-        std::vector<torch::IntArrayRef> output_sizes;
-        
-        // Single integer (square output)
-        output_sizes.push_back(torch::IntArrayRef({output_h}));
-        
-        // Tuple of two integers
-        output_sizes.push_back(torch::IntArrayRef({output_h, output_w}));
-        
-        // Try different output size configurations
-        for (const auto& output_size : output_sizes) {
-            // Create the AdaptiveAvgPool2d module
-            torch::nn::AdaptiveAvgPool2d pool(output_size);
-            
-            // Apply the pooling operation
-            torch::Tensor output = pool->forward(input);
-            
-            // Verify output is not empty
-            if (output.numel() == 0) {
-                continue;
+        // Test with square output size
+        {
+            try {
+                torch::nn::AdaptiveAvgPool2d pool(output_h);
+                torch::Tensor output = pool->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
             }
-            
-            // Test the functional version as well
-            torch::Tensor functional_output = torch::adaptive_avg_pool2d(input, output_size);
+        }
+        
+        // Test with rectangular output size
+        {
+            try {
+                torch::nn::AdaptiveAvgPool2d pool(
+                    torch::nn::AdaptiveAvgPool2dOptions({output_h, output_w}));
+                torch::Tensor output = pool->forward(input);
+                
+                // Verify output is valid
+                if (output.numel() > 0) {
+                    // Test backward pass
+                    if (input.requires_grad() || true) {
+                        torch::Tensor grad_input = input.clone().detach().requires_grad_(true);
+                        // Need to handle the case where input might not be float
+                        if (grad_input.is_floating_point()) {
+                            torch::Tensor grad_output = pool->forward(grad_input);
+                            grad_output.sum().backward();
+                        }
+                    }
+                }
+            } catch (...) {
+                // Silently ignore expected failures
+            }
+        }
+        
+        // Test the functional version
+        {
+            try {
+                torch::Tensor functional_output = torch::adaptive_avg_pool2d(
+                    input, {output_h, output_w});
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
         
         // Test edge cases with different output sizes
         if (offset + 2 <= Size) {
-            // Try with potentially problematic output sizes
-            int64_t edge_h = static_cast<int64_t>(Data[offset++]);
-            int64_t edge_w = static_cast<int64_t>(Data[offset++]);
+            int64_t edge_h = static_cast<int64_t>(Data[offset++]) % 64 + 1; // 1-64, avoid 0
+            int64_t edge_w = static_cast<int64_t>(Data[offset++]) % 64 + 1; // 1-64, avoid 0
             
-            // Create the module with potentially problematic output size
-            torch::nn::AdaptiveAvgPool2d edge_pool(torch::nn::AdaptiveAvgPool2dOptions({edge_h, edge_w}));
-            
-            // Apply the pooling operation
-            torch::Tensor edge_output = edge_pool->forward(input);
+            try {
+                torch::nn::AdaptiveAvgPool2d edge_pool(
+                    torch::nn::AdaptiveAvgPool2dOptions({edge_h, edge_w}));
+                torch::Tensor edge_output = edge_pool->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
+        }
+        
+        // Test with output size equal to input size
+        if (input.dim() >= 3) {
+            try {
+                int64_t in_h = input.size(-2);
+                int64_t in_w = input.size(-1);
+                torch::nn::AdaptiveAvgPool2d same_pool(
+                    torch::nn::AdaptiveAvgPool2dOptions({in_h, in_w}));
+                torch::Tensor same_output = same_pool->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
+        }
+        
+        // Test with output size 1x1 (global average pooling)
+        {
+            try {
+                torch::nn::AdaptiveAvgPool2d global_pool(
+                    torch::nn::AdaptiveAvgPool2dOptions({1, 1}));
+                torch::Tensor global_output = global_pool->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <tuple>          // For std::get with result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -50,23 +56,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test edge case: zero probability
         if (offset < Size && (Data[offset++] & 0x1)) {
-            auto zero_p_result = torch::native_dropout(input, 0.0, train);
-            torch::Tensor zero_p_output = std::get<0>(zero_p_result);
-            torch::Tensor zero_p_mask = std::get<1>(zero_p_result);
+            try {
+                auto zero_p_result = torch::native_dropout(input, 0.0, train);
+                torch::Tensor zero_p_output = std::get<0>(zero_p_result);
+                torch::Tensor zero_p_mask = std::get<1>(zero_p_result);
+                (void)zero_p_output.sum();
+                (void)zero_p_mask.sum();
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
         
         // Test edge case: probability of 1
         if (offset < Size && (Data[offset++] & 0x1)) {
-            auto one_p_result = torch::native_dropout(input, 1.0, train);
-            torch::Tensor one_p_output = std::get<0>(one_p_result);
-            torch::Tensor one_p_mask = std::get<1>(one_p_result);
+            try {
+                auto one_p_result = torch::native_dropout(input, 1.0, train);
+                torch::Tensor one_p_output = std::get<0>(one_p_result);
+                torch::Tensor one_p_mask = std::get<1>(one_p_result);
+                (void)one_p_output.sum();
+                (void)one_p_mask.sum();
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
         
         // Test with train=false
         if (offset < Size && (Data[offset++] & 0x1)) {
-            auto no_train_result = torch::native_dropout(input, p, false);
-            torch::Tensor no_train_output = std::get<0>(no_train_result);
-            torch::Tensor no_train_mask = std::get<1>(no_train_result);
+            try {
+                auto no_train_result = torch::native_dropout(input, p, false);
+                torch::Tensor no_train_output = std::get<0>(no_train_result);
+                torch::Tensor no_train_mask = std::get<1>(no_train_result);
+                (void)no_train_output.sum();
+                (void)no_train_mask.sum();
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
     }
     catch (const std::exception &e)

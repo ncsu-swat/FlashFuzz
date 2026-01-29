@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <cmath>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -33,6 +39,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 offset += sizeof(double);
             }
             
+            // Sanitize scalar to avoid NaN/Inf issues
+            if (!std::isfinite(scalar_value)) {
+                scalar_value = 1.0;
+            }
+            
             // Test torch::sub with scalar
             torch::Tensor result1 = torch::sub(tensor1, scalar_value);
             
@@ -42,6 +53,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Test in-place subtraction with scalar
             torch::Tensor tensor_copy = tensor1.clone();
             tensor_copy.sub_(scalar_value);
+            
+            // Test with alpha parameter for scalar
+            double alpha = 1.0;
+            if (offset + sizeof(double) <= Size) {
+                std::memcpy(&alpha, Data + offset, sizeof(double));
+                offset += sizeof(double);
+            }
+            if (!std::isfinite(alpha)) {
+                alpha = 2.0;
+            }
+            
+            torch::Tensor result3 = torch::sub(tensor1, scalar_value, alpha);
+            torch::Tensor tensor_copy2 = tensor1.clone();
+            tensor_copy2.sub_(scalar_value, alpha);
+            
         } else {
             // Create second tensor for tensor-tensor subtraction
             torch::Tensor tensor2;
@@ -50,6 +76,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             } else {
                 // If we don't have enough data, create a simple tensor
                 tensor2 = torch::ones_like(tensor1);
+            }
+            
+            // Read alpha parameter before try block
+            double alpha = 1.0;
+            if (offset + sizeof(double) <= Size) {
+                std::memcpy(&alpha, Data + offset, sizeof(double));
+                offset += sizeof(double);
+            }
+            if (!std::isfinite(alpha)) {
+                alpha = 2.0;
             }
             
             // Test different variants of sub operation
@@ -64,13 +100,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 torch::Tensor tensor_copy = tensor1.clone();
                 tensor_copy.sub_(tensor2);
                 
-                // Test with alpha parameter
-                double alpha = 1.0;
-                if (offset + sizeof(double) <= Size) {
-                    std::memcpy(&alpha, Data + offset, sizeof(double));
-                    offset += sizeof(double);
-                }
-                
                 // Test torch::sub with alpha
                 torch::Tensor result3 = torch::sub(tensor1, tensor2, alpha);
                 
@@ -82,14 +111,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 tensor_copy2.sub_(tensor2, alpha);
             } catch (const c10::Error& e) {
                 // PyTorch specific errors are expected for incompatible shapes
-                return 0;
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

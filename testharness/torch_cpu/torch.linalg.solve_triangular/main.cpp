@@ -1,150 +1,147 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
-        
-        // Create coefficient matrix A (must be triangular)
+
+        size_t offset = 0;
+
+        // Extract boolean parameters first
+        bool upper = Data[offset++] & 0x1;
+        bool transpose = Data[offset++] & 0x1;
+        bool unitriangular = Data[offset++] & 0x1;
+
+        // Create coefficient matrix A
         torch::Tensor A = fuzzer_utils::createTensor(Data, Size, offset);
         
+        if (offset >= Size) {
+            return 0;
+        }
+
         // Create right-hand side matrix B
-        if (offset < Size) {
-            torch::Tensor B = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Extract parameters for solve_triangular from the input data
-            bool upper = true;
-            bool transpose = false;
-            bool unitriangular = false;
-            
-            if (offset < Size) {
-                upper = Data[offset++] & 0x1;
+        torch::Tensor B = fuzzer_utils::createTensor(Data, Size, offset);
+
+        // Ensure A is at least 2D
+        if (A.dim() < 2) {
+            A = A.view({1, 1});
+        }
+
+        // Make A square in the last two dimensions
+        int64_t n = std::min(A.size(-1), A.size(-2));
+        if (n == 0) {
+            n = 1;
+            std::vector<int64_t> new_shape(A.dim(), 1);
+            A = torch::ones(new_shape, A.options());
+        } else if (A.size(-1) != A.size(-2)) {
+            A = A.narrow(-1, 0, n).narrow(-2, 0, n);
+        }
+
+        // Make A triangular using triu or tril
+        if (upper) {
+            A = torch::triu(A);
+        } else {
+            A = torch::tril(A);
+        }
+
+        // Add small values to diagonal to avoid singular matrix
+        // (unless unitriangular, which assumes 1s on diagonal)
+        if (!unitriangular) {
+            torch::Tensor diag_add = torch::eye(n, A.options()) * 0.1;
+            // Broadcast to match batch dimensions if needed
+            if (A.dim() > 2) {
+                diag_add = diag_add.expand(A.sizes()).clone();
             }
-            
-            if (offset < Size) {
-                transpose = Data[offset++] & 0x1;
+            A = A + diag_add;
+        }
+
+        // Ensure B has at least 2 dimensions
+        if (B.dim() < 2) {
+            if (B.dim() == 0) {
+                B = B.view({1, 1});
+            } else {
+                B = B.unsqueeze(-1);
             }
-            
-            if (offset < Size) {
-                unitriangular = Data[offset++] & 0x1;
-            }
-            
-            // Make sure A has at least 2 dimensions to be a valid matrix
-            if (A.dim() < 2) {
-                if (A.dim() == 0) {
-                    A = A.unsqueeze(0).unsqueeze(0);
-                } else {
-                    A = A.unsqueeze(0);
+        }
+
+        // triangular_solve solves A @ X = B
+        // B should be (..., n, k) where n matches A's size
+        if (B.size(-2) != n) {
+            // Adjust B's size to match A
+            if (B.size(-2) > n) {
+                B = B.narrow(-2, 0, n);
+            } else {
+                // Create new B with correct size
+                int64_t k = B.size(-1);
+                if (k == 0) k = 1;
+                std::vector<int64_t> new_shape;
+                for (int64_t i = 0; i < B.dim() - 2; i++) {
+                    new_shape.push_back(B.size(i));
                 }
+                new_shape.push_back(n);
+                new_shape.push_back(k);
+                B = torch::zeros(new_shape, B.options());
             }
-            
-            // Make A square in the last two dimensions
-            if (A.size(-1) != A.size(-2)) {
-                int64_t min_dim = std::min(A.size(-1), A.size(-2));
-                if (min_dim > 0) {
-                    A = A.slice(-1, 0, min_dim).slice(-2, 0, min_dim);
-                } else {
-                    // If either dimension is 0, reshape to a 1x1 matrix
-                    std::vector<int64_t> new_shape(A.dim(), 1);
-                    A = A.reshape(new_shape);
-                }
+        }
+
+        // Ensure k dimension is at least 1
+        if (B.size(-1) == 0) {
+            std::vector<int64_t> new_shape = B.sizes().vec();
+            new_shape[B.dim() - 1] = 1;
+            B = torch::zeros(new_shape, B.options());
+        }
+
+        // Convert to float if needed (linalg operations typically need float)
+        if (!A.is_floating_point()) {
+            A = A.to(torch::kFloat32);
+        }
+        if (!B.is_floating_point()) {
+            B = B.to(torch::kFloat32);
+        }
+
+        // Ensure same dtype
+        if (A.dtype() != B.dtype()) {
+            B = B.to(A.dtype());
+        }
+
+        // Ensure contiguous tensors
+        A = A.contiguous();
+        B = B.contiguous();
+
+        try {
+            // Call torch::triangular_solve
+            // Returns tuple of (solution, cloned_coefficient)
+            // Parameters: B, A, upper, transpose, unitriangular
+            auto result = torch::triangular_solve(B, A, upper, transpose, unitriangular);
+            torch::Tensor X = std::get<0>(result);
+
+            // Basic validation - check result has expected shape
+            if (X.numel() > 0) {
+                // Force computation
+                auto sum = X.sum();
+                (void)sum;
             }
-            
-            // Make sure B has compatible dimensions with A
-            if (B.dim() < 1) {
-                B = B.unsqueeze(0);
-            }
-            
-            // Ensure B's last dimension matches A's last dimension
-            if (B.dim() >= 1 && A.dim() >= 2) {
-                if (B.size(-1) != A.size(-1)) {
-                    if (A.size(-1) > 0) {
-                        if (B.size(-1) > 0) {
-                            B = B.slice(-1, 0, std::min(B.size(-1), A.size(-1)));
-                        } else {
-                            // If B's last dimension is 0, reshape it
-                            std::vector<int64_t> new_shape = B.sizes().vec();
-                            new_shape.back() = A.size(-1);
-                            B = torch::zeros(new_shape, B.options());
-                        }
-                    } else {
-                        // If A's last dimension is 0, reshape B
-                        std::vector<int64_t> new_shape = B.sizes().vec();
-                        new_shape.back() = 0;
-                        B = torch::zeros(new_shape, B.options());
-                    }
-                }
-            }
-            
-            // Make A triangular by zeroing out appropriate elements
-            if (A.numel() > 0) {
-                auto A_clone = A.clone();
-                for (int64_t i = 0; i < A.size(-2); i++) {
-                    for (int64_t j = 0; j < A.size(-1); j++) {
-                        if ((upper && i > j) || (!upper && i < j)) {
-                            // Zero out elements below/above diagonal based on 'upper'
-                            if (A.dim() == 2) {
-                                A_clone.index_put_({i, j}, 0);
-                            } else if (A.dim() == 3) {
-                                for (int64_t k = 0; k < A.size(0); k++) {
-                                    A_clone.index_put_({k, i, j}, 0);
-                                }
-                            } else if (A.dim() == 4) {
-                                for (int64_t k = 0; k < A.size(0); k++) {
-                                    for (int64_t l = 0; l < A.size(1); l++) {
-                                        A_clone.index_put_({k, l, i, j}, 0);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                A = A_clone;
-            }
-            
-            // Try to solve the triangular system
-            try {
-                torch::Tensor X = torch::triangular_solve(B, A, upper, transpose, unitriangular).solution;
-                
-                // Verify the solution if possible
-                if (X.numel() > 0 && A.numel() > 0 && !X.isnan().any().item<bool>() && !X.isinf().any().item<bool>()) {
-                    // Compute A * X or A^T * X based on transpose flag
-                    torch::Tensor A_to_use = transpose ? A.transpose(-2, -1) : A;
-                    
-                    // Compute the residual: A * X - B
-                    torch::Tensor residual = torch::matmul(A_to_use, X) - B;
-                    
-                    // Check if the residual is small (solution is accurate)
-                    double residual_norm = residual.norm().item<double>();
-                    double b_norm = B.norm().item<double>();
-                    
-                    // Relative error check (avoid division by zero)
-                    if (b_norm > 1e-10) {
-                        double rel_error = residual_norm / b_norm;
-                        if (rel_error > 1.0) {
-                            // Large error might indicate numerical issues
-                        }
-                    }
-                }
-            } catch (const c10::Error& e) {
-                // PyTorch specific errors are expected for invalid inputs
-            }
+        } catch (const c10::Error& e) {
+            // Expected for invalid inputs (singular matrices, etc.)
+        } catch (const std::runtime_error& e) {
+            // Expected for shape mismatches or other runtime issues
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

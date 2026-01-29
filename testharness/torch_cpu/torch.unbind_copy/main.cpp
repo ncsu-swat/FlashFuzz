@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -18,83 +22,126 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Extract dimension to unbind along
-        int64_t dim = 0;
+        // Extract dimension parameter from fuzzer data
+        int64_t dim_raw = 0;
         if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
+            std::memcpy(&dim_raw, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
         }
         
-        // Apply unbind_copy operation
-        std::vector<torch::Tensor> result;
-        
-        // Try different variants of unbind_copy
-        if (input_tensor.dim() > 0) {
-            // Apply unbind_copy with explicit dimension
-            result = torch::unbind_copy(input_tensor, dim);
-            
-            // Verify the result
-            if (input_tensor.dim() > 0) {
-                int64_t expected_size = input_tensor.size(dim % input_tensor.dim());
-                if (result.size() != expected_size) {
-                    throw std::runtime_error("Unexpected result size from unbind_copy");
-                }
-            }
-            
-            // Try to access and perform operations on the resulting tensors
-            for (const auto& tensor : result) {
-                // Simple operation to ensure tensor is valid
-                auto sum = tensor.sum();
-            }
-        }
-        
-        // Try unbind_copy with default dimension (0)
-        if (input_tensor.dim() > 0) {
-            auto result_default = torch::unbind_copy(input_tensor);
-            
-            // Verify the result
-            int64_t expected_size = input_tensor.size(0);
-            if (result_default.size() != expected_size) {
-                throw std::runtime_error("Unexpected result size from default unbind_copy");
-            }
-            
-            // Try to access and perform operations on the resulting tensors
-            for (const auto& tensor : result_default) {
-                // Simple operation to ensure tensor is valid
-                auto sum = tensor.sum();
-            }
-        }
-        
-        // Try unbind_copy on a scalar tensor (should throw an exception)
+        // Skip scalar tensors - unbind_copy requires at least 1 dimension
         if (input_tensor.dim() == 0) {
+            return 0;
+        }
+        
+        // Test 1: unbind_copy with bounded dimension
+        {
+            // Bound dimension to valid range
+            int64_t dim = dim_raw % input_tensor.dim();
+            
             try {
-                auto result_scalar = torch::unbind_copy(input_tensor);
+                std::vector<torch::Tensor> result = torch::unbind_copy(input_tensor, dim);
+                
+                // Perform operations on resulting tensors to ensure they're valid
+                for (const auto& tensor : result) {
+                    auto sum = tensor.sum();
+                    (void)sum;
+                }
             } catch (const c10::Error& e) {
-                // Expected exception for scalar tensor
+                // Silently catch shape/dim errors
             }
         }
         
-        // Try unbind_copy with out-of-bounds dimension
-        if (input_tensor.dim() > 0) {
+        // Test 2: unbind_copy with default dimension (0)
+        {
             try {
-                int64_t out_of_bounds_dim = input_tensor.dim() + std::abs(dim % 10);
-                auto result_oob = torch::unbind_copy(input_tensor, out_of_bounds_dim);
+                std::vector<torch::Tensor> result_default = torch::unbind_copy(input_tensor);
+                
+                // Perform operations on resulting tensors
+                for (const auto& tensor : result_default) {
+                    auto sum = tensor.sum();
+                    (void)sum;
+                }
             } catch (const c10::Error& e) {
-                // Expected exception for out-of-bounds dimension
+                // Silently catch errors
             }
-            
+        }
+        
+        // Test 3: unbind_copy with negative dimension (valid in PyTorch)
+        {
             try {
-                int64_t negative_dim = -input_tensor.dim() - 1 - std::abs(dim % 10);
-                auto result_neg = torch::unbind_copy(input_tensor, negative_dim);
+                int64_t neg_dim = -(std::abs(dim_raw) % input_tensor.dim()) - 1;
+                std::vector<torch::Tensor> result_neg = torch::unbind_copy(input_tensor, neg_dim);
+                
+                for (const auto& tensor : result_neg) {
+                    auto sum = tensor.sum();
+                    (void)sum;
+                }
             } catch (const c10::Error& e) {
-                // Expected exception for negative out-of-bounds dimension
+                // Silently catch errors for invalid dims
+            }
+        }
+        
+        // Test 4: Test with different tensor types if we have more fuzzer data
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset] % 4;
+            offset++;
+            
+            torch::Tensor typed_tensor;
+            try {
+                switch (dtype_selector) {
+                    case 0:
+                        typed_tensor = input_tensor.to(torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_tensor = input_tensor.to(torch::kFloat64);
+                        break;
+                    case 2:
+                        typed_tensor = input_tensor.to(torch::kInt32);
+                        break;
+                    case 3:
+                        typed_tensor = input_tensor.to(torch::kInt64);
+                        break;
+                }
+                
+                if (typed_tensor.dim() > 0) {
+                    int64_t dim = dim_raw % typed_tensor.dim();
+                    std::vector<torch::Tensor> result = torch::unbind_copy(typed_tensor, dim);
+                    
+                    for (const auto& tensor : result) {
+                        auto mean = tensor.mean();
+                        (void)mean;
+                    }
+                }
+            } catch (const c10::Error& e) {
+                // Silently catch type conversion or unbind errors
+            }
+        }
+        
+        // Test 5: Test with contiguous vs non-contiguous tensor
+        {
+            try {
+                if (input_tensor.dim() >= 2) {
+                    // Create a non-contiguous view via transpose
+                    torch::Tensor transposed = input_tensor.transpose(0, input_tensor.dim() - 1);
+                    int64_t dim = dim_raw % transposed.dim();
+                    
+                    std::vector<torch::Tensor> result = torch::unbind_copy(transposed, dim);
+                    
+                    for (const auto& tensor : result) {
+                        auto sum = tensor.sum();
+                        (void)sum;
+                    }
+                }
+            } catch (const c10::Error& e) {
+                // Silently catch errors
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

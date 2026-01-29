@@ -1,88 +1,143 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
+#include <limits>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Skip if we don't have enough data
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create SiLU module
-        torch::nn::SiLU silu_module;
-        
-        // Apply SiLU operation
-        torch::Tensor output = silu_module->forward(input);
-        
-        // Alternative way to apply SiLU using functional API
-        torch::Tensor output_functional = torch::nn::functional::silu(input);
-        
-        // Try inplace version if available
-        if (input.is_floating_point() && input.requires_grad() == false) {
-            torch::Tensor input_copy = input.clone();
-            torch::nn::functional::silu(input_copy, torch::nn::functional::SiLUFuncOptions().inplace(true));
+        // SiLU requires floating point tensor
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
         }
         
-        // Test with different configurations
+        // Create SiLU module and apply it
+        torch::nn::SiLU silu_module;
+        torch::Tensor output = silu_module(input);
+        
+        // Test functional API
+        torch::Tensor output_functional = torch::silu(input);
+        
+        // Test inplace version on a clone (must not require grad)
+        try {
+            torch::Tensor input_clone = input.clone().detach();
+            torch::silu_(input_clone);
+        } catch (...) {
+            // Silently ignore inplace failures
+        }
+        
+        // Test with different tensor shapes
         if (offset + 1 < Size) {
-            bool inplace = Data[offset++] % 2 == 0;
+            uint8_t shape_type = Data[offset++] % 4;
+            torch::Tensor shaped_input;
             
-            // Create another SiLU module
-            torch::nn::SiLU silu_with_options;
-            
-            // Apply the module
-            torch::Tensor result;
-            if (inplace && input.is_floating_point() && !input.requires_grad()) {
-                result = silu_with_options->forward(input.clone());
-            } else {
-                result = silu_with_options->forward(input);
+            try {
+                if (shape_type == 0) {
+                    // Scalar
+                    shaped_input = torch::tensor(1.5f);
+                } else if (shape_type == 1) {
+                    // 1D tensor
+                    shaped_input = torch::randn({8});
+                } else if (shape_type == 2) {
+                    // 2D tensor
+                    shaped_input = torch::randn({4, 4});
+                } else {
+                    // 3D tensor
+                    shaped_input = torch::randn({2, 3, 4});
+                }
+                
+                torch::nn::SiLU silu_shaped;
+                silu_shaped(shaped_input);
+            } catch (...) {
+                // Silently ignore shape-related failures
             }
         }
         
-        // Test with edge cases if we have enough data
+        // Test with edge cases
         if (offset + 1 < Size) {
-            // Create a tensor with extreme values
+            uint8_t extreme_type = Data[offset++] % 5;
             torch::Tensor extreme_input;
             
-            uint8_t extreme_type = Data[offset++] % 3;
-            if (extreme_type == 0 && input.is_floating_point()) {
-                // Very large values
-                extreme_input = torch::full_like(input, 1e38);
-            } else if (extreme_type == 1 && input.is_floating_point()) {
-                // Very small values
-                extreme_input = torch::full_like(input, -1e38);
-            } else {
-                // NaN and Inf values for floating point tensors
-                if (input.is_floating_point()) {
-                    extreme_input = torch::full_like(input, std::numeric_limits<float>::quiet_NaN());
-                    torch::Tensor inf_input = torch::full_like(input, std::numeric_limits<float>::infinity());
-                    torch::nn::SiLU silu_temp;
-                    silu_temp->forward(inf_input);
-                } else {
-                    // For non-floating point, use the original input
-                    extreme_input = input;
+            try {
+                auto sizes = input.sizes().vec();
+                if (sizes.empty()) {
+                    sizes = {1};
                 }
+                
+                if (extreme_type == 0) {
+                    // Very large positive values
+                    extreme_input = torch::full(sizes, 100.0f);
+                } else if (extreme_type == 1) {
+                    // Very large negative values
+                    extreme_input = torch::full(sizes, -100.0f);
+                } else if (extreme_type == 2) {
+                    // Values near zero
+                    extreme_input = torch::full(sizes, 1e-7f);
+                } else if (extreme_type == 3) {
+                    // NaN values
+                    extreme_input = torch::full(sizes, std::numeric_limits<float>::quiet_NaN());
+                } else {
+                    // Infinity values
+                    extreme_input = torch::full(sizes, std::numeric_limits<float>::infinity());
+                }
+                
+                torch::nn::SiLU silu_extreme;
+                silu_extreme(extreme_input);
+            } catch (...) {
+                // Silently ignore extreme value failures
             }
-            
-            // Apply SiLU to extreme values
-            torch::nn::SiLU silu_extreme;
-            silu_extreme->forward(extreme_input);
+        }
+        
+        // Test with requires_grad = true
+        if (offset + 1 < Size && Data[offset++] % 2 == 0) {
+            try {
+                torch::Tensor grad_input = input.clone().detach().requires_grad_(true);
+                torch::nn::SiLU silu_grad;
+                torch::Tensor grad_output = silu_grad(grad_input);
+                
+                // Trigger backward pass
+                if (grad_output.numel() > 0) {
+                    torch::Tensor grad_tensor = torch::ones_like(grad_output);
+                    grad_output.backward(grad_tensor);
+                }
+            } catch (...) {
+                // Silently ignore gradient-related failures
+            }
+        }
+        
+        // Test double precision
+        if (offset + 1 < Size && Data[offset++] % 3 == 0) {
+            try {
+                torch::Tensor double_input = input.to(torch::kFloat64);
+                torch::nn::SiLU silu_double;
+                silu_double(double_input);
+            } catch (...) {
+                // Silently ignore dtype conversion failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

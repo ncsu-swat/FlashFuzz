@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -26,39 +31,43 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Find a suitable square dimension
             int64_t square_dim = 1;
             if (total_elements > 0) {
-                square_dim = static_cast<int64_t>(std::sqrt(total_elements));
+                square_dim = static_cast<int64_t>(std::sqrt(static_cast<double>(total_elements)));
                 if (square_dim * square_dim > total_elements) {
                     square_dim -= 1;
                 }
+                if (square_dim < 1) {
+                    square_dim = 1;
+                }
             }
             
-            // Reshape to square matrix if possible, otherwise create a small square matrix
-            if (square_dim > 0) {
-                input_tensor = input_tensor.reshape({square_dim, square_dim});
-            } else {
-                // Create a small identity matrix as fallback
-                input_tensor = torch::eye(2, input_tensor.options());
-            }
+            // Flatten and take only what we need for square matrix
+            input_tensor = input_tensor.flatten().slice(0, 0, square_dim * square_dim);
+            input_tensor = input_tensor.reshape({square_dim, square_dim});
         }
         
-        // Convert to float or complex type if needed for inverse operation
+        // Convert to float type if needed for inverse operation
         if (!input_tensor.is_floating_point() && !input_tensor.is_complex()) {
             input_tensor = input_tensor.to(torch::kFloat);
         }
         
-        // Try to make the matrix invertible by adding a small value to the diagonal
-        // This is just to increase the chances of getting an invertible matrix
+        // Try to make the matrix more likely to be invertible by adding a small value to the diagonal
+        // This is done by adding epsilon * identity matrix
         if (offset < Size) {
-            float diag_add = static_cast<float>(Data[offset % Size]) / 255.0f;
-            torch::Tensor diag = torch::diag(torch::ones_like(input_tensor.diag())) * diag_add;
-            input_tensor = input_tensor + diag;
+            float epsilon = 0.01f + static_cast<float>(Data[offset % Size]) / 255.0f;
+            torch::Tensor identity = torch::eye(input_tensor.size(0), input_tensor.options());
+            input_tensor = input_tensor + identity * epsilon;
         }
         
         // Apply the inverse operation
         torch::Tensor result;
-        result = torch::inverse(input_tensor);
+        try {
+            result = torch::inverse(input_tensor);
+        } catch (const std::exception &) {
+            // Matrix may be singular, which is expected for some inputs
+            return 0;
+        }
         
-        // Optional: verify the inverse by multiplying with original
+        // Verify the inverse by multiplying with original
         if (result.numel() > 0 && input_tensor.numel() > 0) {
             torch::Tensor identity_check = torch::matmul(input_tensor, result);
             
@@ -69,6 +78,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
+        // Also test batched inverse if we have enough data
+        if (Size > 16 && offset < Size - 4) {
+            int64_t batch_size = 1 + (Data[offset % Size] % 3);  // 1-3 batches
+            int64_t mat_size = input_tensor.size(0);
+            
+            // Create batched input
+            torch::Tensor batched_input = input_tensor.unsqueeze(0).expand({batch_size, mat_size, mat_size}).clone();
+            
+            try {
+                torch::Tensor batched_result = torch::inverse(batched_input);
+                volatile float batch_sum = batched_result.sum().item<float>();
+                (void)batch_sum;
+            } catch (const std::exception &) {
+                // Batched inverse may fail, which is fine
+            }
+        }
+        
         return 0;
     }
     catch (const std::exception &e)
@@ -76,5 +102,4 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         std::cerr << "Exception caught: " << e.what() << std::endl;
         return -1; // discard the input
     }
-    return 0; // keep the input
 }

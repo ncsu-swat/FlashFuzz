@@ -1,116 +1,146 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Extract parameters for Linear module
-        int64_t in_features = 0;
-        int64_t out_features = 0;
-        bool bias = false;
+        // Extract parameters for Linear module from fuzz data
+        int64_t in_features = (Data[offset++] % 32) + 1;  // 1-32
+        int64_t out_features = (Data[offset++] % 32) + 1; // 1-32
+        bool use_bias = Data[offset++] & 0x1;
+        int64_t batch_size = (Data[offset++] % 8) + 1;    // 1-8
         
-        // Determine in_features from input tensor
-        if (input.dim() >= 2) {
-            in_features = input.size(-1);
-        } else if (input.dim() == 1) {
-            in_features = input.size(0);
-        } else {
-            // For scalar tensors, use a default value
-            in_features = 4;
-        }
+        // Create Linear module (standard Linear - QAT modules not in C++ frontend)
+        torch::nn::Linear linear(torch::nn::LinearOptions(in_features, out_features).bias(use_bias));
         
-        // Get out_features from remaining data
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&out_features, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Make sure out_features is reasonable
-            out_features = std::abs(out_features) % 32 + 1;
-        } else {
-            out_features = 4; // Default value
-        }
+        // Create properly shaped input tensor
+        torch::Tensor input = torch::randn({batch_size, in_features});
         
-        // Determine if bias should be used
+        // Use remaining fuzz data to perturb the input
         if (offset < Size) {
-            bias = Data[offset++] & 0x1;
-        }
-        
-        // Create Linear module (QAT modules are not directly available in C++ frontend)
-        torch::nn::Linear linear(torch::nn::LinearOptions(in_features, out_features).bias(bias));
-        
-        // Reshape input if needed to match expected input shape for linear layer
-        if (input.dim() == 0) {
-            // Scalar tensor needs to be reshaped to at least 1D
-            input = input.reshape({1, in_features});
-        } else if (input.dim() == 1) {
-            // 1D tensor needs to be reshaped to 2D for linear layer
-            input = input.reshape({1, input.size(0)});
-        } else if (input.dim() > 2) {
-            // For tensors with more than 2 dimensions, keep the batch dimensions
-            // and reshape the last dimension to match in_features
-            std::vector<int64_t> new_shape(input.dim());
-            for (int i = 0; i < input.dim() - 1; i++) {
-                new_shape[i] = input.size(i);
+            torch::Tensor fuzz_input = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+            
+            // Try to use fuzz tensor if compatible
+            try {
+                if (fuzz_input.numel() > 0) {
+                    fuzz_input = fuzz_input.to(torch::kFloat).flatten();
+                    int64_t needed = batch_size * in_features;
+                    if (fuzz_input.numel() >= needed) {
+                        input = fuzz_input.slice(0, 0, needed).reshape({batch_size, in_features});
+                    } else if (fuzz_input.numel() > 0) {
+                        // Pad with zeros
+                        torch::Tensor padded = torch::zeros({needed});
+                        padded.slice(0, 0, fuzz_input.numel()).copy_(fuzz_input);
+                        input = padded.reshape({batch_size, in_features});
+                    }
+                }
+            } catch (...) {
+                // Silently ignore reshape failures, use random input
             }
-            new_shape[input.dim() - 1] = in_features;
-            input = input.reshape(new_shape);
-        }
-        
-        // Convert input to float if needed
-        if (input.scalar_type() != torch::kFloat) {
-            input = input.to(torch::kFloat);
         }
         
         // Forward pass through the Linear module
         torch::Tensor output = linear->forward(input);
         
-        // Test with different training modes
+        // Test training mode
         linear->train();
         torch::Tensor output_train = linear->forward(input);
         
+        // Test eval mode
         linear->eval();
         torch::Tensor output_eval = linear->forward(input);
         
-        // Test quantization simulation using fake quantization
-        if (offset + 2*sizeof(float) <= Size) {
-            float scale1, scale2;
-            std::memcpy(&scale1, Data + offset, sizeof(float));
-            offset += sizeof(float);
-            std::memcpy(&scale2, Data + offset, sizeof(float));
-            offset += sizeof(float);
+        // Simulate QAT by applying fake quantization to weights
+        // This is the closest C++ approximation to torch.nn.qat.Linear
+        if (Size > 8) {
+            // Get scale and zero_point from fuzz data
+            uint8_t scale_byte = Data[4];
+            int8_t zero_point_byte = static_cast<int8_t>(Data[5]);
             
-            // Ensure scales are positive and reasonable
-            scale1 = std::abs(scale1) + 1e-5;
-            scale2 = std::abs(scale2) + 1e-5;
+            float scale = (static_cast<float>(scale_byte) / 255.0f) * 0.1f + 0.001f; // 0.001-0.101
+            int64_t zero_point = zero_point_byte % 128; // Keep in valid range
             
-            // Simulate quantization by applying fake quantization
-            torch::Tensor quantized_weight = torch::fake_quantize_per_tensor_affine(
-                linear->weight, scale1, 0, -128, 127);
-            
-            // Forward pass with simulated quantized weights
-            torch::Tensor output_quantized = torch::nn::functional::linear(
-                input, quantized_weight, linear->bias);
+            try {
+                // Fake quantize weights (simulates QAT weight quantization)
+                torch::Tensor quantized_weight = torch::fake_quantize_per_tensor_affine(
+                    linear->weight, scale, zero_point, -128, 127);
+                
+                // Forward pass with fake-quantized weights
+                torch::Tensor output_qat;
+                if (use_bias) {
+                    output_qat = torch::nn::functional::linear(input, quantized_weight, linear->bias);
+                } else {
+                    output_qat = torch::nn::functional::linear(input, quantized_weight);
+                }
+                
+                // Also test per-channel fake quantization (more common in QAT)
+                torch::Tensor scales = torch::ones({out_features}) * scale;
+                torch::Tensor zero_points = torch::zeros({out_features}, torch::kLong);
+                
+                torch::Tensor quantized_weight_per_channel = torch::fake_quantize_per_channel_affine(
+                    linear->weight, scales, zero_points, 0, -128, 127);
+                
+                torch::Tensor output_qat_per_channel;
+                if (use_bias) {
+                    output_qat_per_channel = torch::nn::functional::linear(
+                        input, quantized_weight_per_channel, linear->bias);
+                } else {
+                    output_qat_per_channel = torch::nn::functional::linear(
+                        input, quantized_weight_per_channel);
+                }
+            } catch (...) {
+                // Silently ignore quantization failures (can happen with edge case values)
+            }
         }
+        
+        // Test input fake quantization (simulates activation quantization in QAT)
+        try {
+            float input_scale = 0.01f;
+            int64_t input_zp = 0;
+            
+            torch::Tensor quantized_input = torch::fake_quantize_per_tensor_affine(
+                input, input_scale, input_zp, -128, 127);
+            
+            torch::Tensor output_with_quant_input = linear->forward(quantized_input);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Test with multi-dimensional input (Linear supports arbitrary batch dims)
+        try {
+            int64_t extra_dim = (Data[0] % 4) + 1;
+            torch::Tensor input_3d = torch::randn({extra_dim, batch_size, in_features});
+            torch::Tensor output_3d = linear->forward(input_3d);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Access module parameters (common operation during QAT training)
+        for (const auto& param : linear->parameters()) {
+            auto grad = torch::zeros_like(param);
+        }
+        
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

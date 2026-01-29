@@ -7,7 +7,12 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -16,7 +21,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Target API: torch.FloatStorage
+        // Target API: torch::Storage (C++ equivalent of torch.FloatStorage)
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         if (tensor.dtype() != torch::kFloat) {
             tensor = tensor.to(torch::kFloat);

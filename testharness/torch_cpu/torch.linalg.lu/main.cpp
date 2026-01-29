@@ -1,108 +1,146 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes to create a tensor
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor for torch.linalg.lu
         torch::Tensor A = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Ensure tensor is floating point (LU requires float/double/complex)
+        if (!A.is_floating_point() && !A.is_complex()) {
+            A = A.to(torch::kFloat32);
+        }
+        
         // Ensure tensor has at least 2 dimensions for LU decomposition
-        // If not, reshape it to a square matrix
         if (A.dim() < 2) {
             int64_t size = A.numel();
-            int64_t dim = std::max(static_cast<int64_t>(1), static_cast<int64_t>(std::sqrt(size)));
-            
-            // Pad with zeros if needed
-            if (dim * dim > size) {
-                A = torch::constant_pad_nd(A.reshape(-1), {0, dim * dim - size}, 0);
+            if (size < 1) {
+                return 0;
             }
+            int64_t dim = std::max(static_cast<int64_t>(2), 
+                                   static_cast<int64_t>(std::sqrt(static_cast<double>(size))));
             
+            // Resize to square matrix
+            if (dim * dim > size) {
+                auto flat = A.reshape({-1});
+                A = torch::zeros({dim * dim}, A.options());
+                A.slice(0, 0, flat.numel()).copy_(flat);
+            } else {
+                A = A.reshape({-1}).slice(0, 0, dim * dim);
+            }
             A = A.reshape({dim, dim});
         }
         
-        // Get a boolean flag from the input data if available
+        // Get boolean flag for pivot option
         bool pivot = true;
         if (offset < Size) {
             pivot = Data[offset++] & 0x1;
         }
         
-        // Apply torch.linalg.lu operation
-        auto result = torch::lu(A, pivot);
-        
-        // Unpack the result to get P, L, U matrices
+        // torch.linalg.lu returns (P, L, U) - the full decomposition
+        // In C++ API: torch::linalg_lu(A, pivot) returns tuple<Tensor, Tensor, Tensor>
+        auto result = torch::linalg_lu(A, pivot);
         auto P = std::get<0>(result);
         auto L = std::get<1>(result);
         auto U = std::get<2>(result);
         
-        // Try lu_factor variant which returns the factorization and pivot indices
-        if (offset < Size) {
-            auto lu_factor_result = torch::lu(A, pivot);
-            auto LU = std::get<0>(lu_factor_result);
-            auto pivots = std::get<1>(lu_factor_result);
-            
-            // Try lu_solve with the factorization
-            if (offset + 4 < Size) {
-                // Create a right-hand side tensor
+        // Basic verification: shapes should be consistent
+        // P: (m, m), L: (m, k), U: (k, n) where k = min(m, n)
+        (void)P.sizes();
+        (void)L.sizes();
+        (void)U.sizes();
+        
+        // Try reconstructing A to verify: A = P @ L @ U
+        try {
+            auto A_reconstructed = torch::matmul(P, torch::matmul(L, U));
+            (void)A_reconstructed;
+        } catch (const std::exception&) {
+            // Shape mismatch in reconstruction, ignore
+        }
+        
+        // Test torch::linalg_lu_factor which returns (LU, pivots)
+        if (offset + 4 < Size) {
+            try {
+                auto factor_result = torch::linalg_lu_factor(A, pivot);
+                auto LU_packed = std::get<0>(factor_result);
+                auto pivots = std::get<1>(factor_result);
+                
+                // Test lu_solve if we have more data
                 torch::Tensor B = fuzzer_utils::createTensor(Data, Size, offset);
                 
-                // Reshape B to be compatible with A if needed
-                if (B.dim() < 1) {
-                    B = B.reshape({A.size(0), 1});
-                } else if (B.dim() == 1) {
-                    B = B.reshape({B.size(0), 1});
+                if (!B.is_floating_point() && !B.is_complex()) {
+                    B = B.to(A.dtype());
                 }
                 
-                // Make sure B's first dimension matches A's first dimension
-                if (B.size(0) != A.size(0)) {
-                    B = B.slice(0, 0, std::min(B.size(0), A.size(0)));
-                    if (B.size(0) < A.size(0)) {
-                        B = torch::constant_pad_nd(B, {0, 0, 0, A.size(0) - B.size(0)}, 0);
+                // Reshape B for solving Ax = B
+                int64_t m = A.size(-2);
+                if (B.dim() < 2) {
+                    int64_t b_numel = B.numel();
+                    if (b_numel >= m) {
+                        B = B.reshape({-1}).slice(0, 0, m).reshape({m, 1});
+                    } else {
+                        B = torch::zeros({m, 1}, A.options());
+                    }
+                } else {
+                    // Adjust first dimension to match
+                    if (B.size(-2) != m) {
+                        int64_t n_cols = B.size(-1);
+                        B = torch::zeros({m, n_cols}, A.options());
                     }
                 }
                 
-                // Try lu_solve
                 try {
-                    auto X = torch::lu_solve(B, LU, pivots);
+                    // linalg_lu_solve signature: (LU, pivots, B, left=true, adjoint=false)
+                    auto X = torch::linalg_lu_solve(LU_packed, pivots, B);
+                    (void)X;
                 } catch (const std::exception&) {
-                    // Ignore exceptions from lu_solve
+                    // lu_solve may fail for singular matrices, ignore
                 }
+            } catch (const std::exception&) {
+                // lu_factor may fail, ignore
             }
         }
         
-        // Try reconstructing A from P, L, U to verify correctness
-        auto A_reconstructed = torch::matmul(P, torch::matmul(L, U));
-        
-        // Try lu_unpack to get P, L, U from the factorization
-        if (offset < Size) {
+        // Test with batched input if we have enough data
+        if (offset + 8 < Size && A.dim() == 2) {
             try {
-                auto lu_result = torch::lu(A, pivot);
-                auto unpacked = torch::lu_unpack(std::get<0>(lu_result), 
-                                               std::get<1>(lu_result), 
-                                               pivot);
-                auto P_unpacked = std::get<0>(unpacked);
-                auto L_unpacked = std::get<1>(unpacked);
-                auto U_unpacked = std::get<2>(unpacked);
+                // Create a batch of matrices
+                int64_t batch_size = std::max(static_cast<int64_t>(1), 
+                                              static_cast<int64_t>(Data[offset++] % 4 + 1));
+                auto A_batched = A.unsqueeze(0).expand({batch_size, A.size(0), A.size(1)}).clone();
+                
+                auto batch_result = torch::linalg_lu(A_batched, pivot);
+                auto P_batch = std::get<0>(batch_result);
+                auto L_batch = std::get<1>(batch_result);
+                auto U_batch = std::get<2>(batch_result);
+                (void)P_batch;
+                (void)L_batch;
+                (void)U_batch;
             } catch (const std::exception&) {
-                // Ignore exceptions from lu_unpack
+                // Batched operation may fail, ignore
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

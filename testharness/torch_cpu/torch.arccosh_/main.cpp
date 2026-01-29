@@ -1,70 +1,100 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Skip if there's not enough data
         if (Size < 2) {
             return 0;
         }
         
-        // Create input tensor
+        size_t offset = 0;
+        
+        // Create input tensor from fuzzer data
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a copy of the input tensor for in-place operation
-        torch::Tensor input_copy = input.clone();
-        
-        // Apply arccosh_ operation in-place
-        input_copy.arccosh_();
-        
-        // Verify the operation by comparing with the non-in-place version
-        torch::Tensor expected_output = torch::arccosh(input);
-        
-        // Check if the in-place operation produced the same result as the non-in-place version
-        // This is a sanity check, not a defensive check that would prevent testing edge cases
-        if (input_copy.defined() && expected_output.defined()) {
-            bool equal = torch::allclose(input_copy, expected_output, 1e-5, 1e-8);
-            if (!equal) {
-                // This is not an error, just an observation that might be useful for debugging
-                // We don't throw or return early as we want to test all cases
-            }
+        // Test 1: Basic in-place arccosh_ operation
+        {
+            torch::Tensor input_copy = input.clone();
+            input_copy.arccosh_();
         }
         
-        // Try another variant with different input
+        // Test 2: Try with different dtypes if we have more data
         if (offset < Size) {
-            torch::Tensor another_input = fuzzer_utils::createTensor(Data, Size, offset);
-            another_input.arccosh_();
+            torch::Tensor float_input = fuzzer_utils::createTensor(Data, Size, offset).to(torch::kFloat32);
+            float_input.arccosh_();
         }
         
-        // Try with a scalar tensor
         if (offset < Size) {
-            torch::Tensor scalar_tensor = torch::tensor(1.5);
-            scalar_tensor.arccosh_();
+            torch::Tensor double_input = fuzzer_utils::createTensor(Data, Size, offset).to(torch::kFloat64);
+            double_input.arccosh_();
         }
         
-        // Try with a tensor containing values less than 1 (which should result in NaN for real inputs)
-        if (offset < Size) {
-            torch::Tensor edge_case = torch::tensor({0.5, 0.0, -1.0, 1.0, 2.0});
+        // Test 3: Test with specific edge case values
+        // arccosh is defined for x >= 1 (returns NaN for x < 1 with real tensors)
+        {
+            torch::Tensor edge_case = torch::tensor({1.0, 1.5, 2.0, 10.0, 100.0});
             edge_case.arccosh_();
         }
         
-        // Try with empty tensor
-        if (offset < Size) {
-            torch::Tensor empty_tensor = torch::empty({0});
+        // Test 4: Empty tensor (edge case)
+        {
+            torch::Tensor empty_tensor = torch::empty({0}, torch::kFloat32);
             empty_tensor.arccosh_();
+        }
+        
+        // Test 5: Scalar tensor
+        {
+            torch::Tensor scalar_tensor = torch::tensor(2.0);
+            scalar_tensor.arccosh_();
+        }
+        
+        // Test 6: Multi-dimensional tensor
+        if (offset < Size) {
+            torch::Tensor multi_dim = fuzzer_utils::createTensor(Data, Size, offset);
+            if (multi_dim.numel() >= 4) {
+                try {
+                    // Reshape to 2D if possible
+                    int64_t numel = multi_dim.numel();
+                    int64_t rows = 2;
+                    int64_t cols = numel / rows;
+                    if (rows * cols == numel) {
+                        torch::Tensor reshaped = multi_dim.reshape({rows, cols});
+                        reshaped.arccosh_();
+                    }
+                } catch (...) {
+                    // Shape manipulation may fail, continue
+                }
+            }
+        }
+        
+        // Test 7: Contiguous vs non-contiguous tensor
+        if (offset < Size) {
+            torch::Tensor base = fuzzer_utils::createTensor(Data, Size, offset);
+            if (base.numel() >= 4) {
+                try {
+                    torch::Tensor transposed = base.reshape({2, -1}).t().clone();
+                    transposed.arccosh_();
+                } catch (...) {
+                    // Reshape/transpose may fail, continue
+                }
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

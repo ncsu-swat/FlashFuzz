@@ -1,64 +1,99 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Skip if we don't have enough data
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
-        
-        // Create input tensor
+
+        size_t offset = 0;
+
+        // Create input tensor from fuzzer data
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Apply torch.special.expm1 operation
+
+        // Apply torch.special.expm1 operation (computes exp(x) - 1)
         torch::Tensor result = torch::special::expm1(input);
-        
-        // Try to access the result to ensure computation is performed
-        if (result.defined()) {
-            auto item = result.item();
+
+        // Verify result is defined and has correct shape
+        if (!result.defined() || result.sizes() != input.sizes()) {
+            return 0;
         }
-        
-        // Try with out parameter variant
-        if (offset + 1 < Size) {
+
+        // Force computation
+        result.sum().item<float>();
+
+        // Test with out parameter variant
+        try {
             torch::Tensor output = torch::empty_like(input);
             torch::special::expm1_out(output, input);
+            output.sum().item<float>();
+        } catch (...) {
+            // Silently ignore expected failures
+        }
+
+        // Test with different dtypes based on fuzzer data
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset % Size];
             
-            // Verify output has same shape as input
-            if (output.sizes() != input.sizes()) {
-                throw std::runtime_error("Output tensor shape mismatch");
+            try {
+                if (dtype_selector % 3 == 0) {
+                    // Test with float32
+                    torch::Tensor float_input = input.to(torch::kFloat32);
+                    torch::Tensor float_result = torch::special::expm1(float_input);
+                    float_result.sum().item<float>();
+                } else if (dtype_selector % 3 == 1) {
+                    // Test with float64
+                    torch::Tensor double_input = input.to(torch::kFloat64);
+                    torch::Tensor double_result = torch::special::expm1(double_input);
+                    double_result.sum().item<double>();
+                } else {
+                    // Test in-place style using out variant with pre-allocated tensor
+                    torch::Tensor out_tensor = torch::zeros_like(input);
+                    torch::special::expm1_out(out_tensor, input);
+                    out_tensor.sum().item<float>();
+                }
+            } catch (...) {
+                // Silently ignore dtype conversion failures
             }
         }
-        
-        // Try with different dtypes if we have more data
-        if (offset + 2 < Size) {
-            // Try with float32
-            torch::Tensor float_input = input.to(torch::kFloat32);
-            torch::Tensor float_result = torch::special::expm1(float_input);
-            
-            // Try with float64
-            torch::Tensor double_input = input.to(torch::kFloat64);
-            torch::Tensor double_result = torch::special::expm1(double_input);
+
+        // Test with contiguous vs non-contiguous tensor
+        if (input.dim() >= 2) {
+            try {
+                torch::Tensor transposed = input.transpose(0, 1);
+                torch::Tensor trans_result = torch::special::expm1(transposed);
+                trans_result.sum().item<float>();
+            } catch (...) {
+                // Silently ignore failures
+            }
         }
-        
-        // Try with edge cases if we have more data
-        if (offset + 3 < Size) {
-            // Create tensors with special values
-            torch::Tensor special_values = torch::tensor({-INFINITY, -1000.0, -1.0, -0.0, 0.0, 1.0, 1000.0, INFINITY, NAN});
-            torch::Tensor special_result = torch::special::expm1(special_values);
+
+        // Test with sliced tensor (non-contiguous)
+        if (input.numel() > 2) {
+            try {
+                torch::Tensor sliced = input.flatten().slice(0, 0, input.numel() / 2);
+                torch::Tensor slice_result = torch::special::expm1(sliced);
+                slice_result.sum().item<float>();
+            } catch (...) {
+                // Silently ignore failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

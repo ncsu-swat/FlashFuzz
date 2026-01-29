@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,8 +27,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size) {
             torch::Tensor vec2 = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Try to reshape tensors to 1D if they're not already
-            // This helps test more cases without excessive defensive checks
+            // torch::ger only supports floating point and complex types
+            // Convert to float if needed
+            if (!vec1.is_floating_point() && !vec1.is_complex()) {
+                vec1 = vec1.to(torch::kFloat32);
+            }
+            if (!vec2.is_floating_point() && !vec2.is_complex()) {
+                vec2 = vec2.to(torch::kFloat32);
+            }
+            
+            // Reshape tensors to 1D if they're not already
             if (vec1.dim() != 1) {
                 vec1 = vec1.reshape({-1});
             }
@@ -44,6 +56,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 result.size(0) == vec1.size(0) && 
                 result.size(1) == vec2.size(0)) {
                 // Basic shape verification passed
+            }
+            
+            // Test with contiguous vs non-contiguous tensors
+            if (vec1.size(0) > 1 && vec2.size(0) > 1) {
+                try {
+                    // Create non-contiguous views
+                    torch::Tensor nc_vec1 = vec1.slice(0, 0, vec1.size(0));
+                    torch::Tensor nc_vec2 = vec2.slice(0, 0, vec2.size(0));
+                    torch::Tensor nc_result = torch::ger(nc_vec1, nc_vec2);
+                } catch (...) {
+                    // Silently handle edge cases
+                }
             }
             
             // Test some edge cases with empty tensors
@@ -71,12 +95,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     // Expected exception for some cases
                 }
             }
+            
+            // Test with different dtypes if we have enough data
+            if (offset + 1 < Size) {
+                try {
+                    torch::Tensor dvec1 = vec1.to(torch::kFloat64);
+                    torch::Tensor dvec2 = vec2.to(torch::kFloat64);
+                    torch::Tensor dresult = torch::ger(dvec1, dvec2);
+                } catch (...) {
+                    // Silently handle dtype conversion issues
+                }
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

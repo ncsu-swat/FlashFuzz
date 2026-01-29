@@ -1,161 +1,218 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        if (Size < 4) {
+        if (Size < 6) {
             return 0;
         }
-        
-        // Create input tensors
-        torch::Tensor values = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create indices tensor for sparse operations
-        torch::Tensor indices;
-        if (offset < Size) {
-            indices = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure indices are integers
-            if (indices.dtype() != torch::kInt64 && indices.dtype() != torch::kInt32 && indices.dtype() != torch::kInt16 && indices.dtype() != torch::kInt8) {
-                indices = indices.to(torch::kInt64);
-            }
-        } else {
-            // Create default indices if we don't have enough data
-            indices = torch::zeros({2, 3}, torch::kInt64);
-        }
-        
-        // Get sparse dimensions
-        int64_t sparse_dim = 2;
-        int64_t dense_dim = 0;
-        
-        if (offset + 2 <= Size) {
-            sparse_dim = static_cast<int64_t>(Data[offset++]) % 5;
-            dense_dim = static_cast<int64_t>(Data[offset++]) % 3;
-        }
-        
-        // Test Embedding Bag
-        try {
-            int64_t num_embeddings = 10;
-            int64_t embedding_dim = 5;
-            
-            if (offset + 2 <= Size) {
-                num_embeddings = (static_cast<int64_t>(Data[offset++]) % 20) + 1;
-                embedding_dim = (static_cast<int64_t>(Data[offset++]) % 10) + 1;
-            }
-            
-            torch::nn::EmbeddingBag embedding_bag = torch::nn::EmbeddingBag(
-                torch::nn::EmbeddingBagOptions(num_embeddings, embedding_dim)
-                    .mode(torch::kSum)
-                    .sparse(true));
-            
-            // Create valid input for EmbeddingBag
-            torch::Tensor input_indices = torch::randint(0, num_embeddings, {4}, torch::kInt64);
-            torch::Tensor offsets = torch::tensor({0, 2, 4}, torch::kInt64);
-            
-            auto output = embedding_bag->forward(input_indices, offsets);
-        } catch (const std::exception& e) {
-            // Catch and continue
-        }
-        
-        // Test Sparse operations
-        try {
-            // Create a sparse tensor
-            torch::Tensor sparse_tensor;
-            
-            if (indices.dim() >= 2 && values.dim() >= 1) {
-                // Ensure indices are valid for sparse tensor creation
-                if (indices.size(0) > 0 && indices.size(1) > 0) {
-                    try {
-                        sparse_tensor = torch::sparse_coo_tensor(
-                            indices, 
-                            values, 
-                            {}, 
-                            values.options().layout(torch::kSparse));
-                    } catch (const std::exception& e) {
-                        // Try with default shape if the above fails
-                        sparse_tensor = torch::sparse_coo_tensor(
-                            torch::tensor({{0, 1, 1}, {2, 0, 1}}, torch::kInt64),
-                            torch::tensor({3, 4, 5}, torch::kFloat),
-                            {2, 3});
-                    }
-                }
-            }
-            
-            if (!sparse_tensor.defined()) {
-                // Create a default sparse tensor if we couldn't create one from input
-                sparse_tensor = torch::sparse_coo_tensor(
-                    torch::tensor({{0, 1, 1}, {2, 0, 1}}, torch::kInt64),
-                    torch::tensor({3, 4, 5}, torch::kFloat),
-                    {2, 3});
-            }
-            
-            // Test sparse operations
-            auto dense_tensor = sparse_tensor.to_dense();
-            auto coalesced = sparse_tensor.coalesce();
-            
-            // Test sparse-dense operations
-            if (dense_tensor.dim() > 0) {
-                try {
-                    auto result = sparse_tensor.add(dense_tensor);
-                } catch (const std::exception& e) {
-                    // Catch and continue
-                }
-                
-                try {
-                    auto result = sparse_tensor.mul(dense_tensor);
-                } catch (const std::exception& e) {
-                    // Catch and continue
-                }
-            }
-            
-            // Test sparse-sparse operations
+
+        size_t offset = 0;
+
+        // Extract parameters from fuzzer data
+        int64_t num_embeddings = (static_cast<int64_t>(Data[offset++]) % 50) + 1;
+        int64_t embedding_dim = (static_cast<int64_t>(Data[offset++]) % 32) + 1;
+        int64_t batch_size = (static_cast<int64_t>(Data[offset++]) % 8) + 1;
+        int64_t seq_len = (static_cast<int64_t>(Data[offset++]) % 10) + 1;
+        uint8_t mode_selector = Data[offset++] % 3;
+        uint8_t test_selector = Data[offset++];
+
+        // Test torch::nn::Embedding with sparse=true
+        if (test_selector & 0x01) {
             try {
-                auto result = sparse_tensor.add(sparse_tensor);
-            } catch (const std::exception& e) {
-                // Catch and continue
+                auto embedding = torch::nn::Embedding(
+                    torch::nn::EmbeddingOptions(num_embeddings, embedding_dim)
+                        .sparse(true));
+
+                // Create valid indices
+                torch::Tensor indices = torch::randint(0, num_embeddings, {batch_size, seq_len}, torch::kInt64);
+                auto output = embedding->forward(indices);
+
+                // Test with padding_idx
+                int64_t padding_idx = num_embeddings / 2;
+                auto embedding_padded = torch::nn::Embedding(
+                    torch::nn::EmbeddingOptions(num_embeddings, embedding_dim)
+                        .sparse(true)
+                        .padding_idx(padding_idx));
+                auto output_padded = embedding_padded->forward(indices);
+            } catch (...) {
+                // Silent catch for expected failures
             }
-            
-            // Test sparse mm
-            try {
-                if (sparse_tensor.dim() == 2) {
-                    torch::Tensor mat = torch::randn({sparse_tensor.size(1), 3});
-                    auto result = torch::mm(sparse_tensor, mat);
-                }
-            } catch (const std::exception& e) {
-                // Catch and continue
-            }
-            
-            // Test sparse softmax
-            try {
-                auto result = torch::softmax(sparse_tensor, 0);
-            } catch (const std::exception& e) {
-                // Catch and continue
-            }
-            
-            // Test sparse mask
-            try {
-                auto mask = torch::ones_like(dense_tensor).to_sparse();
-                auto result = dense_tensor.sparse_mask(mask);
-            } catch (const std::exception& e) {
-                // Catch and continue
-            }
-        } catch (const std::exception& e) {
-            // Catch and continue
         }
-        
+
+        // Test torch::nn::EmbeddingBag with different modes
+        if (test_selector & 0x02) {
+            try {
+                torch::nn::EmbeddingBagMode mode;
+                switch (mode_selector) {
+                    case 0: mode = torch::kSum; break;
+                    case 1: mode = torch::kMean; break;
+                    case 2: mode = torch::kMax; break;
+                    default: mode = torch::kSum; break;
+                }
+
+                auto embedding_bag = torch::nn::EmbeddingBag(
+                    torch::nn::EmbeddingBagOptions(num_embeddings, embedding_dim)
+                        .mode(mode)
+                        .sparse(true));
+
+                // Create input indices (1D)
+                int64_t total_indices = batch_size * seq_len;
+                torch::Tensor input_indices = torch::randint(0, num_embeddings, {total_indices}, torch::kInt64);
+
+                // Create offsets for bags
+                std::vector<int64_t> offset_vec;
+                int64_t current_offset = 0;
+                for (int64_t i = 0; i < batch_size && current_offset < total_indices; i++) {
+                    offset_vec.push_back(current_offset);
+                    current_offset += seq_len;
+                }
+                torch::Tensor offsets = torch::tensor(offset_vec, torch::kInt64);
+
+                auto output = embedding_bag->forward(input_indices, offsets);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
+        }
+
+        // Test EmbeddingBag with per_sample_weights
+        if (test_selector & 0x04) {
+            try {
+                auto embedding_bag = torch::nn::EmbeddingBag(
+                    torch::nn::EmbeddingBagOptions(num_embeddings, embedding_dim)
+                        .mode(torch::kSum)
+                        .sparse(true));
+
+                int64_t total_indices = batch_size * seq_len;
+                torch::Tensor input_indices = torch::randint(0, num_embeddings, {total_indices}, torch::kInt64);
+                torch::Tensor per_sample_weights = torch::randn({total_indices});
+
+                std::vector<int64_t> offset_vec;
+                for (int64_t i = 0; i < batch_size; i++) {
+                    offset_vec.push_back(i * seq_len);
+                }
+                torch::Tensor offsets = torch::tensor(offset_vec, torch::kInt64);
+
+                auto output = embedding_bag->forward(input_indices, offsets, per_sample_weights);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
+        }
+
+        // Test EmbeddingBag with include_last_offset
+        if (test_selector & 0x08) {
+            try {
+                auto embedding_bag = torch::nn::EmbeddingBag(
+                    torch::nn::EmbeddingBagOptions(num_embeddings, embedding_dim)
+                        .mode(torch::kMean)
+                        .sparse(true)
+                        .include_last_offset(true));
+
+                int64_t total_indices = batch_size * seq_len;
+                torch::Tensor input_indices = torch::randint(0, num_embeddings, {total_indices}, torch::kInt64);
+
+                // With include_last_offset, offsets should have batch_size + 1 elements
+                std::vector<int64_t> offset_vec;
+                for (int64_t i = 0; i <= batch_size; i++) {
+                    offset_vec.push_back(std::min(i * seq_len, total_indices));
+                }
+                torch::Tensor offsets = torch::tensor(offset_vec, torch::kInt64);
+
+                auto output = embedding_bag->forward(input_indices, offsets);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
+        }
+
+        // Test Embedding from_pretrained with sparse
+        if (test_selector & 0x10) {
+            try {
+                torch::Tensor pretrained = torch::randn({num_embeddings, embedding_dim});
+                auto embedding = torch::nn::Embedding(
+                    torch::nn::EmbeddingOptions(num_embeddings, embedding_dim)
+                        .sparse(true)
+                        ._weight(pretrained));
+
+                torch::Tensor indices = torch::randint(0, num_embeddings, {batch_size}, torch::kInt64);
+                auto output = embedding->forward(indices);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
+        }
+
+        // Test EmbeddingBag with max_norm
+        if (test_selector & 0x20) {
+            try {
+                double max_norm = 1.0 + (Data[offset % Size] % 10) * 0.5;
+                auto embedding_bag = torch::nn::EmbeddingBag(
+                    torch::nn::EmbeddingBagOptions(num_embeddings, embedding_dim)
+                        .mode(torch::kSum)
+                        .sparse(true)
+                        .max_norm(max_norm));
+
+                int64_t total_indices = batch_size * seq_len;
+                torch::Tensor input_indices = torch::randint(0, num_embeddings, {total_indices}, torch::kInt64);
+
+                std::vector<int64_t> offset_vec;
+                for (int64_t i = 0; i < batch_size; i++) {
+                    offset_vec.push_back(i * seq_len);
+                }
+                torch::Tensor offsets = torch::tensor(offset_vec, torch::kInt64);
+
+                auto output = embedding_bag->forward(input_indices, offsets);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
+        }
+
+        // Test Embedding with norm_type
+        if (test_selector & 0x40) {
+            try {
+                double max_norm = 2.0;
+                double norm_type = 2.0;
+                auto embedding = torch::nn::Embedding(
+                    torch::nn::EmbeddingOptions(num_embeddings, embedding_dim)
+                        .sparse(true)
+                        .max_norm(max_norm)
+                        .norm_type(norm_type));
+
+                torch::Tensor indices = torch::randint(0, num_embeddings, {batch_size, seq_len}, torch::kInt64);
+                auto output = embedding->forward(indices);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
+        }
+
+        // Test EmbeddingBag with 2D input (no offsets needed)
+        if (test_selector & 0x80) {
+            try {
+                auto embedding_bag = torch::nn::EmbeddingBag(
+                    torch::nn::EmbeddingBagOptions(num_embeddings, embedding_dim)
+                        .mode(torch::kMean)
+                        .sparse(true));
+
+                // 2D input: each row is a bag
+                torch::Tensor input_2d = torch::randint(0, num_embeddings, {batch_size, seq_len}, torch::kInt64);
+                auto output = embedding_bag->forward(input_2d);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

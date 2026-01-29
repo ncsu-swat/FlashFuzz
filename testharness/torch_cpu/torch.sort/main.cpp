@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -31,6 +36,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             descending = static_cast<bool>(Data[offset++] & 0x01);
         }
         
+        // Get stable flag
+        bool stable = false;
+        if (offset < Size) {
+            stable = static_cast<bool>(Data[offset++] & 0x01);
+        }
+        
         // Apply torch.sort operation
         if (input_tensor.dim() > 0) {
             // Normalize dim to be within valid range
@@ -39,45 +50,82 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 dim += input_tensor.dim();
             }
             
-            // Call sort
+            // Call sort with basic parameters
             auto result = torch::sort(input_tensor, dim, descending);
             
             // Access the values and indices to ensure they're computed
             torch::Tensor values = std::get<0>(result);
             torch::Tensor indices = std::get<1>(result);
             
-            // Test the stable sort variant
-            auto stable_result = torch::sort(input_tensor, dim, descending, true);
-            torch::Tensor stable_values = std::get<0>(stable_result);
-            torch::Tensor stable_indices = std::get<1>(stable_result);
+            // Force computation
+            (void)values.numel();
+            (void)indices.numel();
+            
+            // Test stable sort variant if available
+            try {
+                auto stable_result = torch::sort(input_tensor, /*stable=*/stable, dim, descending);
+                torch::Tensor stable_values = std::get<0>(stable_result);
+                torch::Tensor stable_indices = std::get<1>(stable_result);
+                (void)stable_values.numel();
+                (void)stable_indices.numel();
+            } catch (...) {
+                // Stable sort overload may not be available, ignore silently
+            }
         } else {
-            // For 0-dim tensors, sort without dimension
-            auto result = torch::sort(input_tensor);
-            torch::Tensor values = std::get<0>(result);
-            torch::Tensor indices = std::get<1>(result);
+            // For 0-dim tensors, sort without dimension (defaults to dim=-1)
+            try {
+                auto result = torch::sort(input_tensor, /*dim=*/-1, descending);
+                torch::Tensor values = std::get<0>(result);
+                torch::Tensor indices = std::get<1>(result);
+                (void)values.numel();
+                (void)indices.numel();
+            } catch (...) {
+                // 0-dim tensor sorting may fail, ignore silently
+            }
         }
         
-        // Try sorting with named dimension
-        if (input_tensor.dim() > 0) {
-            // Create a named tensor if possible
-            std::vector<torch::Dimname> names;
-            for (int64_t i = 0; i < input_tensor.dim(); i++) {
-                std::string name_str = "dim" + std::to_string(i);
-                names.push_back(torch::Dimname::fromSymbol(c10::Symbol::dimname(name_str)));
+        // Test sort with different dtypes
+        if (input_tensor.numel() > 0) {
+            // Try sorting as float
+            try {
+                torch::Tensor float_tensor = input_tensor.to(torch::kFloat32);
+                if (float_tensor.dim() > 0) {
+                    int64_t sort_dim = dim % float_tensor.dim();
+                    auto float_result = torch::sort(float_tensor, sort_dim, descending);
+                    (void)std::get<0>(float_result).numel();
+                }
+            } catch (...) {
+                // Conversion or sort may fail for some inputs
             }
             
-            auto named_tensor = input_tensor.refine_names(names);
-            
-            // Sort using a named dimension
-            auto named_result = torch::sort(named_tensor, names[dim % names.size()], descending);
-            torch::Tensor named_values = std::get<0>(named_result);
-            torch::Tensor named_indices = std::get<1>(named_result);
+            // Try sorting as int64
+            try {
+                torch::Tensor int_tensor = input_tensor.to(torch::kInt64);
+                if (int_tensor.dim() > 0) {
+                    int64_t sort_dim = dim % int_tensor.dim();
+                    auto int_result = torch::sort(int_tensor, sort_dim, descending);
+                    (void)std::get<0>(int_result).numel();
+                }
+            } catch (...) {
+                // Conversion or sort may fail for some inputs
+            }
+        }
+        
+        // Test argsort as related functionality
+        if (input_tensor.dim() > 0) {
+            try {
+                int64_t argsort_dim = dim % input_tensor.dim();
+                torch::Tensor argsort_result = torch::argsort(input_tensor, argsort_dim, descending);
+                (void)argsort_result.numel();
+            } catch (...) {
+                // argsort may fail for some inputs
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

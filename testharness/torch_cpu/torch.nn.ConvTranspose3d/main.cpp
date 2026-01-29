@@ -1,116 +1,145 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least some data to proceed
-        if (Size < 10) {
+        if (Size < 16) {
             return 0;
         }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Ensure input has at least 5 dimensions (batch, channels, depth, height, width)
-        if (input.dim() < 5) {
-            input = input.reshape({1, 1, 1, 1, 1});
-        }
-        
-        // Extract parameters for ConvTranspose3d from the remaining data
-        int64_t in_channels = 1;
-        int64_t out_channels = 1;
-        int64_t kernel_size = 3;
-        int64_t stride = 1;
-        int64_t padding = 0;
-        int64_t output_padding = 0;
+
+        size_t offset = 0;
+
+        // Parse parameters for ConvTranspose3d from data first
+        int64_t in_channels = (Data[offset++] % 4) + 1;   // 1-4 channels
+        int64_t out_channels = (Data[offset++] % 4) + 1;  // 1-4 channels
+        int64_t kernel_size = (Data[offset++] % 3) + 1;   // 1-3 kernel size
+        int64_t stride = (Data[offset++] % 3) + 1;        // 1-3 stride
+        int64_t padding = Data[offset++] % 3;             // 0-2 padding
+        int64_t output_padding_val = Data[offset++] % stride; // must be < stride
         int64_t groups = 1;
-        bool bias = true;
-        int64_t dilation = 1;
-        
-        // Parse parameters if we have enough data
-        if (offset + 9 <= Size) {
-            in_channels = (Data[offset++] % 4) + 1;  // 1-4 channels
-            out_channels = (Data[offset++] % 4) + 1; // 1-4 channels
-            kernel_size = (Data[offset++] % 3) + 1;  // 1-3 kernel size
-            stride = (Data[offset++] % 3) + 1;       // 1-3 stride
-            padding = Data[offset++] % 3;            // 0-2 padding
-            output_padding = Data[offset++] % 2;     // 0-1 output padding
-            groups = (Data[offset++] % in_channels) + 1; // 1 to in_channels
-            if (groups > 1) {
-                // Ensure in_channels is divisible by groups
-                in_channels = groups * ((in_channels / groups) + 1);
-                // Ensure out_channels is divisible by groups
-                out_channels = groups * ((out_channels / groups) + 1);
+        int64_t groups_selector = Data[offset++] % 4;     // 0-3
+        bool use_bias = Data[offset++] % 2 == 0;
+        int64_t dilation = (Data[offset++] % 2) + 1;      // 1-2 dilation
+
+        // Calculate valid groups (must divide both in_channels and out_channels)
+        if (groups_selector > 0) {
+            for (int64_t g = std::min(in_channels, out_channels); g >= 1; g--) {
+                if (in_channels % g == 0 && out_channels % g == 0) {
+                    if (groups_selector == 1 || g == 1) {
+                        groups = g;
+                        break;
+                    }
+                    groups_selector--;
+                }
             }
-            bias = Data[offset++] % 2 == 0;          // 50% chance of bias
-            dilation = (Data[offset++] % 2) + 1;     // 1-2 dilation
         }
-        
-        // Ensure input has correct number of channels
-        if (input.size(1) != in_channels) {
-            input = input.expand({input.size(0), in_channels, input.size(2), input.size(3), input.size(4)});
-        }
-        
+
+        // Parse spatial dimensions
+        int64_t batch_size = (Data[offset++] % 3) + 1;    // 1-3 batch
+        int64_t depth = (Data[offset++] % 4) + kernel_size;  // ensure >= kernel
+        int64_t height = (Data[offset++] % 4) + kernel_size;
+        int64_t width = (Data[offset++] % 4) + kernel_size;
+
+        // Create input tensor with correct shape: [N, C_in, D, H, W]
+        torch::Tensor input = torch::randn({batch_size, in_channels, depth, height, width});
+
         // Create ConvTranspose3d module
         torch::nn::ConvTranspose3dOptions options(in_channels, out_channels, kernel_size);
         options.stride(stride)
                .padding(padding)
-               .output_padding(output_padding)
+               .output_padding(output_padding_val)
                .groups(groups)
-               .bias(bias)
+               .bias(use_bias)
                .dilation(dilation);
-        
+
         auto conv_transpose = torch::nn::ConvTranspose3d(options);
-        
-        // Apply the operation
-        torch::Tensor output = conv_transpose->forward(input);
-        
-        // Optionally test with different input types
-        if (offset < Size) {
-            auto dtype_selector = Data[offset++];
-            auto dtype = fuzzer_utils::parseDataType(dtype_selector);
-            
-            // Try with a different data type if supported for this operation
-            if (dtype == torch::kFloat || dtype == torch::kDouble) {
-                input = input.to(dtype);
-                conv_transpose = torch::nn::ConvTranspose3d(options);
-                output = conv_transpose->forward(input);
+
+        // Apply the forward pass
+        torch::Tensor output;
+        try {
+            output = conv_transpose->forward(input);
+        } catch (...) {
+            // Shape mismatch or other expected errors - silently continue
+        }
+
+        // Test with output_size parameter
+        if (offset < Size && output.defined()) {
+            try {
+                // ConvTranspose3d can take an output_size to resolve ambiguity
+                std::vector<int64_t> output_size = {
+                    output.size(2) + (Data[offset] % 2),
+                    output.size(3) + ((offset + 1 < Size) ? (Data[offset + 1] % 2) : 0),
+                    output.size(4) + ((offset + 2 < Size) ? (Data[offset + 2] % 2) : 0)
+                };
+                offset += 3;
+                output = conv_transpose->forward(input, output_size);
+            } catch (...) {
+                // Invalid output_size - silently continue
             }
         }
-        
+
+        // Test with double precision
+        if (offset < Size && Data[offset++] % 4 == 0) {
+            try {
+                auto input_double = input.to(torch::kDouble);
+                auto conv_transpose_double = torch::nn::ConvTranspose3d(options);
+                conv_transpose_double->to(torch::kDouble);
+                output = conv_transpose_double->forward(input_double);
+            } catch (...) {
+                // Type conversion issues - silently continue
+            }
+        }
+
         // Test with different batch sizes
-        if (offset < Size && input.size(0) > 0) {
-            int64_t new_batch_size = (Data[offset++] % 3) + 1; // 1-3 batch size
-            if (new_batch_size != input.size(0)) {
-                auto resized_input = input.repeat({new_batch_size, 1, 1, 1, 1});
-                output = conv_transpose->forward(resized_input);
+        if (offset < Size) {
+            try {
+                int64_t new_batch_size = (Data[offset++] % 4) + 1;
+                auto new_input = torch::randn({new_batch_size, in_channels, depth, height, width});
+                output = conv_transpose->forward(new_input);
+            } catch (...) {
+                // Silently continue
             }
         }
-        
-        // Test with different spatial dimensions
+
+        // Test with varied spatial dimensions
         if (offset + 2 < Size) {
-            int64_t depth = (Data[offset++] % 5) + 1;    // 1-5 depth
-            int64_t height = (Data[offset++] % 5) + 1;   // 1-5 height
-            int64_t width = (Data[offset++] % 5) + 1;    // 1-5 width
-            
-            if (depth != input.size(2) || height != input.size(3) || width != input.size(4)) {
-                auto resized_input = torch::zeros({input.size(0), in_channels, depth, height, width}, 
-                                                 input.options());
-                output = conv_transpose->forward(resized_input);
+            try {
+                int64_t new_depth = (Data[offset++] % 6) + kernel_size;
+                int64_t new_height = (Data[offset++] % 6) + kernel_size;
+                int64_t new_width = (Data[offset++] % 6) + kernel_size;
+                auto varied_input = torch::randn({batch_size, in_channels, new_depth, new_height, new_width});
+                output = conv_transpose->forward(varied_input);
+            } catch (...) {
+                // Silently continue
+            }
+        }
+
+        // Test gradient computation
+        if (offset < Size && Data[offset++] % 3 == 0 && output.defined()) {
+            try {
+                auto grad_input = input.clone().requires_grad_(true);
+                auto grad_output = conv_transpose->forward(grad_input);
+                auto loss = grad_output.sum();
+                loss.backward();
+            } catch (...) {
+                // Gradient issues - silently continue
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

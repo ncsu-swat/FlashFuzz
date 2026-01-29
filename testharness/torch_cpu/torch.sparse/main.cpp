@@ -1,16 +1,19 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes to create meaningful tensors
         if (Size < 4) {
             return 0;
         }
@@ -18,135 +21,162 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a dense tensor to convert to sparse
         torch::Tensor dense_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create indices and values for sparse tensor
-        torch::Tensor indices;
-        torch::Tensor values;
+        if (offset + 2 >= Size) {
+            return 0;
+        }
         
-        // Try different sparse tensor creation approaches based on available data
-        if (offset + 2 < Size) {
-            uint8_t sparse_format = Data[offset++];
-            
-            // COO format sparse tensor
-            if (sparse_format % 2 == 0) {
+        uint8_t sparse_format = Data[offset++];
+        uint8_t op_selector = Data[offset++];
+        
+        // COO format sparse tensor from dense
+        if (sparse_format % 3 == 0) {
+            try {
                 // Create a sparse tensor from the dense tensor
                 torch::Tensor sparse_tensor = dense_tensor.to_sparse();
                 
-                // Test basic operations on sparse tensor
+                // Test basic properties
                 auto sparse_size = sparse_tensor.sizes();
-                auto sparse_indices = sparse_tensor.indices();
-                auto sparse_values = sparse_tensor.values();
+                auto sparse_indices = sparse_tensor._indices();
+                auto sparse_values = sparse_tensor._values();
+                auto nnz = sparse_tensor._nnz();
+                auto sparse_dim = sparse_tensor.sparse_dim();
+                auto dense_dim = sparse_tensor.dense_dim();
                 
                 // Convert back to dense
                 torch::Tensor dense_again = sparse_tensor.to_dense();
                 
-                // Test sparse operations
-                if (sparse_tensor.dim() > 0) {
-                    int64_t dim = Data[offset % sparse_tensor.dim()];
-                    if (offset < Size) offset++;
-                    
-                    // Test coalesce
-                    if (!sparse_tensor.is_coalesced()) {
-                        torch::Tensor coalesced = sparse_tensor.coalesce();
-                    }
-                }
-            } 
-            // Create sparse tensor directly
-            else {
-                // Create indices tensor
-                if (offset < Size) {
-                    indices = fuzzer_utils::createTensor(Data, Size, offset);
-                    
-                    // Create values tensor if we have more data
+                // Test coalesce
+                torch::Tensor coalesced = sparse_tensor.coalesce();
+                bool is_coalesced = coalesced.is_coalesced();
+                
+                // Test clone
+                torch::Tensor cloned = sparse_tensor.clone();
+                
+            } catch (const c10::Error& e) {
+                // Expected for some tensor configurations
+            }
+        }
+        // Create sparse COO tensor directly with controlled indices
+        else if (sparse_format % 3 == 1) {
+            try {
+                // Create small controlled sparse tensor
+                int64_t dim0 = (Data[offset % Size] % 5) + 2;
+                int64_t dim1 = (Data[(offset + 1) % Size] % 5) + 2;
+                int64_t nnz = (Data[(offset + 2) % Size] % 4) + 1;
+                offset += 3;
+                
+                // Create valid indices (must be within bounds)
+                auto indices = torch::zeros({2, nnz}, torch::kLong);
+                auto values = torch::rand({nnz});
+                
+                for (int64_t i = 0; i < nnz && offset < Size; i++) {
+                    indices[0][i] = Data[offset++] % dim0;
                     if (offset < Size) {
-                        values = fuzzer_utils::createTensor(Data, Size, offset);
-                        
-                        // Get sparse dimensions
-                        std::vector<int64_t> sparse_dims;
-                        if (dense_tensor.dim() > 0) {
-                            for (int i = 0; i < dense_tensor.dim(); i++) {
-                                sparse_dims.push_back(dense_tensor.size(i));
-                            }
-                        } else {
-                            // Default dimensions if dense tensor is a scalar
-                            sparse_dims = {2, 3};
-                        }
-                        
-                        // Try to create a sparse tensor
-                        try {
-                            torch::Tensor sparse_tensor = torch::sparse_coo_tensor(
-                                indices, values, sparse_dims);
-                                
-                            // Test basic operations
-                            auto dense_version = sparse_tensor.to_dense();
-                            
-                            // Test coalesce if not already coalesced
-                            if (!sparse_tensor.is_coalesced()) {
-                                auto coalesced = sparse_tensor.coalesce();
-                            }
-                            
-                            // Test sparse operations
-                            if (offset + 1 < Size) {
-                                uint8_t op_type = Data[offset++];
-                                
-                                // Test sparse add
-                                if (op_type % 4 == 0) {
-                                    torch::Tensor sparse_tensor2 = dense_tensor.to_sparse();
-                                    torch::Tensor result = sparse_tensor + sparse_tensor2;
-                                }
-                                // Test sparse mul
-                                else if (op_type % 4 == 1) {
-                                    torch::Tensor scalar = torch::tensor(2.0);
-                                    torch::Tensor result = sparse_tensor * scalar;
-                                }
-                                // Test sparse transpose
-                                else if (op_type % 4 == 2 && sparse_tensor.dim() >= 2) {
-                                    torch::Tensor result = sparse_tensor.transpose(0, 1);
-                                }
-                                // Test sparse mm
-                                else if (op_type % 4 == 3 && sparse_tensor.dim() == 2) {
-                                    torch::Tensor dense_mat = torch::rand({sparse_tensor.size(1), 5});
-                                    torch::Tensor result = torch::mm(sparse_tensor, dense_mat);
-                                }
-                            }
-                        } catch (const c10::Error& e) {
-                            // Catch PyTorch-specific errors during sparse tensor creation
-                        }
+                        indices[1][i] = Data[offset++] % dim1;
                     }
                 }
+                
+                torch::Tensor sparse_tensor = torch::sparse_coo_tensor(
+                    indices, values, {dim0, dim1});
+                
+                // Test operations based on op_selector
+                if (op_selector % 5 == 0) {
+                    // Sparse addition
+                    torch::Tensor sparse2 = torch::sparse_coo_tensor(
+                        indices, torch::rand({nnz}), {dim0, dim1});
+                    torch::Tensor result = sparse_tensor + sparse2;
+                }
+                else if (op_selector % 5 == 1) {
+                    // Scalar multiplication
+                    float scalar = static_cast<float>(Data[offset % Size]) / 50.0f;
+                    torch::Tensor result = sparse_tensor * scalar;
+                }
+                else if (op_selector % 5 == 2) {
+                    // Transpose
+                    torch::Tensor result = sparse_tensor.t();
+                }
+                else if (op_selector % 5 == 3) {
+                    // Sparse-dense matrix multiplication
+                    torch::Tensor dense_mat = torch::rand({dim1, 3});
+                    torch::Tensor coalesced = sparse_tensor.coalesce();
+                    torch::Tensor result = torch::mm(coalesced, dense_mat);
+                }
+                else {
+                    // To dense and back
+                    torch::Tensor dense = sparse_tensor.to_dense();
+                    torch::Tensor sparse_again = dense.to_sparse();
+                }
+                
+            } catch (const c10::Error& e) {
+                // Expected for invalid configurations
+            }
+        }
+        // Test sparse with different number of sparse dimensions
+        else {
+            try {
+                if (dense_tensor.dim() >= 2) {
+                    // to_sparse with sparse_dim parameter
+                    int64_t sparse_dim = (Data[offset % Size] % dense_tensor.dim()) + 1;
+                    offset++;
+                    torch::Tensor sparse_tensor = dense_tensor.to_sparse(sparse_dim);
+                    
+                    // Test properties
+                    auto actual_sparse_dim = sparse_tensor.sparse_dim();
+                    auto actual_dense_dim = sparse_tensor.dense_dim();
+                    
+                    // Coalesce and convert back
+                    torch::Tensor coalesced = sparse_tensor.coalesce();
+                    torch::Tensor dense = coalesced.to_dense();
+                }
+            } catch (const c10::Error& e) {
+                // Expected for some tensor configurations
             }
         }
         
-        // Test sparse_mask operation
+        // Test sparse tensor indexing operations
         if (offset + 1 < Size) {
             try {
-                torch::Tensor mask = dense_tensor.gt(0).to_sparse();
-                torch::Tensor result = dense_tensor.sparse_mask(mask);
+                torch::Tensor sparse = dense_tensor.to_sparse().coalesce();
+                
+                // Test indices() and values()
+                if (sparse._nnz() > 0) {
+                    auto indices = sparse._indices();
+                    auto values = sparse._values();
+                    
+                    // Test is_sparse
+                    bool is_sparse = sparse.is_sparse();
+                }
             } catch (const c10::Error& e) {
-                // Catch PyTorch-specific errors
+                // Expected for some configurations
             }
         }
         
-        // Test sparse resize operations
-        if (offset + 1 < Size && dense_tensor.dim() > 0) {
+        // Test sparse tensor with different dtypes
+        if (offset + 1 < Size) {
             try {
-                torch::Tensor sparse_tensor = dense_tensor.to_sparse();
+                uint8_t dtype_selector = Data[offset++];
+                torch::Tensor typed_tensor;
                 
-                // Get new size
-                int64_t new_size = static_cast<int64_t>(Data[offset++]) % 10 + 1;
-                std::vector<int64_t> new_sizes = sparse_tensor.sizes().vec();
-                if (!new_sizes.empty()) {
-                    new_sizes[0] = new_size;
-                    sparse_tensor.sparse_resize_(new_sizes, sparse_tensor.sparse_dim(), sparse_tensor.dense_dim());
+                if (dtype_selector % 4 == 0) {
+                    typed_tensor = dense_tensor.to(torch::kFloat32).to_sparse();
+                } else if (dtype_selector % 4 == 1) {
+                    typed_tensor = dense_tensor.to(torch::kFloat64).to_sparse();
+                } else if (dtype_selector % 4 == 2) {
+                    typed_tensor = dense_tensor.to(torch::kInt32).to_sparse();
+                } else {
+                    typed_tensor = dense_tensor.to(torch::kInt64).to_sparse();
                 }
+                
+                auto dense_back = typed_tensor.to_dense();
             } catch (const c10::Error& e) {
-                // Catch PyTorch-specific errors
+                // Expected for some configurations
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

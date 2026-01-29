@@ -1,12 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -16,11 +21,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor and ensure it's float type (required for quantization)
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Quantization requires float input
+        if (!input_tensor.is_floating_point()) {
+            input_tensor = input_tensor.to(torch::kFloat32);
+        }
+        
         // Extract parameters for quantization
-        // We need scale and zero_point for quantization
         float scale = 0.1f;
         int64_t zero_point = 0;
         
@@ -30,48 +39,63 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(float);
             
             // Ensure scale is positive and not too small or large
-            scale = std::abs(scale);
-            if (scale < 1e-10f) scale = 1e-10f;
-            if (scale > 1e10f) scale = 1e10f;
+            // Also handle NaN and Inf
+            if (!std::isfinite(scale) || scale <= 0.0f) {
+                scale = 0.1f;
+            }
+            scale = std::max(scale, 1e-10f);
+            scale = std::min(scale, 1e10f);
         }
         
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&zero_point, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
-            
-            // Ensure zero_point is within valid range for int8
+        }
+        
+        // Select quantization dtype
+        torch::ScalarType dtype = torch::kQInt8;
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset++];
+            dtype = (dtype_selector % 2 == 0) ? torch::kQInt8 : torch::kQUInt8;
+        }
+        
+        // Adjust zero_point range based on dtype
+        if (dtype == torch::kQUInt8) {
+            zero_point = std::max<int64_t>(std::min<int64_t>(zero_point, 255), 0);
+        } else {
             zero_point = std::max<int64_t>(std::min<int64_t>(zero_point, 127), -128);
         }
         
-        // Create quantization parameters
-        torch::ScalarType dtype = torch::kQInt8;
-        if (offset < Size) {
-            // Use one more byte to select between qint8 and quint8
-            uint8_t dtype_selector = Data[offset++];
-            dtype = (dtype_selector % 2 == 0) ? torch::kQInt8 : torch::kQUInt8;
-            
-            // Adjust zero_point range for quint8 if needed
-            if (dtype == torch::kQUInt8) {
-                zero_point = std::max<int64_t>(std::min<int64_t>(zero_point, 255), 0);
-            }
-        }
-        
         // Apply quantization using torch::quantize_per_tensor
-        torch::Tensor output = torch::quantize_per_tensor(input_tensor, scale, zero_point, dtype);
+        // This is the underlying function used by torch.nn.quantized.Quantize module
+        torch::Tensor quantized = torch::quantize_per_tensor(input_tensor, scale, zero_point, dtype);
         
-        // Try to access tensor properties to ensure computation happened
-        auto sizes = output.sizes();
-        auto output_dtype = output.dtype();
+        // Verify quantization worked by accessing properties
+        auto sizes = quantized.sizes();
+        (void)sizes;
         
-        // Try to get the quantization parameters from the output tensor
-        auto qparams = output.q_scale();
+        // Get quantization parameters from the output tensor
+        double q_scale = quantized.q_scale();
+        int64_t q_zero_point = quantized.q_zero_point();
+        (void)q_scale;
+        (void)q_zero_point;
+        
+        // Test dequantization as well (common operation after quantization)
+        torch::Tensor dequantized = quantized.dequantize();
+        
+        // Verify dequantized tensor properties
+        auto dq_sizes = dequantized.sizes();
+        (void)dq_sizes;
+        
+        // Additional coverage: test int_repr() to get underlying integer values
+        torch::Tensor int_repr = quantized.int_repr();
+        (void)int_repr.sizes();
         
         return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

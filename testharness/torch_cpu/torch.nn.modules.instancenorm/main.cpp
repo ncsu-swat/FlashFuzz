@@ -1,24 +1,26 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes for basic parameters
         if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Extract parameters for InstanceNorm
         bool affine = (offset < Size) ? (Data[offset++] & 0x1) : false;
         bool track_running_stats = (offset < Size) ? (Data[offset++] & 0x1) : false;
         double eps = 1e-5;
@@ -27,29 +29,38 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&eps, Data + offset, sizeof(double));
             offset += sizeof(double);
-            // Ensure eps is positive
             eps = std::abs(eps);
-            if (eps == 0.0) eps = 1e-5;
+            if (eps < 1e-10 || !std::isfinite(eps)) eps = 1e-5;
         }
         
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&momentum, Data + offset, sizeof(double));
             offset += sizeof(double);
-            // Ensure momentum is between 0 and 1
             momentum = std::abs(momentum);
-            if (momentum > 1.0) momentum = momentum - std::floor(momentum);
+            if (!std::isfinite(momentum) || momentum > 1.0) {
+                momentum = 0.1;
+            }
         }
         
-        // Get the number of dimensions
         int64_t ndim = input.dim();
         
-        // InstanceNorm requires at least 2D tensor (N,C,...)
-        if (ndim >= 2) {
-            // Get the number of features (channels)
-            int64_t num_features = input.size(1);
-            
-            // Create appropriate InstanceNorm module based on dimensions
-            if (ndim == 2) {
+        // InstanceNorm requires at least 3D tensor for 1D, 4D for 2D, 5D for 3D
+        // Format: (N, C, ...) where ... is the spatial dimensions
+        if (ndim < 3) {
+            return 0;
+        }
+        
+        int64_t num_features = input.size(1);
+        if (num_features <= 0) {
+            return 0;
+        }
+        
+        // Ensure input is float type for normalization
+        torch::Tensor float_input = input.to(torch::kFloat);
+        
+        try {
+            if (ndim == 3) {
+                // InstanceNorm1d: (N, C, L)
                 torch::nn::InstanceNorm1d instance_norm(
                     torch::nn::InstanceNorm1dOptions(num_features)
                         .eps(eps)
@@ -57,19 +68,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         .affine(affine)
                         .track_running_stats(track_running_stats));
                 
-                auto output = instance_norm(input);
-            }
-            else if (ndim == 3) {
-                torch::nn::InstanceNorm1d instance_norm(
-                    torch::nn::InstanceNorm1dOptions(num_features)
-                        .eps(eps)
-                        .momentum(momentum)
-                        .affine(affine)
-                        .track_running_stats(track_running_stats));
+                auto output = instance_norm(float_input);
                 
-                auto output = instance_norm(input);
+                // Test eval mode
+                instance_norm->eval();
+                auto output_eval = instance_norm(float_input);
             }
             else if (ndim == 4) {
+                // InstanceNorm2d: (N, C, H, W)
                 torch::nn::InstanceNorm2d instance_norm(
                     torch::nn::InstanceNorm2dOptions(num_features)
                         .eps(eps)
@@ -77,9 +83,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         .affine(affine)
                         .track_running_stats(track_running_stats));
                 
-                auto output = instance_norm(input);
+                auto output = instance_norm(float_input);
+                
+                // Test eval mode
+                instance_norm->eval();
+                auto output_eval = instance_norm(float_input);
             }
             else if (ndim == 5) {
+                // InstanceNorm3d: (N, C, D, H, W)
                 torch::nn::InstanceNorm3d instance_norm(
                     torch::nn::InstanceNorm3dOptions(num_features)
                         .eps(eps)
@@ -87,31 +98,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         .affine(affine)
                         .track_running_stats(track_running_stats));
                 
-                auto output = instance_norm(input);
+                auto output = instance_norm(float_input);
+                
+                // Test eval mode
+                instance_norm->eval();
+                auto output_eval = instance_norm(float_input);
             }
+        } catch (const c10::Error&) {
+            // Expected failures for invalid shapes/sizes - silently continue
         }
         
-        // Try with different data types
-        if (offset < Size && ndim >= 2) {
-            int64_t num_features = input.size(1);
-            
-            // Convert to float if not already
-            torch::Tensor float_input = input.to(torch::kFloat);
-            
-            torch::nn::InstanceNorm2d instance_norm(
-                torch::nn::InstanceNorm2dOptions(num_features)
-                    .eps(eps)
-                    .momentum(momentum)
-                    .affine(affine)
-                    .track_running_stats(track_running_stats));
-            
-            auto output = instance_norm(float_input);
+        // Additional test: try with double precision
+        if (offset < Size) {
+            try {
+                torch::Tensor double_input = input.to(torch::kDouble);
+                
+                if (ndim == 4) {
+                    torch::nn::InstanceNorm2d instance_norm(
+                        torch::nn::InstanceNorm2dOptions(num_features)
+                            .eps(eps)
+                            .momentum(momentum)
+                            .affine(affine)
+                            .track_running_stats(track_running_stats));
+                    instance_norm->to(torch::kDouble);
+                    auto output = instance_norm(double_input);
+                }
+            } catch (const c10::Error&) {
+                // Expected failures - silently continue
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

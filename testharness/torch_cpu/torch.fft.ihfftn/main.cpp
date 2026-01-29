@@ -4,13 +4,17 @@
 #include <cstring>        // For std::memcpy
 #include <iostream>       // For cerr
 #include <optional>       // For std::optional
-#include <string_view>    // For std::string_view
 #include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -20,8 +24,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor - ihfftn expects real input
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        // Ensure we have a real-valued floating point tensor
+        if (!input_tensor.is_floating_point()) {
+            input_tensor = input_tensor.to(torch::kFloat32);
+        }
         
         // Parse n_dims parameter if we have more data
         std::vector<int64_t> dim_vec;
@@ -41,6 +50,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         int64_t input_rank = input_tensor.dim();
+        
+        // Normalize dimensions to valid range
         for (auto &d : dim_vec) {
             if (input_rank > 0) {
                 int64_t wrapped = d % input_rank;
@@ -52,6 +63,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 d = 0;
             }
         }
+        
+        // Remove duplicate dimensions
+        std::sort(dim_vec.begin(), dim_vec.end());
+        dim_vec.erase(std::unique(dim_vec.begin(), dim_vec.end()), dim_vec.end());
+        
         std::vector<int64_t> default_dim;
         if (input_rank >= 2) {
             default_dim = {-2, -1};
@@ -81,21 +97,29 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 for (auto &val : s_vec) {
                     val = std::max<int64_t>(1, static_cast<int64_t>(std::abs(val) % 16) + 1);
                 }
+                // Ensure s has same length as dim
+                while (s_vec.size() > dim_ref.size()) {
+                    s_vec.pop_back();
+                }
+                while (s_vec.size() < dim_ref.size()) {
+                    s_vec.push_back(s_vec.empty() ? 2 : s_vec.back());
+                }
                 s = c10::IntArrayRef(s_vec);
             }
         }
         
         // Parse norm parameter if we have more data
-        std::optional<std::string_view> norm = std::nullopt;
+        c10::optional<c10::string_view> norm = c10::nullopt;
         if (offset < Size) {
             uint8_t norm_selector = Data[offset++];
-            if (norm_selector % 3 == 0) {
+            if (norm_selector % 4 == 0) {
                 norm = "backward";
-            } else if (norm_selector % 3 == 1) {
+            } else if (norm_selector % 4 == 1) {
                 norm = "forward";
-            } else {
+            } else if (norm_selector % 4 == 2) {
                 norm = "ortho";
             }
+            // else leave as nullopt for default behavior
         }
         
         // Apply the ihfftn operation with different parameter combinations
@@ -105,41 +129,55 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size) {
             uint8_t param_selector = Data[offset++];
             
-            switch (param_selector % 4) {
-                case 0:
-                    // Just input tensor
-                    result = torch::fft::ihfftn(input_tensor);
-                    break;
-                case 1:
-                    // Input tensor with optional shape and dims
-                    result = torch::fft::ihfftn(input_tensor, s, dim_ref);
-                    break;
-                case 2:
-                    // Input tensor, dim, and norm
-                    result = torch::fft::ihfftn(input_tensor, s, dim_ref, norm);
-                    break;
-                case 3:
-                    // All parameters
-                    result = torch::fft::ihfftn(input_tensor, c10::nullopt, dim_ref, norm);
-                    break;
+            try {
+                switch (param_selector % 5) {
+                    case 0:
+                        // Just input tensor
+                        result = torch::fft::ihfftn(input_tensor);
+                        break;
+                    case 1:
+                        // Input tensor with optional shape and dims
+                        result = torch::fft::ihfftn(input_tensor, s, dim_ref);
+                        break;
+                    case 2:
+                        // Input tensor, dim, and norm
+                        result = torch::fft::ihfftn(input_tensor, s, dim_ref, norm);
+                        break;
+                    case 3:
+                        // All parameters with nullopt for s
+                        result = torch::fft::ihfftn(input_tensor, c10::nullopt, dim_ref, norm);
+                        break;
+                    case 4:
+                        // Just dims, no s
+                        result = torch::fft::ihfftn(input_tensor, c10::nullopt, dim_ref);
+                        break;
+                }
+            } catch (const c10::Error &e) {
+                // Expected errors from invalid parameter combinations
+                return 0;
             }
         } else {
             // Default case if we don't have enough data
-            result = torch::fft::ihfftn(input_tensor);
+            try {
+                result = torch::fft::ihfftn(input_tensor);
+            } catch (const c10::Error &e) {
+                // Expected errors from invalid input
+                return 0;
+            }
         }
         
         // Perform some operation on the result to ensure it's used
-        auto sum = result.sum();
+        // ihfftn returns complex tensor, use abs() before sum for real value
+        auto sum = torch::abs(result).sum();
         
         // Prevent compiler from optimizing away the computation
-        if (sum.item<double>() == -12345.6789) {
-            return 1; // This condition is unlikely to be true
-        }
+        volatile float check = sum.item<float>();
+        (void)check;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

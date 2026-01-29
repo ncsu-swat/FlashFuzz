@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -35,10 +40,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Already handled by default
         } else if (offset < Size && Data[offset] % 3 == 1) {
             // Case 2: Mask is a scalar
-            if (mask.numel() > 0) {
-                mask = mask[0].reshape({});
-            } else {
-                mask = torch::tensor(true, torch::kBool);
+            try {
+                if (mask.numel() > 0) {
+                    mask = mask.flatten()[0].reshape({});
+                } else {
+                    mask = torch::tensor(true, torch::kBool);
+                }
+            } catch (...) {
+                // Keep original mask on failure
             }
         } else {
             // Case 3: Try to create a mask with different but broadcastable shape
@@ -73,53 +82,58 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size) {
             uint8_t edge_case = Data[offset++];
             
-            if (edge_case % 5 == 0) {
-                // Empty tensor
-                torch::Tensor empty_input = torch::empty({0}, input.options());
-                torch::Tensor empty_mask = torch::empty({0}, torch::kBool);
-                result = torch::masked_select(empty_input, empty_mask);
-            } else if (edge_case % 5 == 1) {
-                // All false mask
-                torch::Tensor all_false = torch::zeros_like(input, torch::kBool);
-                result = torch::masked_select(input, all_false);
-            } else if (edge_case % 5 == 2) {
-                // All true mask
-                torch::Tensor all_true = torch::ones_like(input, torch::kBool);
-                result = torch::masked_select(input, all_true);
-            } else if (edge_case % 5 == 3) {
-                // Scalar input with scalar mask
-                if (input.numel() > 0) {
-                    torch::Tensor scalar_input = input.flatten()[0].reshape({});
-                    torch::Tensor scalar_mask = torch::tensor(true, torch::kBool);
-                    result = torch::masked_select(scalar_input, scalar_mask);
-                }
-            } else {
-                // Non-contiguous tensors
-                if (input.dim() >= 2 && input.size(0) > 1 && input.size(1) > 1) {
-                    torch::Tensor non_contig_input = input.transpose(0, 1);
-                    torch::Tensor non_contig_mask = mask;
-                    if (mask.dim() >= 2 && mask.size(0) > 1 && mask.size(1) > 1) {
-                        non_contig_mask = mask.transpose(0, 1);
+            try {
+                if (edge_case % 5 == 0) {
+                    // Empty tensor
+                    torch::Tensor empty_input = torch::empty({0}, input.options());
+                    torch::Tensor empty_mask = torch::empty({0}, torch::kBool);
+                    result = torch::masked_select(empty_input, empty_mask);
+                } else if (edge_case % 5 == 1) {
+                    // All false mask
+                    torch::Tensor all_false = torch::zeros_like(input, torch::kBool);
+                    result = torch::masked_select(input, all_false);
+                } else if (edge_case % 5 == 2) {
+                    // All true mask
+                    torch::Tensor all_true = torch::ones_like(input, torch::kBool);
+                    result = torch::masked_select(input, all_true);
+                } else if (edge_case % 5 == 3) {
+                    // Scalar input with scalar mask
+                    if (input.numel() > 0) {
+                        torch::Tensor scalar_input = input.flatten()[0].reshape({});
+                        torch::Tensor scalar_mask = torch::tensor(true, torch::kBool);
+                        result = torch::masked_select(scalar_input, scalar_mask);
                     }
-                    result = torch::masked_select(non_contig_input, non_contig_mask);
+                } else {
+                    // Non-contiguous tensors
+                    if (input.dim() >= 2 && input.size(0) > 1 && input.size(1) > 1) {
+                        torch::Tensor non_contig_input = input.transpose(0, 1);
+                        torch::Tensor non_contig_mask = mask;
+                        if (mask.dim() >= 2 && mask.size(0) > 1 && mask.size(1) > 1) {
+                            non_contig_mask = mask.transpose(0, 1);
+                        }
+                        result = torch::masked_select(non_contig_input, non_contig_mask);
+                    }
                 }
+            } catch (...) {
+                // Edge cases may fail due to shape mismatches, etc. - silently continue
             }
         }
         
         // Access result to ensure computation is not optimized away
-        auto result_size = result.numel();
-        if (result_size > 0) {
-            auto first_element = result[0].item<float>();
-            // Use the value in a way that doesn't affect the output but prevents optimization
-            if (std::isnan(first_element)) {
-                return 0;
+        if (result.numel() > 0) {
+            try {
+                // Use sum() which works for all dtypes
+                volatile auto sum_val = result.sum().item<double>();
+                (void)sum_val;
+            } catch (...) {
+                // Ignore access errors
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

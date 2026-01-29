@@ -1,105 +1,146 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 10) {
+        // Need enough data for parameters and tensor
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Extract parameters for ConvTranspose2d from the remaining data
-        uint8_t in_channels = 0;
-        uint8_t out_channels = 0;
-        uint8_t kernel_size = 0;
-        uint8_t stride = 0;
-        uint8_t padding = 0;
-        uint8_t output_padding = 0;
-        uint8_t dilation = 0;
-        bool bias = false;
+        // Extract parameters for ConvTranspose2d from the data
+        uint8_t groups = (Data[offset++] % 4) + 1;
+        uint8_t in_channels_base = (Data[offset++] % 8) + 1;
+        uint8_t in_channels = in_channels_base * groups; // Must be divisible by groups
+        uint8_t out_channels_base = (Data[offset++] % 8) + 1;
+        uint8_t out_channels = out_channels_base * groups; // Must be divisible by groups
+        uint8_t kernel_h = (Data[offset++] % 5) + 1;
+        uint8_t kernel_w = (Data[offset++] % 5) + 1;
+        uint8_t stride_h = (Data[offset++] % 3) + 1;
+        uint8_t stride_w = (Data[offset++] % 3) + 1;
+        uint8_t padding_h = Data[offset++] % kernel_h;
+        uint8_t padding_w = Data[offset++] % kernel_w;
+        uint8_t output_padding_h = Data[offset++] % stride_h;
+        uint8_t output_padding_w = Data[offset++] % stride_w;
+        uint8_t dilation_h = (Data[offset++] % 3) + 1;
+        uint8_t dilation_w = (Data[offset++] % 3) + 1;
+        bool bias = Data[offset++] % 2 == 0;
         
-        if (offset + 7 < Size) {
-            in_channels = (Data[offset++] % 16) + 1;
-            out_channels = (Data[offset++] % 16) + 1;
-            kernel_size = (Data[offset++] % 5) + 1;
-            stride = (Data[offset++] % 3) + 1;
-            padding = Data[offset++] % (kernel_size + 1);
-            output_padding = Data[offset++] % stride;
-            dilation = (Data[offset++] % 3) + 1;
-            bias = Data[offset++] % 2 == 0;
-        } else {
-            // Default values if not enough data
-            in_channels = 3;
-            out_channels = 2;
-            kernel_size = 3;
-            stride = 1;
-            padding = 0;
-            output_padding = 0;
-            dilation = 1;
-            bias = true;
-        }
+        // Derive input dimensions from remaining data
+        uint8_t batch_size = (Data[offset++] % 4) + 1;
+        uint8_t height = (Data[offset++] % 8) + 2;
+        uint8_t width = (Data[offset++] % 8) + 2;
         
-        // Ensure input tensor has correct shape for convolution
-        // For ConvTranspose2d, input should be [N, C_in, H, W]
-        if (input.dim() < 2) {
-            // Reshape to at least 2D
-            std::vector<int64_t> new_shape;
-            if (input.dim() == 0) {
-                // Scalar tensor, reshape to [1, in_channels, 1, 1]
-                new_shape = {1, in_channels, 1, 1};
-            } else if (input.dim() == 1) {
-                // 1D tensor, reshape to [1, in_channels, length, 1]
-                int64_t length = input.size(0);
-                new_shape = {1, in_channels, length, 1};
+        // Create input tensor with proper shape [N, C_in, H, W]
+        torch::Tensor input = torch::randn({batch_size, in_channels, height, width});
+        
+        // Use remaining fuzzer data to perturb the input values
+        if (offset < Size) {
+            size_t remaining = Size - offset;
+            size_t numel = input.numel();
+            auto input_accessor = input.accessor<float, 4>();
+            for (size_t i = 0; i < std::min(remaining, numel); i++) {
+                int64_t idx = i;
+                int64_t n = idx / (in_channels * height * width);
+                idx %= (in_channels * height * width);
+                int64_t c = idx / (height * width);
+                idx %= (height * width);
+                int64_t h = idx / width;
+                int64_t w = idx % width;
+                input_accessor[n][c][h][w] = static_cast<float>(Data[offset + i]) / 128.0f - 1.0f;
             }
-            input = input.reshape(new_shape);
-        } else if (input.dim() == 2) {
-            // 2D tensor, add two dimensions
-            input = input.unsqueeze(0).unsqueeze(-1);
-        } else if (input.dim() == 3) {
-            // 3D tensor, add one dimension
-            input = input.unsqueeze(-1);
         }
         
-        // Ensure the channel dimension matches in_channels
-        if (input.size(1) != in_channels) {
-            std::vector<int64_t> new_shape = input.sizes().vec();
-            new_shape[1] = in_channels;
-            input = input.reshape(new_shape);
+        // Create ConvTranspose2d module (C++ frontend doesn't have Lazy variant)
+        auto options = torch::nn::ConvTranspose2dOptions(in_channels, out_channels, {kernel_h, kernel_w})
+            .stride({stride_h, stride_w})
+            .padding({padding_h, padding_w})
+            .output_padding({output_padding_h, output_padding_w})
+            .dilation({dilation_h, dilation_w})
+            .groups(groups)
+            .bias(bias);
+        
+        torch::nn::ConvTranspose2d conv_transpose(options);
+        
+        // Apply the transposed convolution
+        torch::Tensor output;
+        try {
+            output = conv_transpose->forward(input);
+        } catch (const c10::Error&) {
+            // Shape mismatch or invalid configuration - silently ignore
+            return 0;
         }
         
-        // Create ConvTranspose2d module
-        torch::nn::ConvTranspose2d conv_transpose(
-            torch::nn::ConvTranspose2dOptions(in_channels, out_channels, kernel_size)
-                .stride(stride)
-                .padding(padding)
-                .output_padding(output_padding)
-                .dilation(dilation)
-                .bias(bias)
-        );
-        
-        // Apply the convolution
-        torch::Tensor output = conv_transpose->forward(input);
-        
-        // Force materialization of the tensor
+        // Force materialization
         output = output.clone();
+        
+        // Verify output is valid
+        if (output.numel() > 0) {
+            volatile float sum = output.sum().item<float>();
+            (void)sum;
+        }
+        
+        // Test with different configurations if we have enough data
+        if (offset + 4 < Size) {
+            uint8_t kernel2_h = (Data[offset] % 5) + 1;
+            uint8_t kernel2_w = (Data[offset + 1] % 5) + 1;
+            uint8_t stride2_h = (Data[offset + 2] % 3) + 1;
+            uint8_t stride2_w = (Data[offset + 3] % 3) + 1;
+            
+            auto options2 = torch::nn::ConvTranspose2dOptions(in_channels, out_channels, {kernel2_h, kernel2_w})
+                .stride({stride2_h, stride2_w})
+                .groups(groups)
+                .bias(bias);
+            
+            torch::nn::ConvTranspose2d conv2(options2);
+            try {
+                torch::Tensor output2 = conv2->forward(input);
+                output2 = output2.clone();
+                volatile float sum2 = output2.sum().item<float>();
+                (void)sum2;
+            } catch (const c10::Error&) {
+                // Silently ignore configuration errors
+            }
+        }
+        
+        // Test backward pass
+        try {
+            input.set_requires_grad(true);
+            torch::nn::ConvTranspose2d conv3(
+                torch::nn::ConvTranspose2dOptions(in_channels, out_channels, {kernel_h, kernel_w})
+                    .stride({stride_h, stride_w})
+                    .padding({padding_h, padding_w})
+                    .groups(groups)
+                    .bias(bias)
+            );
+            torch::Tensor out3 = conv3->forward(input);
+            torch::Tensor loss = out3.sum();
+            loss.backward();
+            
+            if (input.grad().defined()) {
+                volatile float grad_sum = input.grad().sum().item<float>();
+                (void)grad_sum;
+            }
+        } catch (const c10::Error&) {
+            // Silently ignore errors in backward pass
+        }
         
         return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

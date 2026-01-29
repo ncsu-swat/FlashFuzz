@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -34,7 +38,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (!tensors.empty()) {
             torch::Tensor result = torch::block_diag(tensors);
             
-            // Optional: perform some operation on the result to ensure it's used
+            // Perform some operation on the result to ensure it's used
             auto sum = result.sum();
             
             // Test edge cases by creating additional block_diag calls with subsets of tensors
@@ -51,12 +55,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     torch::Tensor subset_result = torch::block_diag(subset_tensors);
                 }
             }
+            
+            // Test with empty vector edge case (should produce empty tensor)
+            try {
+                std::vector<torch::Tensor> empty_tensors;
+                torch::Tensor empty_result = torch::block_diag(empty_tensors);
+            } catch (...) {
+                // Empty input might not be supported, silently ignore
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

@@ -1,51 +1,87 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
-        
-        // Need at least a few bytes to create a tensor
+
         if (Size < 4) {
             return 0;
         }
-        
+
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Parse n_dims parameter if we have more data
+        // hfftn expects complex input - convert to complex if real
+        if (!input_tensor.is_complex()) {
+            input_tensor = torch::complex(input_tensor, torch::zeros_like(input_tensor));
+        }
+        
+        // Ensure tensor has at least 1 dimension
+        if (input_tensor.dim() == 0) {
+            input_tensor = input_tensor.unsqueeze(0);
+        }
+
+        int64_t ndim = input_tensor.dim();
+
+        // Parse dim parameter first (dimensions to transform)
         std::vector<int64_t> dim;
         if (offset + 1 < Size) {
-            uint8_t n_dims = Data[offset++] % 5; // Get number of dimensions to transform
-            
-            // Parse dimensions to transform
+            uint8_t n_dims = (Data[offset++] % std::min<int64_t>(ndim, 3)) + 1;
+
             for (uint8_t i = 0; i < n_dims && offset < Size; i++) {
-                int64_t d = static_cast<int64_t>(Data[offset++]);
-                dim.push_back(d);
+                // Map to valid dimension indices
+                int64_t d = static_cast<int64_t>(Data[offset++]) % ndim;
+                // Avoid duplicate dimensions
+                bool duplicate = false;
+                for (auto existing_d : dim) {
+                    if (existing_d == d || existing_d == d - ndim) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    dim.push_back(d);
+                }
             }
         }
         
-        // Parse s parameter (shape of the transformed axis)
+        // If no valid dims, use last dimension
+        if (dim.empty()) {
+            dim.push_back(ndim - 1);
+        }
+
+        // Parse s parameter (output sizes for transformed dimensions)
+        // s size should match dim size
+        c10::optional<c10::IntArrayRef> s_opt = c10::nullopt;
         std::vector<int64_t> s;
         if (offset + 1 < Size) {
-            uint8_t s_size = Data[offset++] % 5; // Get size of s parameter
-            
-            // Parse s values
-            for (uint8_t i = 0; i < s_size && offset + sizeof(int64_t) <= Size; i++) {
-                int64_t s_val;
-                std::memcpy(&s_val, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
-                s.push_back(s_val);
+            uint8_t use_s = Data[offset++] % 2;
+            if (use_s) {
+                for (size_t i = 0; i < dim.size() && offset < Size; i++) {
+                    // Use positive values for output sizes (1 to 64)
+                    int64_t s_val = (static_cast<int64_t>(Data[offset++]) % 64) + 1;
+                    s.push_back(s_val);
+                }
+                if (s.size() == dim.size()) {
+                    s_opt = s;
+                } else {
+                    s.clear();
+                }
             }
         }
-        
+
         // Parse norm parameter
-        std::optional<std::string> norm = std::nullopt;
+        c10::optional<c10::string_view> norm = c10::nullopt;
         if (offset < Size) {
             uint8_t norm_selector = Data[offset++] % 4;
             if (norm_selector == 0) {
@@ -55,44 +91,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             } else if (norm_selector == 2) {
                 norm = "ortho";
             }
-            // norm_selector == 3 keeps norm as std::nullopt
+            // norm_selector == 3 keeps norm as nullopt
         }
-        
-        // Apply torch.fft.hfftn operation
+
+        // Call torch::fft::hfftn with proper parameter order: (input, s, dim, norm)
+        // dim is required as IntArrayRef, not optional
         torch::Tensor result;
         
-        // Call with different combinations of parameters based on available data
-        if (dim.empty() && s.empty() && !norm) {
-            result = torch::fft::hfftn(input_tensor);
-        } else if (!dim.empty() && s.empty() && !norm) {
-            result = torch::fft::hfftn(input_tensor, dim);
-        } else if (dim.empty() && !s.empty() && !norm) {
-            result = torch::fft::hfftn(input_tensor, {}, s);
-        } else if (dim.empty() && s.empty() && norm) {
-            result = torch::fft::hfftn(input_tensor, {}, {}, *norm);
-        } else if (!dim.empty() && !s.empty() && !norm) {
-            result = torch::fft::hfftn(input_tensor, dim, s);
-        } else if (!dim.empty() && s.empty() && norm) {
-            result = torch::fft::hfftn(input_tensor, dim, {}, *norm);
-        } else if (dim.empty() && !s.empty() && norm) {
-            result = torch::fft::hfftn(input_tensor, {}, s, *norm);
-        } else {
-            result = torch::fft::hfftn(input_tensor, dim, s, norm ? *norm : "backward");
+        try {
+            result = torch::fft::hfftn(input_tensor, s_opt, dim, norm);
+        } catch (const c10::Error &e) {
+            // Shape mismatches and invalid dimension errors are expected
+            return 0;
         }
-        
+
         // Access result to ensure computation is performed
-        auto result_size = result.sizes();
-        auto result_dtype = result.dtype();
-        
-        // Try to perform a simple operation on the result to ensure it's valid
-        if (result.numel() > 0) {
+        if (result.defined() && result.numel() > 0) {
             auto sum = result.sum();
+            (void)sum;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

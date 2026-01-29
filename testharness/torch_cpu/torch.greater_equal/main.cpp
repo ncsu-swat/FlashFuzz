@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -28,50 +32,61 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Modify tensor2 to have different values
             if (tensor2.numel() > 0) {
-                // Add a small value to make it different
-                if (tensor2.is_floating_point()) {
-                    tensor2 = tensor2 + 0.5;
-                } else if (tensor2.is_complex()) {
-                    tensor2 = tensor2 + 1;
-                } else {
-                    tensor2 = tensor2 + 1;
+                try {
+                    if (tensor2.is_floating_point()) {
+                        tensor2 = tensor2 + 0.5;
+                    } else if (tensor2.is_complex()) {
+                        tensor2 = tensor2 + 1;
+                    } else {
+                        tensor2 = tensor2 + 1;
+                    }
+                } catch (...) {
+                    // Ignore arithmetic errors on certain dtypes
                 }
             }
         }
         
         // Apply greater_equal operation
-        torch::Tensor result = torch::greater_equal(tensor1, tensor2);
-        
-        // Try broadcasting version if shapes are different
-        if (tensor1.sizes() != tensor2.sizes()) {
-            try {
-                // Attempt broadcasting
-                torch::Tensor broadcast_result = torch::greater_equal(tensor1, tensor2);
-            } catch (...) {
-                // Ignore broadcasting errors
-            }
+        try {
+            torch::Tensor result = torch::greater_equal(tensor1, tensor2);
+        } catch (...) {
+            // Ignore comparison errors (e.g., complex tensors don't support comparison)
         }
         
-        // Try scalar versions
-        if (tensor1.numel() > 0) {
-            // Get a scalar value from the first element
-            torch::Scalar scalar;
-            if (tensor1.is_floating_point()) {
-                scalar = tensor1.item<float>();
-            } else if (tensor1.is_complex()) {
-                scalar = tensor1.item<c10::complex<float>>().real();
-            } else {
-                scalar = tensor1.item<int64_t>();
+        // Try scalar versions with different scalar types
+        if (tensor1.numel() > 0 && !tensor1.is_complex()) {
+            try {
+                // Test tensor >= int scalar
+                torch::Tensor result_int = torch::greater_equal(tensor1, 0);
+            } catch (...) {
+                // Ignore errors
             }
             
-            // Test tensor >= scalar
-            torch::Tensor result_scalar = torch::greater_equal(tensor1, scalar);
+            try {
+                // Test tensor >= float scalar
+                torch::Tensor result_float = torch::greater_equal(tensor1, 0.5);
+            } catch (...) {
+                // Ignore errors
+            }
         }
         
-        // Try in-place version
-        if (tensor1.sizes() == tensor2.sizes() && tensor1.dtype() == torch::kBool) {
-            torch::Tensor tensor_copy = tensor1.clone();
-            tensor_copy.greater_equal_(tensor2);
+        // Try ge (alias for greater_equal)
+        try {
+            torch::Tensor result_ge = torch::ge(tensor1, tensor2);
+        } catch (...) {
+            // Ignore errors
+        }
+        
+        // Try in-place version on a copy (result will be bool)
+        try {
+            // Create a bool tensor for in-place operation
+            torch::Tensor bool_tensor = tensor1.to(torch::kBool);
+            if (tensor2.numel() > 0) {
+                torch::Tensor tensor2_bool = tensor2.to(torch::kBool);
+                bool_tensor.greater_equal_(tensor2_bool);
+            }
+        } catch (...) {
+            // Ignore in-place errors
         }
         
         // Try with empty tensors
@@ -82,19 +97,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Ignore errors with empty tensors
         }
         
-        // Try with tensors of different dtypes
+        // Try with 0-dim (scalar) tensors
         try {
-            if (tensor1.dtype() != tensor2.dtype()) {
-                torch::Tensor result_diff_dtype = torch::greater_equal(tensor1, tensor2);
-            }
+            torch::Tensor scalar_tensor1 = torch::tensor(1.0);
+            torch::Tensor scalar_tensor2 = torch::tensor(2.0);
+            torch::Tensor result_scalar = torch::greater_equal(scalar_tensor1, scalar_tensor2);
         } catch (...) {
-            // Ignore dtype mismatch errors
+            // Ignore errors
+        }
+        
+        // Try out= variant
+        try {
+            torch::Tensor out_tensor = torch::empty_like(tensor1, torch::kBool);
+            torch::greater_equal_out(out_tensor, tensor1, tensor2);
+        } catch (...) {
+            // Ignore errors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

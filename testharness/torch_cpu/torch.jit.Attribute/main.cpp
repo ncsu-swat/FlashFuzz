@@ -1,12 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/script.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -32,7 +35,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         switch (type_selector % 5) {
             case 0: {
                 // Register tensor attribute
-                module.register_attribute(attr_name, c10::TensorType::get(), tensor);
+                module.register_attribute(attr_name, c10::TensorType::get(), torch::jit::IValue(tensor));
                 break;
             }
             case 1: {
@@ -42,7 +45,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     std::memcpy(&int_value, Data + offset, sizeof(int64_t));
                     offset += sizeof(int64_t);
                 }
-                module.register_attribute(attr_name, c10::IntType::get(), int_value);
+                module.register_attribute(attr_name, c10::IntType::get(), torch::jit::IValue(int_value));
                 break;
             }
             case 2: {
@@ -51,8 +54,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 if (offset + sizeof(double) <= Size) {
                     std::memcpy(&float_value, Data + offset, sizeof(double));
                     offset += sizeof(double);
+                    // Sanitize NaN/Inf values
+                    if (std::isnan(float_value) || std::isinf(float_value)) {
+                        float_value = 0.0;
+                    }
                 }
-                module.register_attribute(attr_name, c10::FloatType::get(), float_value);
+                module.register_attribute(attr_name, c10::FloatType::get(), torch::jit::IValue(float_value));
                 break;
             }
             case 3: {
@@ -61,7 +68,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 if (offset < Size) {
                     str_value += std::to_string(Data[offset++]);
                 }
-                module.register_attribute(attr_name, c10::StringType::get(), str_value);
+                module.register_attribute(attr_name, c10::StringType::get(), torch::jit::IValue(str_value));
                 break;
             }
             case 4: {
@@ -70,7 +77,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 if (offset < Size) {
                     bool_value = (Data[offset++] % 2 == 0);
                 }
-                module.register_attribute(attr_name, c10::BoolType::get(), bool_value);
+                module.register_attribute(attr_name, c10::BoolType::get(), torch::jit::IValue(bool_value));
                 break;
             }
         }
@@ -79,28 +86,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (module.hasattr(attr_name)) {
             switch (type_selector % 5) {
                 case 0: {
-                    // Get tensor attribute
                     torch::Tensor retrieved = module.attr(attr_name).toTensor();
+                    (void)retrieved;
                     break;
                 }
                 case 1: {
-                    // Get int attribute
                     int64_t retrieved = module.attr(attr_name).toInt();
+                    (void)retrieved;
                     break;
                 }
                 case 2: {
-                    // Get float attribute
                     double retrieved = module.attr(attr_name).toDouble();
+                    (void)retrieved;
                     break;
                 }
                 case 3: {
-                    // Get string attribute
                     std::string retrieved = module.attr(attr_name).toStringRef();
+                    (void)retrieved;
                     break;
                 }
                 case 4: {
-                    // Get bool attribute
                     bool retrieved = module.attr(attr_name).toBool();
+                    (void)retrieved;
                     break;
                 }
             }
@@ -110,45 +117,45 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size && Data[offset] % 2 == 0) {
             try {
                 auto nonexistent = module.attr("nonexistent_attr");
+                (void)nonexistent;
             } catch (const c10::Error&) {
-                // Expected exception
+                // Expected exception - catch silently
             }
         }
         
         // Try to modify an attribute
         if (offset < Size && Data[offset] % 3 == 0) {
             if (module.hasattr(attr_name)) {
-                switch (type_selector % 5) {
-                    case 0: {
-                        // Create a new tensor with different shape/values
-                        torch::Tensor new_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                        module.setattr(attr_name, new_tensor);
-                        break;
+                try {
+                    switch (type_selector % 5) {
+                        case 0: {
+                            torch::Tensor new_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                            module.setattr(attr_name, torch::jit::IValue(new_tensor));
+                            break;
+                        }
+                        case 1: {
+                            int64_t new_int = 42;
+                            module.setattr(attr_name, torch::jit::IValue(new_int));
+                            break;
+                        }
+                        case 2: {
+                            double new_float = 3.14159;
+                            module.setattr(attr_name, torch::jit::IValue(new_float));
+                            break;
+                        }
+                        case 3: {
+                            std::string new_str = "modified_string";
+                            module.setattr(attr_name, torch::jit::IValue(new_str));
+                            break;
+                        }
+                        case 4: {
+                            bool new_bool = true;
+                            module.setattr(attr_name, torch::jit::IValue(new_bool));
+                            break;
+                        }
                     }
-                    case 1: {
-                        // Modify int attribute
-                        int64_t new_int = 42;
-                        module.setattr(attr_name, new_int);
-                        break;
-                    }
-                    case 2: {
-                        // Modify float attribute
-                        double new_float = 3.14159;
-                        module.setattr(attr_name, new_float);
-                        break;
-                    }
-                    case 3: {
-                        // Modify string attribute
-                        std::string new_str = "modified_string";
-                        module.setattr(attr_name, new_str);
-                        break;
-                    }
-                    case 4: {
-                        // Modify bool attribute
-                        bool new_bool = true;
-                        module.setattr(attr_name, new_bool);
-                        break;
-                    }
+                } catch (const c10::Error&) {
+                    // Type mismatch or other expected errors - catch silently
                 }
             }
         }
@@ -156,14 +163,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Try to remove an attribute
         if (offset < Size && Data[offset] % 5 == 0) {
             if (module.hasattr(attr_name)) {
-                module._ivalue()->unsafeRemoveAttr(attr_name);
+                try {
+                    module._ivalue()->unsafeRemoveAttr(attr_name);
+                } catch (const c10::Error&) {
+                    // Expected error for certain attributes - catch silently
+                }
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

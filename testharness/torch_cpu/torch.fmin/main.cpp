@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <limits>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -28,21 +33,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Apply torch.fmin operation
-        // fmin returns the minimum of each element in input1 and input2
+        // fmin returns the element-wise minimum, propagating NaN
         torch::Tensor result = torch::fmin(input1, input2);
         
-        // Try broadcasting version if shapes are different
-        if (input1.sizes() != input2.sizes()) {
-            try {
-                torch::Tensor broadcast_result = torch::fmin(input1, input2);
-            } catch (const std::exception&) {
-                // Broadcasting might fail for incompatible shapes, which is expected
-            }
-        }
-        
         // Try scalar version
-        if (offset + 1 < Size) {
-            double scalar_value = static_cast<double>(Data[offset]);
+        if (offset + sizeof(float) <= Size) {
+            float scalar_value;
+            memcpy(&scalar_value, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            
             try {
                 torch::Tensor scalar_tensor = torch::tensor(scalar_value);
                 torch::Tensor scalar_result1 = torch::fmin(input1, scalar_tensor);
@@ -60,28 +59,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Empty tensor operations might fail
         }
         
-        // Try with NaN values
-        try {
-            torch::Tensor nan_tensor = torch::full_like(input1, std::numeric_limits<float>::quiet_NaN());
-            torch::Tensor nan_result = torch::fmin(input1, nan_tensor);
-        } catch (const std::exception&) {
-            // NaN operations might behave differently
+        // Test with special float values if input is float type
+        if (input1.is_floating_point()) {
+            try {
+                // Test NaN propagation behavior
+                torch::Tensor nan_tensor = torch::full_like(input1, std::numeric_limits<float>::quiet_NaN());
+                torch::Tensor nan_result = torch::fmin(input1, nan_tensor);
+            } catch (const std::exception&) {
+                // NaN operations might behave differently for some dtypes
+            }
+            
+            try {
+                // Test infinity handling
+                torch::Tensor inf_tensor = torch::full_like(input1, std::numeric_limits<float>::infinity());
+                torch::Tensor inf_result = torch::fmin(input1, inf_tensor);
+                
+                torch::Tensor neg_inf_tensor = torch::full_like(input1, -std::numeric_limits<float>::infinity());
+                torch::Tensor neg_inf_result = torch::fmin(input1, neg_inf_tensor);
+            } catch (const std::exception&) {
+                // Infinity operations might fail for some dtypes
+            }
         }
         
-        // Try with infinity values
+        // Test with same tensor (should return identical tensor)
         try {
-            torch::Tensor inf_tensor = torch::full_like(input1, std::numeric_limits<float>::infinity());
-            torch::Tensor inf_result = torch::fmin(input1, inf_tensor);
-            torch::Tensor neg_inf_tensor = torch::full_like(input1, -std::numeric_limits<float>::infinity());
-            torch::Tensor neg_inf_result = torch::fmin(input1, neg_inf_tensor);
+            torch::Tensor same_result = torch::fmin(input1, input1);
         } catch (const std::exception&) {
-            // Infinity operations might behave differently
+            // Might fail for unsupported dtypes
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

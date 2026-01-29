@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,41 +23,53 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a copy of the input tensor for in-place operation
-        torch::Tensor input_copy = input.clone();
-        
-        // Apply acosh_ operation (in-place)
-        input_copy.acosh_();
-        
-        // Verify the operation by comparing with the non-in-place version
-        torch::Tensor expected_output = torch::acosh(input);
-        
-        // Check if the in-place operation produced the same result as the non-in-place version
-        // This is a sanity check, not a defensive check that would prevent testing edge cases
-        if (input_copy.defined() && expected_output.defined()) {
-            try {
-                bool equal = torch::allclose(input_copy, expected_output, 1e-5, 1e-8);
-                if (!equal) {
-                    // This is not an error, just an observation that might be useful for debugging
-                    // We don't throw or return early here
-                }
-            } catch (const std::exception& e) {
-                // Comparison might fail for certain types or values, but we continue execution
-            }
+        // Test 1: Basic in-place acosh_ operation
+        {
+            torch::Tensor tensor_copy = input.clone();
+            tensor_copy.acosh_();
         }
         
-        // Try another variant with different tensor if we have more data
+        // Test 2: With contiguous tensor
+        {
+            torch::Tensor contiguous_tensor = input.contiguous().clone();
+            contiguous_tensor.acosh_();
+        }
+        
+        // Test 3: With different dtypes if possible
+        try {
+            torch::Tensor float_tensor = input.to(torch::kFloat32).clone();
+            float_tensor.acosh_();
+        } catch (...) {
+            // Dtype conversion might fail, continue
+        }
+        
+        try {
+            torch::Tensor double_tensor = input.to(torch::kFloat64).clone();
+            double_tensor.acosh_();
+        } catch (...) {
+            // Dtype conversion might fail, continue
+        }
+        
+        // Test 4: With another tensor from remaining data
         if (Size - offset > 2) {
             torch::Tensor another_input = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Apply acosh_ directly without making a copy
             another_input.acosh_();
+        }
+        
+        // Test 5: Sliced tensor (non-contiguous)
+        if (input.numel() > 2) {
+            try {
+                torch::Tensor sliced = input.slice(0, 0, input.size(0) / 2 + 1).clone();
+                sliced.acosh_();
+            } catch (...) {
+                // Slicing might fail for certain shapes
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

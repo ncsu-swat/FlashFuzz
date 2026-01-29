@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -32,36 +37,53 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (type_list.size() > 0) {
             c10::ScalarType unified_type = type_list[0];
             for (size_t i = 1; i < type_list.size(); ++i) {
-                unified_type = c10::promoteTypes(unified_type, type_list[i]);
+                try {
+                    unified_type = c10::promoteTypes(unified_type, type_list[i]);
+                } catch (...) {
+                    // Some type combinations may not be promotable, silently skip
+                }
             }
             
             // Create a tensor with the unified type to verify it works
-            std::vector<int64_t> shape = {1, 1};
-            auto options = torch::TensorOptions().dtype(unified_type);
-            torch::Tensor test_tensor = torch::zeros(shape, options);
-        }
-        
-        // Try with empty list (edge case)
-        if (offset < Size && Data[offset++] % 2 == 0) {
-            std::vector<c10::ScalarType> empty_list;
-            // Skip empty list case since promoteTypes requires at least one type
+            try {
+                std::vector<int64_t> shape = {1, 1};
+                auto options = torch::TensorOptions().dtype(unified_type);
+                torch::Tensor test_tensor = torch::zeros(shape, options);
+            } catch (...) {
+                // Some types may not be valid for tensor creation
+            }
         }
         
         // Try with mixed numeric and complex types
         if (offset + 1 < Size) {
-            c10::ScalarType mixed_result = c10::promoteTypes(torch::kFloat, torch::kComplexFloat);
+            try {
+                c10::ScalarType mixed_result = c10::promoteTypes(torch::kFloat, torch::kComplexFloat);
+                (void)mixed_result;
+            } catch (...) {
+                // Silently handle
+            }
         }
         
         // Try with potentially incompatible types
         if (offset + 1 < Size) {
-            c10::ScalarType incompatible_result = c10::promoteTypes(torch::kBool, torch::kComplexDouble);
+            try {
+                c10::ScalarType incompatible_result = c10::promoteTypes(torch::kBool, torch::kComplexDouble);
+                (void)incompatible_result;
+            } catch (...) {
+                // Silently handle
+            }
         }
         
         // Try with duplicate types
         if (offset < Size) {
             uint8_t type_selector = Data[offset++];
             c10::ScalarType dtype = fuzzer_utils::parseDataType(type_selector);
-            c10::ScalarType duplicate_result = c10::promoteTypes(dtype, dtype);
+            try {
+                c10::ScalarType duplicate_result = c10::promoteTypes(dtype, dtype);
+                (void)duplicate_result;
+            } catch (...) {
+                // Silently handle
+            }
         }
         
         // Try with all supported types
@@ -71,18 +93,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 torch::kInt8, torch::kUInt8, torch::kInt16, torch::kInt32, torch::kInt64,
                 torch::kBool, torch::kComplexFloat, torch::kComplexDouble
             };
-            if (all_types.size() > 0) {
-                c10::ScalarType all_result = all_types[0];
-                for (size_t i = 1; i < all_types.size(); ++i) {
+            c10::ScalarType all_result = all_types[0];
+            for (size_t i = 1; i < all_types.size(); ++i) {
+                try {
                     all_result = c10::promoteTypes(all_result, all_types[i]);
+                } catch (...) {
+                    // Silently handle promotion failures
                 }
+            }
+            (void)all_result;
+        }
+        
+        // Additional test: result_type which is another type unification function
+        if (offset + 2 < Size) {
+            uint8_t type1_selector = Data[offset++];
+            uint8_t type2_selector = Data[offset++];
+            c10::ScalarType dtype1 = fuzzer_utils::parseDataType(type1_selector);
+            c10::ScalarType dtype2 = fuzzer_utils::parseDataType(type2_selector);
+            
+            try {
+                // Create tensors and use torch::result_type
+                auto t1 = torch::zeros({1}, torch::TensorOptions().dtype(dtype1));
+                auto t2 = torch::zeros({1}, torch::TensorOptions().dtype(dtype2));
+                c10::ScalarType result = torch::result_type(t1, t2);
+                (void)result;
+            } catch (...) {
+                // Silently handle
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

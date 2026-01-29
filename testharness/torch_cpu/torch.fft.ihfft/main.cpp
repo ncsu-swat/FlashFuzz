@@ -1,34 +1,50 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Skip if we don't have enough data
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Apply ihfft operation
+        // ihfft requires at least 1-dimensional real-valued input
+        if (input.dim() == 0) {
+            input = input.unsqueeze(0);
+        }
+        
         // ihfft expects a real-valued input tensor
-        // If the input tensor is complex, convert it to real
         if (input.is_complex()) {
             input = torch::real(input);
         }
         
-        // Get a dimension to apply ihfft along
+        // Ensure input is floating point
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Get a dimension to apply ihfft along (valid range: 0 to dim-1, or use -1)
         int64_t dim = -1;
         if (offset < Size) {
-            dim = static_cast<int64_t>(Data[offset++]) % (input.dim() + 1) - 1;
+            uint8_t dim_selector = Data[offset++];
+            if (input.dim() > 0) {
+                dim = static_cast<int64_t>(dim_selector % input.dim());
+            }
         }
         
         // Get norm parameter
@@ -44,46 +60,53 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Apply ihfft operation
-        torch::Tensor result;
-        if (input.dim() > 0) {
-            if (dim >= 0 && dim < input.dim()) {
-                // Apply ihfft along the specified dimension
-                result = torch::fft::ihfft(input, c10::nullopt, dim, norm);
-            } else {
-                // Apply ihfft along the last dimension
-                result = torch::fft::ihfft(input, c10::nullopt, -1, norm);
-            }
-        } else {
-            // For 0-dim tensors, just apply ihfft without dimension
-            result = torch::fft::ihfft(input, c10::nullopt, -1, norm);
+        // Apply ihfft operation without n parameter
+        try {
+            torch::Tensor result = torch::fft::ihfft(input, c10::nullopt, dim, norm);
+            (void)result;
+        } catch (const std::exception &) {
+            // Expected failures (e.g., invalid input) - continue fuzzing
         }
         
         // Try with n parameter (length of transformed axis)
-        if (offset + sizeof(int64_t) <= Size) {
-            int64_t n_raw;
-            std::memcpy(&n_raw, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset < Size) {
+            // Get n value from fuzzer data
+            int64_t n = static_cast<int64_t>(Data[offset++] % 64) + 1;
             
-            // Make n positive and reasonable
-            int64_t n = std::abs(n_raw) % 100 + 1;
-            
-            // Apply ihfft with n parameter
-            if (input.dim() > 0) {
-                if (dim >= 0 && dim < input.dim()) {
-                    result = torch::fft::ihfft(input, c10::optional<int64_t>(n), dim, norm);
-                } else {
-                    result = torch::fft::ihfft(input, c10::optional<int64_t>(n), -1, norm);
-                }
-            } else {
-                result = torch::fft::ihfft(input, c10::optional<int64_t>(n), -1, norm);
+            try {
+                torch::Tensor result = torch::fft::ihfft(input, c10::optional<int64_t>(n), dim, norm);
+                (void)result;
+            } catch (const std::exception &) {
+                // Expected failures - continue fuzzing
+            }
+        }
+        
+        // Test with different dimensions if tensor has multiple dims
+        if (input.dim() > 1 && offset < Size) {
+            int64_t alt_dim = static_cast<int64_t>(Data[offset++] % input.dim());
+            try {
+                torch::Tensor result = torch::fft::ihfft(input, c10::nullopt, alt_dim, norm);
+                (void)result;
+            } catch (const std::exception &) {
+                // Expected failures - continue
+            }
+        }
+        
+        // Test with contiguous vs non-contiguous input
+        if (input.dim() >= 2) {
+            try {
+                torch::Tensor transposed = input.transpose(0, 1);
+                torch::Tensor result = torch::fft::ihfft(transposed, c10::nullopt, -1, norm);
+                (void)result;
+            } catch (const std::exception &) {
+                // Expected failures - continue
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

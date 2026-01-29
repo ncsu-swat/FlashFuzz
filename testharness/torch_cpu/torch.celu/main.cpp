@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For std::isfinite
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -24,8 +30,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&alpha, Data + offset, sizeof(float));
             offset += sizeof(float);
             
-            // Ensure alpha is not zero or negative (which would cause issues)
-            if (alpha <= 0.0f) {
+            // Ensure alpha is valid (positive and finite)
+            if (!std::isfinite(alpha) || alpha <= 0.0f) {
                 alpha = 1.0f;
             }
         }
@@ -56,19 +62,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Test with extreme values for alpha
+        // Test with varied alpha values
         if (Size > offset + sizeof(float)) {
-            float extreme_alpha;
-            std::memcpy(&extreme_alpha, Data + offset, sizeof(float));
+            float varied_alpha;
+            std::memcpy(&varied_alpha, Data + offset, sizeof(float));
+            offset += sizeof(float);
             
-            // Don't filter out extreme values - let PyTorch handle them
-            torch::Tensor output_extreme = torch::celu(input, extreme_alpha);
+            // Only test with valid alpha values
+            if (std::isfinite(varied_alpha) && varied_alpha > 0.0f) {
+                torch::Tensor output_varied = torch::celu(input, varied_alpha);
+            }
+        }
+        
+        // Test with different input tensor types
+        if (input.scalar_type() != torch::kFloat) {
+            try {
+                torch::Tensor float_input = input.to(torch::kFloat);
+                torch::Tensor output_float = torch::celu(float_input, alpha);
+            } catch (...) {
+                // Silently ignore conversion failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

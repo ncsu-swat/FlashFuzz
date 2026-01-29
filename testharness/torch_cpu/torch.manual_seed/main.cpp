@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstring>        // For std::memcpy
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -32,6 +37,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // The two tensors should be identical since we used the same seed
         bool tensors_equal = torch::all(torch::eq(random_tensor, random_tensor2)).item<bool>();
+        (void)tensors_equal; // Suppress unused variable warning
         
         // If there's more data, try creating a tensor and test operations with the seeded random state
         if (offset < Size) {
@@ -47,8 +53,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 // Check if dropout results are identical with the same seed
                 bool dropout_equal = torch::all(torch::eq(dropout_result, dropout_result2)).item<bool>();
+                (void)dropout_equal; // Suppress unused variable warning
             } catch (const std::exception &e) {
-                // Ignore exceptions from tensor creation
+                // Ignore exceptions from tensor creation - expected for invalid shapes
             }
         }
         
@@ -68,11 +75,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test with zero seed
         torch::manual_seed(0);
         torch::Tensor zero_seed_tensor = torch::rand({2, 2});
+        
+        // Additional coverage: test various random generation functions with the seed
+        if (Size >= 16) {
+            uint64_t seed2;
+            std::memcpy(&seed2, Data + 8, sizeof(uint64_t));
+            torch::manual_seed(static_cast<int64_t>(seed2));
+            
+            // Test different random tensor creation methods
+            torch::Tensor randn_tensor = torch::randn({2, 3});
+            torch::Tensor randint_tensor = torch::randint(0, 100, {3, 3});
+            torch::Tensor randperm_tensor = torch::randperm(10);
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

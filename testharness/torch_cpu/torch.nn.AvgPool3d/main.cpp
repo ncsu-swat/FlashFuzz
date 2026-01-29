@@ -1,131 +1,145 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
+        
+        // Extract parameters for AvgPool3d from the data first
+        int64_t kernel_d = (Data[offset++] % 3) + 1; // 1-3
+        int64_t kernel_h = (Data[offset++] % 3) + 1; // 1-3
+        int64_t kernel_w = (Data[offset++] % 3) + 1; // 1-3
+        int64_t stride = (Data[offset++] % 2) + 1;   // 1-2
+        int64_t padding = Data[offset++] % 2;        // 0-1
+        bool ceil_mode = Data[offset++] % 2;
+        bool count_include_pad = Data[offset++] % 2;
+        uint8_t config_selector = Data[offset++] % 4;
+        
+        // Create input tensor from remaining data
+        torch::Tensor input = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
         
         // Ensure we have a 5D tensor (batch_size, channels, depth, height, width)
-        // If not, reshape it to 5D
-        if (input.dim() < 5) {
-            std::vector<int64_t> new_shape;
+        // Create appropriate dimensions that are large enough for the pooling operation
+        int64_t batch = 1;
+        int64_t channels = 1;
+        int64_t depth = kernel_d + padding * 2 + 1;
+        int64_t height = kernel_h + padding * 2 + 1;
+        int64_t width = kernel_w + padding * 2 + 1;
+        
+        int64_t total_elements = input.numel();
+        if (total_elements <= 0) {
+            return 0;
+        }
+        
+        // Adjust dimensions based on available elements
+        int64_t required = batch * channels * depth * height * width;
+        
+        if (total_elements < required) {
+            // Use smaller fixed dimensions
+            depth = kernel_d + 1;
+            height = kernel_h + 1;
+            width = kernel_w + 1;
+            required = batch * channels * depth * height * width;
             
-            // Keep original dimensions
-            for (int i = 0; i < input.dim(); i++) {
-                new_shape.push_back(input.size(i));
+            if (total_elements < required) {
+                // Expand tensor to fit minimum requirements
+                input = input.flatten();
+                std::vector<int64_t> expand_sizes(required - total_elements, 0);
+                torch::Tensor padding_tensor = torch::zeros({required - total_elements}, input.options());
+                input = torch::cat({input, padding_tensor});
             }
-            
-            // Add missing dimensions
-            while (new_shape.size() < 5) {
-                new_shape.push_back(1);
-            }
-            
-            input = input.reshape(new_shape);
         }
         
-        // Extract parameters for AvgPool3d from the remaining data
-        int64_t kernel_size = 1;
-        int64_t stride = 1;
-        int64_t padding = 0;
-        bool ceil_mode = false;
-        bool count_include_pad = true;
-        int64_t divisor_override = 0;
+        // Reshape to 5D
+        input = input.flatten().slice(0, 0, batch * channels * depth * height * width);
+        input = input.reshape({batch, channels, depth, height, width});
         
-        if (offset + 1 < Size) {
-            kernel_size = (Data[offset++] % 5) + 1; // 1-5
+        // Ensure float type for avg pooling
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
         }
         
-        if (offset + 1 < Size) {
-            stride = (Data[offset++] % 3) + 1; // 1-3
-        }
-        
-        if (offset + 1 < Size) {
-            padding = Data[offset++] % 3; // 0-2
-        }
-        
-        if (offset + 1 < Size) {
-            ceil_mode = Data[offset++] % 2; // 0-1 (false-true)
-        }
-        
-        if (offset + 1 < Size) {
-            count_include_pad = Data[offset++] % 2; // 0-1 (false-true)
-        }
-        
-        if (offset + 1 < Size) {
-            // divisor_override should be 0 (None) or a positive integer
-            divisor_override = Data[offset++] % 4; // 0-3
-        }
-        
-        // Create AvgPool3d module with various parameters
+        // Create AvgPool3d module with various parameter combinations
         torch::nn::AvgPool3d avg_pool = nullptr;
         
-        // Try different parameter combinations
-        if (offset % 4 == 0) {
-            // Single integer for kernel_size, stride, padding
-            avg_pool = torch::nn::AvgPool3d(
-                torch::nn::AvgPool3dOptions(kernel_size)
-                    .stride(stride)
-                    .padding(padding)
-                    .ceil_mode(ceil_mode)
-                    .count_include_pad(count_include_pad)
-            );
-        } else if (offset % 4 == 1) {
-            // Try with tuple for kernel_size
-            avg_pool = torch::nn::AvgPool3d(
-                torch::nn::AvgPool3dOptions({kernel_size, kernel_size, kernel_size})
-                    .stride(stride)
-                    .padding(padding)
-                    .ceil_mode(ceil_mode)
-                    .count_include_pad(count_include_pad)
-            );
-        } else if (offset % 4 == 2) {
-            // Try with tuple for stride
-            avg_pool = torch::nn::AvgPool3d(
-                torch::nn::AvgPool3dOptions(kernel_size)
-                    .stride({stride, stride, stride})
-                    .padding(padding)
-                    .ceil_mode(ceil_mode)
-                    .count_include_pad(count_include_pad)
-            );
-        } else {
-            // Try with tuple for padding
-            c10::optional<int64_t> divisor_opt = divisor_override > 0 ? c10::optional<int64_t>(divisor_override) : c10::nullopt;
-            avg_pool = torch::nn::AvgPool3d(
-                torch::nn::AvgPool3dOptions(kernel_size)
-                    .stride(stride)
-                    .padding({padding, padding, padding})
-                    .ceil_mode(ceil_mode)
-                    .count_include_pad(count_include_pad)
-                    .divisor_override(divisor_opt)
-            );
+        try {
+            if (config_selector == 0) {
+                // Single integer for kernel_size
+                avg_pool = torch::nn::AvgPool3d(
+                    torch::nn::AvgPool3dOptions(kernel_d)
+                        .stride(stride)
+                        .padding(padding)
+                        .ceil_mode(ceil_mode)
+                        .count_include_pad(count_include_pad)
+                );
+            } else if (config_selector == 1) {
+                // Tuple for kernel_size
+                avg_pool = torch::nn::AvgPool3d(
+                    torch::nn::AvgPool3dOptions({kernel_d, kernel_h, kernel_w})
+                        .stride(stride)
+                        .padding(padding)
+                        .ceil_mode(ceil_mode)
+                        .count_include_pad(count_include_pad)
+                );
+            } else if (config_selector == 2) {
+                // Tuple for stride
+                avg_pool = torch::nn::AvgPool3d(
+                    torch::nn::AvgPool3dOptions(kernel_d)
+                        .stride({stride, stride, stride})
+                        .padding(padding)
+                        .ceil_mode(ceil_mode)
+                        .count_include_pad(count_include_pad)
+                );
+            } else {
+                // Tuple for padding and divisor_override
+                int64_t divisor_val = (Data[0] % 4) + 1; // 1-4
+                c10::optional<int64_t> divisor_opt = (Data[1] % 2) ? c10::optional<int64_t>(divisor_val) : c10::nullopt;
+                avg_pool = torch::nn::AvgPool3d(
+                    torch::nn::AvgPool3dOptions(kernel_d)
+                        .stride(stride)
+                        .padding({padding, padding, padding})
+                        .ceil_mode(ceil_mode)
+                        .count_include_pad(count_include_pad)
+                        .divisor_override(divisor_opt)
+                );
+            }
+            
+            // Apply the AvgPool3d operation
+            torch::Tensor output = avg_pool->forward(input);
+            
+            // Access output properties to ensure computation completed
+            auto output_size = output.sizes();
+            (void)output_size;
+            
+            // Additional coverage: backward pass
+            if (input.requires_grad() || (Data[0] % 3 == 0)) {
+                torch::Tensor input_grad = input.clone().detach().requires_grad_(true);
+                torch::Tensor output_grad = avg_pool->forward(input_grad);
+                output_grad.sum().backward();
+            }
+        } catch (const c10::Error&) {
+            // Silently catch expected errors from invalid configurations
         }
         
-        // Apply the AvgPool3d operation
-        torch::Tensor output = avg_pool->forward(input);
-        
-        // Try to access output properties to ensure computation completed
-        auto output_size = output.sizes();
-        auto output_dtype = output.dtype();
-        
-        return 0; // keep the input
+        return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

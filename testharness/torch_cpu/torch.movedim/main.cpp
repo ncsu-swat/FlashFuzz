@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -55,7 +60,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test single dimension version
         try {
             torch::Tensor result1 = torch::movedim(input_tensor, source_dim, destination_dim);
-        } catch (const std::exception&) {
+            // Verify result has same number of elements
+            (void)result1.numel();
+        } catch (...) {
             // Expected to throw for invalid dimensions
         }
         
@@ -92,7 +99,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Test with vectors of dimensions
             try {
                 torch::Tensor result2 = torch::movedim(input_tensor, source_dims, destination_dims);
-            } catch (const std::exception&) {
+                (void)result2.numel();
+            } catch (...) {
                 // Expected to throw for invalid dimensions
             }
         }
@@ -100,28 +108,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test edge cases with empty vectors
         try {
             torch::Tensor result3 = torch::movedim(input_tensor, std::vector<int64_t>{}, std::vector<int64_t>{});
-        } catch (const std::exception&) {
+            (void)result3.numel();
+        } catch (...) {
             // May throw depending on implementation
         }
         
-        // Test with negative dimensions
+        // Test with negative dimensions (valid in PyTorch)
         try {
             torch::Tensor result4 = torch::movedim(input_tensor, -1, 0);
-        } catch (const std::exception&) {
+            (void)result4.numel();
+        } catch (...) {
             // May throw for invalid negative dimensions
         }
         
-        // Test with out-of-bounds dimensions
+        // Test moving last dim to first position
         try {
-            torch::Tensor result5 = torch::movedim(input_tensor, rank + 1, 0);
-        } catch (const std::exception&) {
+            torch::Tensor result5 = torch::movedim(input_tensor, rank - 1, 0);
+            (void)result5.numel();
+        } catch (...) {
+            // May throw
+        }
+        
+        // Test with out-of-bounds dimensions (should throw)
+        try {
+            torch::Tensor result6 = torch::movedim(input_tensor, rank + 1, 0);
+            (void)result6.numel();
+        } catch (...) {
             // Expected to throw for out-of-bounds dimensions
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

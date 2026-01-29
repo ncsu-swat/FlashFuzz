@@ -1,120 +1,114 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least a few bytes for basic tensor creation
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // group_norm requires at least 2D input (N, C, ...)
+        if (input.dim() < 2) {
+            return 0;
+        }
+        
+        // Ensure we have a reasonable number of channels
+        int64_t num_channels = input.size(1);
+        if (num_channels <= 0 || num_channels > 1024) {
+            return 0;
+        }
+        
         // Extract parameters for group_norm
-        // We need at least 4 more bytes for parameters
-        if (offset + 4 > Size) {
+        if (offset + 2 > Size) {
             return 0;
         }
         
         // Parse number of groups
-        int64_t num_groups = 1;
-        if (input.dim() > 1) {
-            uint8_t groups_byte = Data[offset++];
-            // Ensure num_groups is between 1 and the number of channels
-            // For group_norm, the channel dimension is typically dim 1 for NCHW format
-            int64_t num_channels = input.dim() > 1 ? input.size(1) : 1;
-            if (num_channels > 0) {
-                num_groups = (groups_byte % num_channels) + 1;
-                // Ensure num_channels is divisible by num_groups
-                while (num_channels % num_groups != 0 && num_groups > 1) {
-                    num_groups--;
-                }
-            }
+        uint8_t groups_byte = Data[offset++];
+        // Ensure num_groups is between 1 and the number of channels
+        int64_t num_groups = (groups_byte % num_channels) + 1;
+        // Ensure num_channels is divisible by num_groups
+        while (num_channels % num_groups != 0 && num_groups > 1) {
+            num_groups--;
         }
         
-        // Parse epsilon value
-        float epsilon = 1e-5; // Default value
-        if (offset + sizeof(float) <= Size) {
-            std::memcpy(&epsilon, Data + offset, sizeof(float));
-            offset += sizeof(float);
-            // Ensure epsilon is positive
-            epsilon = std::abs(epsilon);
-            // Avoid extremely small values that might cause numerical issues
-            if (epsilon < 1e-10) {
-                epsilon = 1e-10;
-            }
+        // Parse epsilon value from a byte (scaled to reasonable range)
+        uint8_t eps_byte = Data[offset++];
+        double epsilon = 1e-5 + (eps_byte / 255.0) * 1e-3; // Range: 1e-5 to ~1e-3
+        
+        // Decide whether to use weight/bias based on fuzzer data
+        bool use_affine = false;
+        if (offset < Size) {
+            use_affine = (Data[offset++] % 2) == 1;
         }
         
-        // Create weight and bias tensors if there's enough data
+        // Create weight and bias tensors
         torch::Tensor weight;
         torch::Tensor bias;
         
-        // For group_norm, weight and bias should have shape [C] where C is the number of channels
-        if (input.dim() > 1) {
-            int64_t num_channels = input.size(1);
+        if (use_affine) {
+            // Use float dtype for weight and bias to avoid issues
+            auto options = torch::TensorOptions().dtype(torch::kFloat32);
             
-            if (offset < Size) {
-                // Create weight tensor
-                auto options = torch::TensorOptions().dtype(input.dtype());
-                if (num_channels > 0) {
-                    std::vector<int64_t> weight_shape = {num_channels};
-                    
-                    // Parse weight data
-                    std::vector<uint8_t> weight_data;
-                    size_t dtype_size = c10::elementSize(input.scalar_type());
-                    size_t bytes_needed = num_channels * dtype_size;
-                    
-                    if (offset + bytes_needed <= Size) {
-                        weight_data.resize(bytes_needed);
-                        std::memcpy(weight_data.data(), Data + offset, bytes_needed);
-                        offset += bytes_needed;
-                        weight = torch::from_blob(weight_data.data(), weight_shape, options).clone();
-                    } else {
-                        // Not enough data, create ones tensor
-                        weight = torch::ones(weight_shape, options);
-                    }
-                    
-                    // Create bias tensor with similar approach
-                    std::vector<int64_t> bias_shape = {num_channels};
-                    
-                    if (offset + bytes_needed <= Size) {
-                        std::vector<uint8_t> bias_data(bytes_needed);
-                        std::memcpy(bias_data.data(), Data + offset, bytes_needed);
-                        offset += bytes_needed;
-                        bias = torch::from_blob(bias_data.data(), bias_shape, options).clone();
-                    } else {
-                        // Not enough data, create zeros tensor
-                        bias = torch::zeros(bias_shape, options);
-                    }
+            // Initialize weight to ones with some variation
+            weight = torch::ones({num_channels}, options);
+            if (offset + num_channels <= Size) {
+                for (int64_t i = 0; i < num_channels && offset < Size; i++, offset++) {
+                    // Scale byte to range [0.5, 1.5]
+                    weight[i] = 0.5f + (Data[offset] / 255.0f);
+                }
+            }
+            
+            // Initialize bias to zeros with some variation
+            bias = torch::zeros({num_channels}, options);
+            if (offset + num_channels <= Size) {
+                for (int64_t i = 0; i < num_channels && offset < Size; i++, offset++) {
+                    // Scale byte to range [-0.5, 0.5]
+                    bias[i] = (Data[offset] / 255.0f) - 0.5f;
                 }
             }
         }
+        
+        // Convert input to float if needed (group_norm works best with float)
+        torch::Tensor float_input = input.to(torch::kFloat32);
         
         // Apply group_norm operation
         torch::Tensor output;
         
-        // Handle different cases based on available parameters
-        if (weight.defined() && bias.defined()) {
-            output = torch::group_norm(input, num_groups, weight, bias, epsilon);
-        } else {
-            output = torch::group_norm(input, num_groups, {}, {}, epsilon);
+        try {
+            // Handle different cases based on available parameters
+            if (use_affine && weight.defined() && bias.defined()) {
+                output = torch::group_norm(float_input, num_groups, weight, bias, epsilon);
+            } else {
+                output = torch::group_norm(float_input, num_groups, {}, {}, epsilon);
+            }
+        } catch (const c10::Error &e) {
+            // Silently catch expected errors (shape mismatches, etc.)
+            return 0;
         }
         
         // Perform some operations on the output to ensure it's used
         auto sum = output.sum();
         
         // Ensure the operation is not optimized away
-        if (sum.item<float>() == -12345.6789f) {
-            std::cerr << "Unlikely value detected";
-        }
+        volatile float result = sum.item<float>();
+        (void)result;
         
         return 0; // keep the input
     }
@@ -123,5 +117,4 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         std::cerr << "Exception caught: " << e.what() << std::endl;
         return -1; // discard the input
     }
-    return 0; // keep the input
 }

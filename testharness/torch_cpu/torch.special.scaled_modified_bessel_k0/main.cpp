@@ -1,18 +1,22 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         if (Size < 2) {
             return 0;
         }
+        
+        size_t offset = 0;
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
@@ -20,82 +24,111 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply the scaled_modified_bessel_k0 operation
         torch::Tensor result = torch::special::scaled_modified_bessel_k0(input);
         
-        // Try to access the result to ensure computation is performed
+        // Access the result to ensure computation is performed
         if (result.defined() && result.numel() > 0) {
-            result.item();
+            volatile float val = result.sum().item<float>();
+            (void)val;
         }
         
-        // Try with different input types
+        // Try with float64 dtype
         if (offset + 2 < Size) {
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
-            torch::Tensor result2 = torch::special::scaled_modified_bessel_k0(input2);
+            size_t offset2 = offset;
+            torch::Tensor input_f64 = fuzzer_utils::createTensor(Data, Size, offset2);
+            input_f64 = input_f64.to(torch::kFloat64);
             
-            if (result2.defined() && result2.numel() > 0) {
-                result2.item();
+            torch::Tensor result_f64 = torch::special::scaled_modified_bessel_k0(input_f64);
+            
+            if (result_f64.defined() && result_f64.numel() > 0) {
+                volatile double val = result_f64.sum().item<double>();
+                (void)val;
             }
         }
         
         // Try with edge cases if we have enough data
-        if (Size > offset + 4) {
-            // Create a tensor with potentially extreme values
-            torch::Tensor extreme_values;
-            
-            // Use the remaining data to create a tensor that might have extreme values
+        if (Size > 4) {
+            // Test with extreme positive values
             try {
-                extreme_values = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
-                
-                // Multiply by a large factor to get extreme values
-                extreme_values = extreme_values * 1e10;
-                
+                torch::Tensor extreme_values = torch::abs(input) * 1e10;
                 torch::Tensor extreme_result = torch::special::scaled_modified_bessel_k0(extreme_values);
                 
                 if (extreme_result.defined() && extreme_result.numel() > 0) {
-                    extreme_result.item();
+                    volatile float val = extreme_result.sum().item<float>();
+                    (void)val;
                 }
             } catch (const std::exception &) {
-                // Continue if this specific edge case fails
+                // Expected for some edge cases
             }
             
-            // Try with negative values
+            // Try with small positive values (function is defined for x > 0)
             try {
-                torch::Tensor negative_values = -torch::abs(extreme_values);
+                torch::Tensor small_values = torch::abs(input) * 1e-10 + 1e-15;
+                torch::Tensor small_result = torch::special::scaled_modified_bessel_k0(small_values);
+                
+                if (small_result.defined() && small_result.numel() > 0) {
+                    volatile float val = small_result.sum().item<float>();
+                    (void)val;
+                }
+            } catch (const std::exception &) {
+                // Expected for some edge cases
+            }
+            
+            // Test with zeros (boundary case)
+            try {
+                torch::Tensor zero_values = torch::zeros_like(input);
+                torch::Tensor zero_result = torch::special::scaled_modified_bessel_k0(zero_values);
+                
+                if (zero_result.defined() && zero_result.numel() > 0) {
+                    volatile float val = zero_result.sum().item<float>();
+                    (void)val;
+                }
+            } catch (const std::exception &) {
+                // Expected - function may have singularity at 0
+            }
+            
+            // Test with negative values (mathematically complex)
+            try {
+                torch::Tensor negative_values = -torch::abs(input) - 0.1f;
                 torch::Tensor negative_result = torch::special::scaled_modified_bessel_k0(negative_values);
                 
                 if (negative_result.defined() && negative_result.numel() > 0) {
-                    negative_result.item();
+                    volatile float val = negative_result.sum().item<float>();
+                    (void)val;
                 }
             } catch (const std::exception &) {
-                // Continue if this specific edge case fails
+                // Expected for negative inputs
             }
             
-            // Try with NaN and Inf values
+            // Test with NaN values
             try {
-                torch::Tensor special_values = torch::full_like(extreme_values, std::numeric_limits<float>::quiet_NaN());
-                torch::Tensor special_result = torch::special::scaled_modified_bessel_k0(special_values);
+                torch::Tensor nan_values = torch::full_like(input, std::numeric_limits<float>::quiet_NaN());
+                torch::Tensor nan_result = torch::special::scaled_modified_bessel_k0(nan_values);
                 
-                if (special_result.defined() && special_result.numel() > 0) {
-                    special_result.item();
+                if (nan_result.defined() && nan_result.numel() > 0) {
+                    volatile float val = nan_result.sum().item<float>();
+                    (void)val;
                 }
             } catch (const std::exception &) {
-                // Continue if this specific edge case fails
+                // Expected for NaN inputs
             }
             
+            // Test with Inf values
             try {
-                torch::Tensor inf_values = torch::full_like(extreme_values, std::numeric_limits<float>::infinity());
+                torch::Tensor inf_values = torch::full_like(input, std::numeric_limits<float>::infinity());
                 torch::Tensor inf_result = torch::special::scaled_modified_bessel_k0(inf_values);
                 
                 if (inf_result.defined() && inf_result.numel() > 0) {
-                    inf_result.item();
+                    volatile float val = inf_result.sum().item<float>();
+                    (void)val;
                 }
             } catch (const std::exception &) {
-                // Continue if this specific edge case fails
+                // Expected for Inf inputs
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

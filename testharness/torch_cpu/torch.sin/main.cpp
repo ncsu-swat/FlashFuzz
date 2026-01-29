@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -37,16 +42,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             uint8_t option_selector = Data[offset++];
             
             // Try with non-contiguous tensor
-            if (option_selector % 4 == 0 && input_tensor.dim() > 0 && input_tensor.size(0) > 1) {
+            if (option_selector % 4 == 0 && input_tensor.dim() > 1 && input_tensor.size(0) > 1) {
                 torch::Tensor non_contiguous = input_tensor.transpose(0, input_tensor.dim() - 1);
                 torch::Tensor result_non_contiguous = torch::sin(non_contiguous);
             }
             
-            // Try with different device if available
-            if (option_selector % 4 == 1 && torch::cuda::is_available()) {
-                torch::Tensor cuda_tensor = input_tensor.cuda();
-                torch::Tensor cuda_result = torch::sin(cuda_tensor);
-            }
+            // Try with different device if available (skip CUDA in CPU-only fuzzing)
+            // if (option_selector % 4 == 1 && torch::cuda::is_available()) {
+            //     torch::Tensor cuda_tensor = input_tensor.cuda();
+            //     torch::Tensor cuda_result = torch::sin(cuda_tensor);
+            // }
             
             // Try with requires_grad
             if (option_selector % 4 == 2) {
@@ -55,28 +60,49 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     torch::Tensor grad_tensor = input_tensor.clone().detach().requires_grad_(true);
                     torch::Tensor grad_result = torch::sin(grad_tensor);
                     
-                    // Try backward if tensor is scalar or has small number of elements
-                    if (input_tensor.numel() < 10) {
-                        grad_result.backward();
+                    // Backward requires scalar - sum first
+                    try {
+                        grad_result.sum().backward();
+                    } catch (...) {
+                        // Silently ignore autograd failures
                     }
                 }
             }
             
             // Try with different dtype if possible
-            if (option_selector % 4 == 3) {
+            if (option_selector % 4 == 3 && offset < Size) {
                 torch::ScalarType target_dtype = fuzzer_utils::parseDataType(Data[offset++]);
-                // Only attempt conversion if it makes sense
-                if (torch::can_cast(input_tensor.scalar_type(), target_dtype)) {
+                try {
                     torch::Tensor converted = input_tensor.to(target_dtype);
                     torch::Tensor converted_result = torch::sin(converted);
+                } catch (...) {
+                    // Silently ignore dtype conversion failures
                 }
+            }
+        }
+        
+        // Additional coverage: test with specific tensor shapes
+        if (offset + 4 < Size) {
+            // Test with 0-dim tensor (scalar)
+            torch::Tensor scalar_tensor = torch::tensor(static_cast<float>(Data[offset++]) / 255.0f * 6.28f - 3.14f);
+            torch::Tensor scalar_result = torch::sin(scalar_tensor);
+            
+            // Test with 1-dim tensor
+            std::vector<float> vec_data;
+            size_t vec_len = std::min(static_cast<size_t>(Data[offset++] % 16 + 1), Size - offset);
+            for (size_t i = 0; i < vec_len && offset < Size; i++) {
+                vec_data.push_back(static_cast<float>(Data[offset++]) / 255.0f * 6.28f - 3.14f);
+            }
+            if (!vec_data.empty()) {
+                torch::Tensor vec_tensor = torch::tensor(vec_data);
+                torch::Tensor vec_result = torch::sin(vec_tensor);
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

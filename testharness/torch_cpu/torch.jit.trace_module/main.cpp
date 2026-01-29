@@ -1,76 +1,113 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/script.h>
-
-struct TestModule : torch::nn::Module {
-    TestModule() {
-        register_module("linear", linear);
-    }
-
-    torch::Tensor forward(torch::Tensor x) {
-        return linear(x);
-    }
-
-    torch::nn::Linear linear{10, 5};
-};
+#include <torch/torch.h>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
+
+        size_t offset = 0;
+
+        // Extract batch size from fuzzer data (1-16)
+        uint8_t batch_size = (Data[offset++] % 16) + 1;
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract input features from fuzzer data
+        uint8_t in_features = (Data[offset++] % 32) + 1;
+        uint8_t out_features = (Data[offset++] % 32) + 1;
+
+        // Create a simple traced module using TorchScript
+        // torch::jit::trace works on functions/modules
+        // For fuzzing trace_module, we need to work with existing traced modules
         
-        // Create a simple module to trace
-        TestModule module;
+        // Create input tensor with appropriate shape
+        torch::Tensor input_tensor = torch::randn({batch_size, in_features});
         
-        // Create a dictionary of inputs for tracing
+        // Use remaining fuzzer data to perturb the tensor values
+        size_t remaining = Size - offset;
+        if (remaining > 0) {
+            auto accessor = input_tensor.accessor<float, 2>();
+            size_t data_idx = 0;
+            for (int64_t i = 0; i < batch_size && data_idx < remaining; i++) {
+                for (int64_t j = 0; j < in_features && data_idx < remaining; j++) {
+                    // Use fuzzer bytes to create float values
+                    float val = static_cast<float>(Data[offset + data_idx]) / 255.0f * 2.0f - 1.0f;
+                    accessor[i][j] = val;
+                    data_idx++;
+                }
+            }
+        }
+
+        // Create a simple module using TorchScript compilation
+        // This is the proper way to create traceable modules in C++
+        std::string module_src = R"(
+            def forward(self, x):
+                return x * 2 + 1
+        )";
+        
+        // Create a script module that we can trace
+        torch::jit::Module script_module("TestModule");
+        script_module.define(module_src);
+        
+        // Prepare inputs for tracing
         std::vector<torch::jit::IValue> inputs;
         inputs.push_back(input_tensor);
         
-        // Create a map of methods to trace
-        std::unordered_map<std::string, std::vector<torch::jit::IValue>> method_inputs;
-        method_inputs["forward"] = inputs;
+        // Create method inputs map for trace_module
+        c10::Dict<std::string, std::vector<torch::jit::IValue>> method_inputs;
+        method_inputs.insert("forward", inputs);
         
-        // Try to trace the module
-        torch::jit::script::Module traced_module;
         try {
-            traced_module = torch::jit::trace_module(std::make_shared<TestModule>(module), method_inputs);
+            // trace_module traces an existing Module's methods
+            auto traced = torch::jit::trace_module(script_module, method_inputs);
             
-            // Test the traced module with the same input
-            auto output = traced_module.forward(inputs);
+            // Run the traced module
+            auto output = traced.forward(inputs);
             
-            // Try with a different input if there's enough data
-            if (offset + 4 < Size) {
-                torch::Tensor another_input = fuzzer_utils::createTensor(Data, Size, offset);
-                std::vector<torch::jit::IValue> another_inputs;
-                another_inputs.push_back(another_input);
-                auto another_output = traced_module.forward(another_inputs);
+            // Verify output is valid
+            if (output.isTensor()) {
+                torch::Tensor out_tensor = output.toTensor();
+                // Force computation
+                (void)out_tensor.sum().item<float>();
             }
             
-            // Try to save and load the traced module
-            if (Size % 3 == 0) {
-                traced_module.save("temp_module.pt");
-                auto loaded_module = torch::jit::load("temp_module.pt");
-                auto loaded_output = loaded_module.forward(inputs);
+            // Try with different input shape based on fuzzer data
+            if (Size > 10 && Data[Size - 1] % 2 == 0) {
+                uint8_t new_batch = (Data[Size - 2] % 8) + 1;
+                torch::Tensor new_input = torch::randn({new_batch, in_features});
+                std::vector<torch::jit::IValue> new_inputs;
+                new_inputs.push_back(new_input);
+                auto new_output = traced.forward(new_inputs);
             }
+            
+            // Test cloning the traced module
+            if (Size > 5 && Data[4] % 3 == 0) {
+                auto cloned = traced.clone();
+                auto clone_output = cloned.forward(inputs);
+            }
+            
         } catch (const c10::Error& e) {
-            // This is a normal PyTorch error, not a bug in our code
+            // Expected PyTorch errors (shape mismatch, etc.) - not bugs
+            return 0;
+        } catch (const std::runtime_error& e) {
+            // Runtime errors from tracing are expected for some inputs
             return 0;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

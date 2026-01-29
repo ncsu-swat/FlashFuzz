@@ -1,81 +1,124 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes to create a tensor
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract dimensions for matrix (need at least 2D for matrix_rank)
+        uint8_t rows = (Data[offset++] % 16) + 1;  // 1-16 rows
+        uint8_t cols = (Data[offset++] % 16) + 1;  // 1-16 cols
         
-        // Get a byte for atol parameter if available
-        double atol = 1e-5;
+        // Get tolerance parameters
+        double tol = 1e-5;
         if (offset < Size) {
-            uint8_t atol_byte = Data[offset++];
-            // Scale atol between 1e-10 and 1e-1
-            atol = std::pow(10.0, -10.0 + (atol_byte % 10));
+            uint8_t tol_byte = Data[offset++];
+            tol = std::pow(10.0, -10.0 + (tol_byte % 10));
         }
         
-        // Get a byte for rtol parameter if available
-        double rtol = 1e-3;
-        if (offset < Size) {
-            uint8_t rtol_byte = Data[offset++];
-            // Scale rtol between 1e-8 and 1e-1
-            rtol = std::pow(10.0, -8.0 + (rtol_byte % 8));
-        }
-        
-        // Get a byte for hermitian parameter if available
+        // Get hermitian parameter
         bool hermitian = false;
         if (offset < Size) {
             hermitian = (Data[offset++] % 2) == 1;
         }
         
-        // Call matrix_rank with different parameter combinations
-        torch::Tensor result;
+        // Create a 2D matrix tensor
+        torch::Tensor input = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
         
-        // Basic call with default parameters
-        result = torch::matrix_rank(input);
-        
-        // Call with tolerance parameters
-        if (offset < Size) {
-            result = torch::matrix_rank(input, atol);
+        // Ensure we have a floating point type for matrix_rank
+        if (!input.is_floating_point() && !input.is_complex()) {
+            input = input.to(torch::kFloat32);
         }
         
-        if (offset < Size) {
-            result = torch::matrix_rank(input, atol, rtol);
+        // Reshape to 2D matrix
+        int64_t total_elements = input.numel();
+        if (total_elements < 1) {
+            return 0;
         }
         
-        // Call with hermitian parameter
-        if (offset < Size) {
-            result = torch::matrix_rank(input, atol, rtol, hermitian);
+        // Create matrix dimensions that fit the elements
+        int64_t m = std::min(static_cast<int64_t>(rows), total_elements);
+        int64_t n = total_elements / m;
+        if (n < 1) n = 1;
+        
+        // Resize tensor to fit m*n elements and reshape to 2D
+        input = input.flatten().slice(0, 0, m * n).reshape({m, n});
+        
+        // Test basic matrix_rank call
+        try {
+            torch::Tensor result = torch::linalg_matrix_rank(input);
+        } catch (const c10::Error&) {
+            // Expected for some invalid inputs
         }
         
-        // Try with different tensor types if we have enough data
-        if (offset + 4 < Size) {
-            // Create another tensor with different properties
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+        // Test with tolerance (using optional atol parameter)
+        try {
+            torch::Tensor result = torch::linalg_matrix_rank(input, tol, c10::nullopt, hermitian);
+        } catch (const c10::Error&) {
+            // Expected for some invalid inputs
+        }
+        
+        // Test with hermitian flag (requires square matrix for hermitian=true)
+        if (hermitian && m == n) {
+            try {
+                // For hermitian, make the matrix symmetric
+                torch::Tensor symmetric = (input + input.transpose(-2, -1)) / 2.0;
+                torch::Tensor result = torch::linalg_matrix_rank(symmetric, c10::nullopt, c10::nullopt, true);
+            } catch (const c10::Error&) {
+                // Expected for some invalid inputs
+            }
+        } else {
+            try {
+                torch::Tensor result = torch::linalg_matrix_rank(input, c10::nullopt, c10::nullopt, false);
+            } catch (const c10::Error&) {
+                // Expected for some invalid inputs
+            }
+        }
+        
+        // Test with batched input if we have enough data
+        if (Size - offset > 16) {
+            uint8_t batch_size = (Data[offset % Size] % 4) + 1;  // 1-4 batches
             
-            // Try matrix_rank on this tensor too
-            torch::Tensor result2 = torch::matrix_rank(input2);
-            
-            // Try with tolerance parameters
-            result2 = torch::matrix_rank(input2, atol, rtol, hermitian);
+            try {
+                torch::Tensor batched = input.unsqueeze(0).expand({batch_size, m, n}).clone();
+                torch::Tensor result = torch::linalg_matrix_rank(batched);
+            } catch (const c10::Error&) {
+                // Expected for some invalid inputs
+            }
+        }
+        
+        // Test with different dtypes
+        try {
+            torch::Tensor double_input = input.to(torch::kFloat64);
+            torch::Tensor result = torch::linalg_matrix_rank(double_input);
+        } catch (const c10::Error&) {
+            // Expected for some invalid inputs
+        }
+        
+        // Test with rtol parameter
+        try {
+            torch::Tensor result = torch::linalg_matrix_rank(input, c10::nullopt, tol, false);
+        } catch (const c10::Error&) {
+            // Expected for some invalid inputs
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,12 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -19,7 +23,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a tensor from the fuzzer data
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a simple module
+        // Create a simple module to test torch::nn::Module functionality
         struct SimpleModule : torch::nn::Module {
             SimpleModule() {
                 // Register a parameter
@@ -33,25 +37,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             
             torch::Tensor forward(torch::Tensor x) {
-                // Simple operation that uses the parameter
-                if (x.dim() > 0 && x.size(0) > 0) {
-                    x = torch::nn::functional::relu(x);
-                    
-                    // Reshape if needed to match linear layer input
-                    if (x.dim() > 1) {
-                        auto batch_size = x.size(0);
-                        x = x.reshape({batch_size, -1});
-                    } else {
-                        x = x.reshape({1, -1});
-                    }
-                    
-                    // Ensure the last dimension is 10 for the linear layer
-                    if (x.size(-1) != 10) {
-                        x = x.expand({x.size(0), 10});
-                    }
-                    
-                    x = submodule->forward(x);
+                // Apply relu activation
+                x = torch::relu(x);
+                
+                // Flatten and pad/truncate to match linear layer input size
+                x = x.flatten();
+                int64_t numel = x.numel();
+                
+                if (numel == 0) {
+                    return torch::zeros({1, 5});
                 }
+                
+                // Pad or truncate to size 10
+                if (numel < 10) {
+                    x = torch::nn::functional::pad(x, torch::nn::functional::PadFuncOptions({0, 10 - numel}));
+                } else if (numel > 10) {
+                    x = x.slice(0, 0, 10);
+                }
+                
+                x = x.reshape({1, 10});
+                x = submodule->forward(x);
+                
                 return x;
             }
             
@@ -62,9 +68,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create an instance of the module
         auto module = std::make_shared<SimpleModule>();
         
-        // Test module state
+        // Test train/eval mode switching
         module->train();
+        bool is_training = module->is_training();
+        (void)is_training;
+        
         module->eval();
+        is_training = module->is_training();
+        (void)is_training;
         
         // Test parameter access
         auto params = module->parameters();
@@ -72,44 +83,98 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         auto named_params = module->named_parameters();
         auto named_buffers = module->named_buffers();
         
+        // Iterate over parameters
+        for (auto& p : params) {
+            (void)p.numel();
+        }
+        
+        // Test named parameters
+        for (auto& np : named_params) {
+            (void)np.key();
+            (void)np.value().numel();
+        }
+        
         // Test module methods
         module->to(torch::kCPU);
-        module->to(torch::kFloat);
+        module->to(torch::kFloat32);
+        module->to(torch::kFloat64);
+        module->to(torch::kFloat32);  // Convert back
         
-        // Apply the module to the input tensor
-        torch::Tensor output = module->forward(input);
-        
-        // Test module serialization if we have enough data
-        if (Size > offset + 10) {
-            torch::save(module, "temp_module.pt");
-            torch::load(module, "temp_module.pt");
+        // Apply the module to the input tensor (wrap in try-catch for shape issues)
+        torch::Tensor output;
+        try {
+            output = module->forward(input.to(torch::kFloat32));
+        } catch (...) {
+            // Shape mismatch or other expected errors, ignore
         }
         
         // Test module children and named children
         auto children = module->children();
         auto named_children = module->named_children();
         
+        for (auto& child : children) {
+            (void)child->is_training();
+        }
+        
+        for (auto& nc : named_children) {
+            (void)nc.key();
+        }
+        
         // Test module zero_grad
         module->zero_grad();
         
-        // Test module apply
-        module->apply([](torch::nn::Module& m) {
-            if (auto linear = dynamic_cast<torch::nn::LinearImpl*>(&m)) {
-                linear->reset_parameters();
+        // Verify gradients are zeroed
+        for (auto& p : module->parameters()) {
+            if (p.grad().defined()) {
+                (void)p.grad().sum().item<float>();
             }
-            return m;
+        }
+        
+        // Test module apply (lambda takes Module& and returns void)
+        module->apply([](torch::nn::Module& m) {
+            (void)m.is_training();
         });
         
-        // Test module with different input types if we have more data
-        if (Size > offset + 20) {
+        // Test clone (if available)
+        try {
+            auto cloned = module->clone();
+            (void)cloned;
+        } catch (...) {
+            // clone may not be implemented
+        }
+        
+        // Test pretty_print
+        std::ostringstream oss;
+        module->pretty_print(oss);
+        (void)oss.str();
+        
+        // Test with another input if we have more data
+        if (Size > offset + 8) {
             torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, offset);
-            output = module->forward(input2);
+            try {
+                output = module->forward(input2.to(torch::kFloat32));
+            } catch (...) {
+                // Expected shape issues, ignore
+            }
+        }
+        
+        // Test requires_grad setting
+        for (auto& p : module->parameters()) {
+            p.set_requires_grad(false);
+            p.set_requires_grad(true);
+        }
+        
+        // Test named_modules
+        auto named_modules = module->named_modules();
+        for (auto& nm : named_modules) {
+            (void)nm.key();
+            (void)nm.value()->is_training();
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

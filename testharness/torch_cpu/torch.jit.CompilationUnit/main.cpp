@@ -1,13 +1,18 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <torch/csrc/jit/frontend/parser.h>
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <torch/script.h>
+#include <torch/csrc/jit/api/compilation_unit.h>
 #include <torch/csrc/jit/frontend/resolver.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -29,12 +34,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a CompilationUnit
         torch::jit::CompilationUnit cu;
         
+        // Track which functions were successfully defined
+        std::vector<std::string> defined_functions;
+        
         // Define some TorchScript functions based on the input data
         for (uint8_t i = 0; i < num_functions; i++) {
             // Choose function type based on input data
             uint8_t func_type = 0;
             if (offset < Size) {
-                func_type = Data[offset++] % 5;
+                func_type = Data[offset++] % 6;
             }
             
             std::string func_name = "test_func_" + std::to_string(i);
@@ -61,29 +69,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     // More complex function
                     source = "def " + func_name + "(x):\n    y = x * x\n    z = y + x\n    return z.tanh()\n";
                     break;
+                case 5:
+                    // Negation and abs
+                    source = "def " + func_name + "(x):\n    return (-x).abs()\n";
+                    break;
             }
             
             try {
                 cu.define(
-                    std::nullopt,  // prefix
+                    c10::nullopt,  // prefix
                     source,        // source code
                     torch::jit::nativeResolver(),  // resolver
                     nullptr        // self
                 );
+                defined_functions.push_back(func_name);
             } catch (...) {
                 // Function definition might fail, continue testing
             }
         }
         
-        // Try to get a function from the CompilationUnit
-        if (num_functions > 0) {
+        // Try to get and call functions from the CompilationUnit
+        if (!defined_functions.empty()) {
             // Choose which function to call
             uint8_t func_idx = 0;
             if (offset < Size) {
-                func_idx = Data[offset++] % num_functions;
+                func_idx = Data[offset++] % defined_functions.size();
             }
             
-            std::string func_to_call = "test_func_" + std::to_string(func_idx);
+            std::string func_to_call = defined_functions[func_idx];
             
             try {
                 // Get the function
@@ -102,26 +115,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     
                     // Perform some operation on the result to ensure it's used
                     auto sum = result.sum();
+                    (void)sum;
                 }
             } catch (...) {
-                // Function call might fail, continue testing
+                // Function call might fail due to tensor incompatibility
             }
         }
         
-        // Test finding functions
-        auto functions = cu.get_functions();
+        // Test getting all functions
+        try {
+            auto functions = cu.get_functions();
+            (void)functions;
+        } catch (...) {
+            // Ignore errors
+        }
         
         // Try to define an invalid function to test error handling
         if (offset < Size && Data[offset++] % 2 == 0) {
             try {
                 cu.define(
-                    std::nullopt,
+                    c10::nullopt,
                     "def invalid_func(x):\n    invalid syntax here\n",
                     torch::jit::nativeResolver(),
                     nullptr
                 );
             } catch (...) {
-                // Expected to fail, continue testing
+                // Expected to fail
             }
         }
         
@@ -129,15 +148,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size && Data[offset++] % 2 == 0) {
             try {
                 torch::jit::Function& non_existent = cu.get_function("non_existent_function");
+                (void)non_existent;
             } catch (...) {
-                // Expected to fail, continue testing
+                // Expected to fail
+            }
+        }
+        
+        // Test find_function which returns nullptr instead of throwing
+        if (offset < Size && Data[offset++] % 2 == 0) {
+            try {
+                auto* found = cu.find_function("test_func_0");
+                if (found != nullptr) {
+                    std::vector<torch::jit::IValue> inputs;
+                    inputs.push_back(input_tensor.clone());
+                    auto result = (*found)(inputs);
+                    (void)result;
+                }
+            } catch (...) {
+                // Ignore errors
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

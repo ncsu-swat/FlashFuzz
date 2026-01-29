@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -22,88 +27,132 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Parse shape for randn
         std::vector<int64_t> shape = fuzzer_utils::parseShape(Data, offset, Size, rank);
         
-        // Parse dtype for the tensor
+        // Parse dtype for the tensor - randn only supports floating point types
+        torch::ScalarType dtype = torch::kFloat;
         if (offset < Size) {
             uint8_t dtype_selector = Data[offset++];
-            torch::ScalarType dtype = fuzzer_utils::parseDataType(dtype_selector);
-            
-            // Create options with the selected dtype
-            auto options = torch::TensorOptions().dtype(dtype);
-            
-            // Call torch::randn with the shape and options
-            torch::Tensor result = torch::randn(shape, options);
-            
-            // Test some basic properties to ensure the tensor was created correctly
-            if (result.dim() != rank) {
-                throw std::runtime_error("Dimension mismatch");
+            // randn only supports float, double, half, bfloat16, complex float/double
+            switch (dtype_selector % 4) {
+                case 0:
+                    dtype = torch::kFloat;
+                    break;
+                case 1:
+                    dtype = torch::kDouble;
+                    break;
+                case 2:
+                    dtype = torch::kFloat16;
+                    break;
+                case 3:
+                    dtype = torch::kBFloat16;
+                    break;
             }
+        }
+        
+        // Create options with the selected dtype
+        auto options = torch::TensorOptions().dtype(dtype);
+        
+        // Call torch::randn with the shape and options
+        torch::Tensor result = torch::randn(shape, options);
+        
+        // Test additional operations based on the selector
+        if (offset < Size) {
+            uint8_t op_selector = Data[offset++];
             
-            // Test additional operations on the result tensor
-            if (Size > offset && offset < Size - 1) {
-                uint8_t op_selector = Data[offset++];
-                
-                // Perform different operations based on the selector
-                switch (op_selector % 5) {
-                    case 0:
-                        // Test mean and std
-                        result.mean();
-                        result.std();
-                        break;
-                    case 1:
-                        // Test mathematical operations
-                        result = result * 2.0;
-                        result = result + 1.0;
-                        break;
-                    case 2:
-                        // Test reshaping if possible
-                        if (!result.numel()) break;
+            // Perform different operations based on the selector
+            switch (op_selector % 6) {
+                case 0:
+                    // Test mean and std (need at least one element and float type)
+                    if (result.numel() > 0) {
+                        try {
+                            auto mean_result = result.to(torch::kFloat).mean();
+                            auto std_result = result.to(torch::kFloat).std();
+                        } catch (...) {
+                            // May fail for some configurations
+                        }
+                    }
+                    break;
+                case 1:
+                    // Test mathematical operations
+                    result = result * 2.0;
+                    result = result + 1.0;
+                    break;
+                case 2:
+                    // Test reshaping if possible
+                    if (result.numel() > 0) {
                         try {
                             result = result.reshape({-1});
                         } catch (...) {
-                            // Reshape might fail, that's okay
+                            // Reshape might fail
                         }
+                    }
+                    break;
+                case 3:
+                    {
+                        // Test cloning and other operations
+                        torch::Tensor cloned = result.clone();
+                        cloned = torch::abs(cloned);
                         break;
-                    case 3:
-                        {
-                            // Test cloning and other operations
-                            torch::Tensor cloned = result.clone();
-                            cloned = torch::abs(cloned);
-                            break;
-                        }
-                    case 4:
-                        // Test type conversion
-                        try {
-                            result = result.to(torch::kFloat);
-                        } catch (...) {
-                            // Conversion might fail, that's okay
-                        }
-                        break;
-                }
+                    }
+                case 4:
+                    // Test type conversion
+                    try {
+                        result = result.to(torch::kFloat);
+                    } catch (...) {
+                        // Conversion might fail
+                    }
+                    break;
+                case 5:
+                    // Test randn_like
+                    {
+                        torch::Tensor randn_like_result = torch::randn_like(result);
+                    }
+                    break;
             }
-            
-            // Test randn_like
-            if (Size > offset) {
-                torch::Tensor randn_like_result = torch::randn_like(result);
-            }
-        } else {
-            // If no dtype specified, use default float
-            torch::Tensor result = torch::randn(shape);
         }
         
-        // Test randn with specific mean and std if we have more data
-        if (Size > offset + 1) {
-            // Extract values for mean and std
-            float mean_val = static_cast<float>(Data[offset++]) / 255.0f * 10.0f - 5.0f; // Range: -5 to 5
-            float std_val = static_cast<float>(Data[offset++]) / 255.0f * 5.0f + 0.1f;   // Range: 0.1 to 5.1
+        // Test randn with generator if we have more data
+        if (offset + 1 < Size) {
+            uint64_t seed = static_cast<uint64_t>(Data[offset++]) << 8 | Data[offset++];
+            auto gen = torch::make_generator<torch::CPUGeneratorImpl>(seed);
+            torch::Tensor seeded_result = torch::randn(shape, gen, options);
+        }
+        
+        // Test randn with different shape configurations
+        if (offset < Size) {
+            uint8_t shape_config = Data[offset++];
+            std::vector<int64_t> test_shape;
             
-            // Create a tensor with the specified mean and std
-            torch::Tensor custom_randn = torch::randn(shape) * std_val + mean_val;
+            switch (shape_config % 5) {
+                case 0:
+                    // Scalar (0-d tensor)
+                    test_shape = {};
+                    break;
+                case 1:
+                    // 1-D tensor
+                    test_shape = {static_cast<int64_t>((shape_config % 16) + 1)};
+                    break;
+                case 2:
+                    // 2-D tensor
+                    test_shape = {static_cast<int64_t>((shape_config % 8) + 1), 
+                                  static_cast<int64_t>((shape_config % 4) + 1)};
+                    break;
+                case 3:
+                    // 3-D tensor
+                    test_shape = {2, 3, 4};
+                    break;
+                case 4:
+                    // Empty tensor
+                    test_shape = {0};
+                    break;
+            }
+            
+            torch::Tensor config_result = torch::randn(test_shape);
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

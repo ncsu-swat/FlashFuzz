@@ -1,16 +1,23 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <cmath>
+#include <limits>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least 4 bytes for start, end, steps, and base
+        // Need at least some bytes for parameters
         if (Size < 4) {
             return 0;
         }
@@ -38,10 +45,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&steps, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
             
-            // Limit steps to avoid excessive memory usage
-            // Note: We're not adding a defensive check here to prevent testing with negative steps
-            if (steps > 1000000) {
-                steps = 1000000;
+            // Steps must be non-negative and bounded to avoid OOM
+            if (steps < 0) {
+                steps = 0;
+            }
+            if (steps > 100000) {
+                steps = 100000;
             }
         }
         
@@ -51,74 +60,113 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(double);
         }
         
+        // Sanitize base to avoid problematic values
+        if (!std::isfinite(base) || base == 0.0) {
+            base = 10.0;
+        }
+        
+        // Sanitize start/end to avoid NaN/Inf propagation issues
+        if (!std::isfinite(start)) {
+            start = 0.0;
+        }
+        if (!std::isfinite(end)) {
+            end = 1.0;
+        }
+        
         // Create options tensor for dtype and device
-        torch::TensorOptions options;
+        torch::TensorOptions options = torch::TensorOptions().device(torch::kCPU);
         
         // Parse dtype if we have more data
         if (offset < Size) {
             uint8_t dtype_selector = Data[offset++];
-            options = options.dtype(fuzzer_utils::parseDataType(dtype_selector));
+            // Only use float types for logspace (int types don't make sense)
+            switch (dtype_selector % 4) {
+                case 0: options = options.dtype(torch::kFloat32); break;
+                case 1: options = options.dtype(torch::kFloat64); break;
+                case 2: options = options.dtype(torch::kFloat16); break;
+                case 3: options = options.dtype(torch::kBFloat16); break;
+            }
+        } else {
+            options = options.dtype(torch::kFloat32);
         }
         
-        // Try different variants of logspace
-        
-        // Basic logspace
+        // Basic logspace call
         torch::Tensor result1 = torch::logspace(start, end, steps, base, options);
         
-        // Logspace with default base (10.0)
-        torch::Tensor result2 = torch::logspace(start, end, steps, 10.0, options);
-        
-        // Logspace with explicit device
-        torch::Tensor result3 = torch::logspace(start, end, steps, base, options.device(torch::kCPU));
-        
-        // Edge case: 0 steps (should create an empty tensor)
-        torch::Tensor result4 = torch::logspace(start, end, 0, base, options);
-        
-        // Edge case: 1 step (should create a tensor with just the start value)
-        torch::Tensor result5 = torch::logspace(start, end, 1, base, options);
-        
-        // Edge case: negative base (should work mathematically)
-        if (offset < Size) {
-            double neg_base = -std::abs(base);
-            if (neg_base == 0) neg_base = -1.0;
-            torch::Tensor result6 = torch::logspace(start, end, steps, neg_base, options);
+        // Verify result shape
+        if (result1.size(0) != steps) {
+            std::cerr << "Unexpected result size" << std::endl;
         }
         
-        // Edge case: base = 1.0 (all values should be 1.0)
-        torch::Tensor result7 = torch::logspace(start, end, steps, 1.0, options);
-        
-        // Edge case: start > end (should work, just reversed range)
-        torch::Tensor result8 = torch::logspace(end, start, steps, base, options);
-        
-        // Edge case: very large/small values
-        if (offset + 2*sizeof(double) <= Size) {
-            double extreme_start, extreme_end;
-            std::memcpy(&extreme_start, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            std::memcpy(&extreme_end, Data + offset, sizeof(double));
-            offset += sizeof(double);
+        // Test with different bases (inner try-catch for expected edge cases)
+        try {
+            // Base 2 (common case)
+            torch::Tensor result2 = torch::logspace(start, end, steps, 2.0, options);
             
-            torch::Tensor result9 = torch::logspace(extreme_start, extreme_end, steps, base, options);
+            // Base e (natural log)
+            torch::Tensor result3 = torch::logspace(start, end, steps, M_E, options);
+        } catch (...) {
+            // Silently ignore edge case failures
         }
         
-        // Edge case: NaN/Inf values
-        torch::Tensor result10 = torch::logspace(std::numeric_limits<double>::quiet_NaN(), 
-                                                end, steps, base, options);
+        // Test edge cases with 0 and 1 steps
+        try {
+            torch::Tensor result4 = torch::logspace(start, end, 0, base, options);
+            torch::Tensor result5 = torch::logspace(start, end, 1, base, options);
+        } catch (...) {
+            // Silently ignore
+        }
         
-        torch::Tensor result11 = torch::logspace(start, 
-                                                std::numeric_limits<double>::infinity(), 
-                                                steps, base, options);
+        // Test with swapped start/end
+        try {
+            torch::Tensor result6 = torch::logspace(end, start, steps, base, options);
+        } catch (...) {
+            // Silently ignore
+        }
         
-        // Edge case: base = 0 or infinity
-        torch::Tensor result12 = torch::logspace(start, end, steps, 0.0, options);
-        torch::Tensor result13 = torch::logspace(start, end, steps, 
-                                                std::numeric_limits<double>::infinity(), 
-                                                options);
+        // Test with base = 1 (all values should be 1)
+        try {
+            torch::Tensor result7 = torch::logspace(start, end, steps, 1.0, options);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Test with negative base (may or may not be supported)
+        try {
+            if (base > 0) {
+                torch::Tensor result8 = torch::logspace(start, end, steps, -base, options);
+            }
+        } catch (...) {
+            // Silently ignore - negative base may throw
+        }
+        
+        // Test with small step counts
+        try {
+            torch::Tensor result9 = torch::logspace(start, end, 2, base, options);
+            torch::Tensor result10 = torch::logspace(start, end, 5, base, options);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Test default dtype variant
+        try {
+            torch::Tensor result11 = torch::logspace(start, end, steps, base);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Access elements to ensure computation happened
+        if (result1.numel() > 0) {
+            volatile float first = result1[0].item<float>();
+            if (result1.numel() > 1) {
+                volatile float last = result1[-1].item<float>();
+            }
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,135 +1,199 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes for basic parameters
-        if (Size < 10) {
+        // Need enough bytes for parameters
+        if (Size < 16) {
             return 0;
         }
         
-        // Create values tensor
-        torch::Tensor values = fuzzer_utils::createTensor(Data, Size, offset);
+        // Parse block dimensions (block_size for BSC format)
+        int64_t block_rows = static_cast<int64_t>(Data[offset++] % 4) + 1;  // 1-4
+        int64_t block_cols = static_cast<int64_t>(Data[offset++] % 4) + 1;  // 1-4
         
-        // Parse ccol_indices tensor (note: BSC uses ccol_indices, not crow_indices)
-        torch::Tensor ccol_indices = fuzzer_utils::createTensor(Data, Size, offset);
+        // Parse number of block rows and columns in the sparse matrix
+        int64_t num_block_rows = static_cast<int64_t>(Data[offset++] % 4) + 1;  // 1-4
+        int64_t num_block_cols = static_cast<int64_t>(Data[offset++] % 4) + 1;  // 1-4
         
-        // Parse row_indices tensor
-        torch::Tensor row_indices = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Parse sparse dimensions
-        std::vector<int64_t> sparse_dims;
-        if (offset + 2 <= Size) {
-            uint8_t sparse_dim_count = Data[offset++] % 3 + 1; // 1-3 sparse dimensions
-            for (uint8_t i = 0; i < sparse_dim_count && offset < Size; i++) {
-                int64_t dim = static_cast<int64_t>(Data[offset++]) % 10 + 1; // 1-10 dimension size
-                sparse_dims.push_back(dim);
-            }
-        } else {
-            // Default sparse dimensions if not enough data
-            sparse_dims = {2, 3};
+        // Parse number of non-zero blocks (limited to valid range)
+        int64_t max_nnz = num_block_rows * num_block_cols;
+        int64_t nnz_blocks = static_cast<int64_t>(Data[offset++] % std::max(max_nnz, (int64_t)1)) + 1;
+        if (nnz_blocks > max_nnz) {
+            nnz_blocks = max_nnz;
         }
         
-        // Create sparse BSC tensor with size parameter
+        // Full tensor size
+        std::vector<int64_t> tensor_size = {
+            num_block_rows * block_rows,
+            num_block_cols * block_cols
+        };
+        
+        // Create ccol_indices: size (num_block_cols + 1,), values in range [0, nnz_blocks]
+        std::vector<int64_t> ccol_data(num_block_cols + 1);
+        ccol_data[0] = 0;
+        for (int64_t i = 1; i <= num_block_cols; i++) {
+            int64_t increment = 0;
+            if (offset < Size) {
+                increment = static_cast<int64_t>(Data[offset++] % (nnz_blocks / num_block_cols + 2));
+            }
+            ccol_data[i] = std::min(ccol_data[i-1] + increment, nnz_blocks);
+        }
+        ccol_data[num_block_cols] = nnz_blocks;  // Last element must equal nnz_blocks
+        
+        torch::Tensor ccol_indices = torch::tensor(ccol_data, torch::kInt64);
+        
+        // Create row_indices: size (nnz_blocks,), values in range [0, num_block_rows)
+        std::vector<int64_t> row_data(nnz_blocks);
+        for (int64_t i = 0; i < nnz_blocks; i++) {
+            if (offset < Size) {
+                row_data[i] = static_cast<int64_t>(Data[offset++] % num_block_rows);
+            } else {
+                row_data[i] = i % num_block_rows;
+            }
+        }
+        torch::Tensor row_indices = torch::tensor(row_data, torch::kInt64);
+        
+        // Create values tensor: shape (nnz_blocks, block_rows, block_cols)
+        torch::Tensor values = fuzzer_utils::createTensor(Data, Size, offset);
+        // Reshape to proper block dimensions
         try {
+            values = values.flatten().slice(0, 0, nnz_blocks * block_rows * block_cols);
+            if (values.numel() < nnz_blocks * block_rows * block_cols) {
+                // Pad if necessary
+                values = torch::cat({values, torch::zeros(nnz_blocks * block_rows * block_cols - values.numel())});
+            }
+            values = values.reshape({nnz_blocks, block_rows, block_cols});
+        } catch (...) {
+            // If reshaping fails, create a proper values tensor
+            values = torch::randn({nnz_blocks, block_rows, block_cols});
+        }
+        
+        // Create sparse BSC tensor (requires 5 arguments: ccol_indices, row_indices, values, size, options)
+        try {
+            auto options = torch::TensorOptions().dtype(values.dtype());
             torch::Tensor sparse_bsc = torch::sparse_bsc_tensor(
                 ccol_indices,
                 row_indices,
                 values,
-                sparse_dims
+                tensor_size,
+                options
             );
             
-            // Test some operations on the sparse tensor
+            // Test operations on the sparse tensor
             if (sparse_bsc.defined()) {
-                auto indices = sparse_bsc.indices();
+                auto ccol_out = sparse_bsc.ccol_indices();
+                auto row_out = sparse_bsc.row_indices();
                 auto values_out = sparse_bsc.values();
                 auto dense = sparse_bsc.to_dense();
+                
+                // Test properties
+                auto nnz = sparse_bsc._nnz();
+                auto is_sparse = sparse_bsc.is_sparse();
             }
         } catch (const c10::Error& e) {
-            // Expected exceptions from PyTorch operations are fine
+            // Expected exceptions from invalid sparse tensor construction
         }
         
-        // Try with TensorOptions
-        if (offset < Size) {
-            try {
-                auto options = torch::TensorOptions().dtype(torch::kFloat32);
-                torch::Tensor sparse_bsc_with_options = torch::sparse_bsc_tensor(
-                    ccol_indices,
-                    row_indices,
-                    values,
-                    sparse_dims,
-                    options
-                );
-            } catch (const c10::Error& e) {
-                // Expected exceptions from PyTorch operations are fine
-            }
+        // Try with TensorOptions - float32
+        try {
+            auto options = torch::TensorOptions().dtype(torch::kFloat32);
+            torch::Tensor values_f32 = values.to(torch::kFloat32);
+            torch::Tensor sparse_bsc_f32 = torch::sparse_bsc_tensor(
+                ccol_indices,
+                row_indices,
+                values_f32,
+                tensor_size,
+                options
+            );
+        } catch (const c10::Error& e) {
+            // Expected exceptions
         }
         
-        // Try with different dtype in options
+        // Try with different dtype
         if (offset < Size) {
             try {
                 auto dtype_selector = Data[offset++];
                 auto dtype = fuzzer_utils::parseDataType(dtype_selector);
                 auto options = torch::TensorOptions().dtype(dtype);
-                torch::Tensor sparse_bsc_with_dtype = torch::sparse_bsc_tensor(
+                torch::Tensor values_typed = values.to(dtype);
+                torch::Tensor sparse_bsc_typed = torch::sparse_bsc_tensor(
                     ccol_indices,
                     row_indices,
-                    values,
-                    sparse_dims,
+                    values_typed,
+                    tensor_size,
                     options
                 );
             } catch (const c10::Error& e) {
-                // Expected exceptions from PyTorch operations are fine
+                // Expected exceptions
             }
         }
         
-        // Try with device in options
-        if (offset < Size) {
-            try {
-                auto device = torch::kCPU;
-                auto options = torch::TensorOptions().device(device);
-                torch::Tensor sparse_bsc_with_device = torch::sparse_bsc_tensor(
-                    ccol_indices,
-                    row_indices,
-                    values,
-                    sparse_dims,
-                    options
-                );
-            } catch (const c10::Error& e) {
-                // Expected exceptions from PyTorch operations are fine
+        // Try with float64
+        try {
+            auto options = torch::TensorOptions().dtype(torch::kFloat64).device(torch::kCPU);
+            torch::Tensor values_f64 = values.to(torch::kFloat64);
+            torch::Tensor sparse_bsc_f64 = torch::sparse_bsc_tensor(
+                ccol_indices,
+                row_indices,
+                values_f64,
+                tensor_size,
+                options
+            );
+            
+            if (sparse_bsc_f64.defined()) {
+                // Test conversion
+                auto dense_f64 = sparse_bsc_f64.to_dense();
             }
+        } catch (const c10::Error& e) {
+            // Expected exceptions
         }
         
-        // Try with all options combined
-        if (offset < Size) {
-            try {
-                auto dtype_selector = Data[offset++];
-                auto dtype = fuzzer_utils::parseDataType(dtype_selector);
-                auto device = torch::kCPU;
-                auto options = torch::TensorOptions().dtype(dtype).device(device);
-                torch::Tensor sparse_bsc_full = torch::sparse_bsc_tensor(
-                    ccol_indices,
-                    row_indices,
-                    values,
-                    sparse_dims,
-                    options
-                );
-            } catch (const c10::Error& e) {
-                // Expected exceptions from PyTorch operations are fine
-            }
+        // Try with complex type
+        try {
+            auto options = torch::TensorOptions().dtype(torch::kComplexFloat);
+            torch::Tensor values_complex = values.to(torch::kComplexFloat);
+            torch::Tensor sparse_bsc_complex = torch::sparse_bsc_tensor(
+                ccol_indices,
+                row_indices,
+                values_complex,
+                tensor_size,
+                options
+            );
+        } catch (const c10::Error& e) {
+            // Expected exceptions
+        }
+        
+        // Try without specifying size (3-argument version)
+        try {
+            auto options = torch::TensorOptions().dtype(torch::kFloat32);
+            torch::Tensor values_f32 = values.to(torch::kFloat32);
+            torch::Tensor sparse_bsc_no_size = torch::sparse_bsc_tensor(
+                ccol_indices,
+                row_indices,
+                values_f32,
+                options
+            );
+        } catch (const c10::Error& e) {
+            // Expected exceptions
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

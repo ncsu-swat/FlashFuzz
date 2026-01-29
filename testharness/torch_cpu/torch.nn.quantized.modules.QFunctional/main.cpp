@@ -1,12 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,7 +26,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + 2 < Size) {
             input2 = fuzzer_utils::createTensor(Data, Size, offset);
         } else {
-            // If not enough data, create a tensor with the same shape as input1
             input2 = torch::ones_like(input1);
         }
         
@@ -40,83 +42,99 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&scale, Data + offset, sizeof(float));
             offset += sizeof(float);
-            scale = std::abs(scale) + 1e-5f; // Ensure positive scale
+            // Ensure positive scale and avoid extreme values
+            scale = std::abs(scale);
+            if (scale < 1e-5f || std::isnan(scale) || std::isinf(scale)) {
+                scale = 0.1f;
+            }
+            if (scale > 1e5f) {
+                scale = 1.0f;
+            }
         }
         
         if (offset + sizeof(int) <= Size) {
             std::memcpy(&zero_point, Data + offset, sizeof(int));
             offset += sizeof(int);
-            zero_point = zero_point % 256; // Keep zero_point in uint8 range
+            zero_point = std::abs(zero_point) % 256;
+        }
+        
+        // Ensure input tensors are float for quantization
+        input1 = input1.to(torch::kFloat).contiguous();
+        input2 = input2.to(torch::kFloat).contiguous();
+        
+        // Ensure tensors have compatible shapes for binary operations
+        if (input1.sizes() != input2.sizes()) {
+            input2 = torch::ones_like(input1);
         }
         
         // Quantize the input tensors
-        auto q_scheme = torch::kPerTensorAffine;
         torch::Tensor q_input1, q_input2;
         
         try {
-            q_input1 = torch::quantize_per_tensor(input1.to(torch::kFloat), scale, zero_point, torch::kQUInt8);
-            q_input2 = torch::quantize_per_tensor(input2.to(torch::kFloat), scale, zero_point, torch::kQUInt8);
-        } catch (const std::exception& e) {
-            // If quantization fails, return early
+            q_input1 = torch::quantize_per_tensor(input1, scale, zero_point, torch::kQUInt8);
+            q_input2 = torch::quantize_per_tensor(input2, scale, zero_point, torch::kQUInt8);
+        } catch (const std::exception&) {
             return 0;
         }
         
-        // Apply different operations based on op_type using functional API
         torch::Tensor output;
         
-        switch (op_type % 8) {
-            case 0:
-                output = torch::ops::quantized::add(q_input1, q_input2, scale, zero_point);
+        switch (op_type % 6) {
+            case 0: {
+                // Quantized add using dequantize-operate-requantize pattern
+                torch::Tensor dq1 = q_input1.dequantize();
+                torch::Tensor dq2 = q_input2.dequantize();
+                torch::Tensor result = dq1 + dq2;
+                output = torch::quantize_per_tensor(result, scale, zero_point, torch::kQUInt8);
                 break;
-            case 1:
-                output = torch::ops::quantized::add_scalar(q_input1, 1.0);
+            }
+            case 1: {
+                // Quantized mul using dequantize-operate-requantize pattern
+                torch::Tensor dq1 = q_input1.dequantize();
+                torch::Tensor dq2 = q_input2.dequantize();
+                torch::Tensor result = dq1 * dq2;
+                output = torch::quantize_per_tensor(result, scale, zero_point, torch::kQUInt8);
                 break;
-            case 2:
-                output = torch::ops::quantized::mul(q_input1, q_input2, scale, zero_point);
+            }
+            case 2: {
+                // Add scalar - use dequantize, add, requantize pattern
+                torch::Tensor dq = q_input1.dequantize();
+                dq = dq + 1.0f;
+                output = torch::quantize_per_tensor(dq, scale, zero_point, torch::kQUInt8);
                 break;
-            case 3:
-                output = torch::ops::quantized::mul_scalar(q_input1, 1.0);
+            }
+            case 3: {
+                // Mul scalar - use dequantize, mul, requantize pattern
+                torch::Tensor dq = q_input1.dequantize();
+                dq = dq * 2.0f;
+                output = torch::quantize_per_tensor(dq, scale, zero_point, torch::kQUInt8);
                 break;
-            case 4:
-                try {
-                    output = torch::ops::quantized::cat({q_input1, q_input2}, 0, scale, zero_point);
-                } catch (const std::exception& e) {
-                    // Try a different dimension if cat fails
-                    if (q_input1.dim() > 0) {
-                        int dim = q_input1.dim() - 1;
-                        output = torch::ops::quantized::cat({q_input1, q_input2}, dim, scale, zero_point);
-                    } else {
-                        // Can't concatenate 0-dim tensors
-                        return 0;
-                    }
-                }
-                break;
-            case 5:
+            }
+            case 4: {
+                // Cat operation on quantized tensors
                 if (q_input1.dim() > 0) {
-                    output = torch::ops::quantized::add_relu(q_input1, q_input2, scale, zero_point);
-                } else {
-                    output = torch::ops::quantized::add(q_input1, q_input2, scale, zero_point);
-                }
-                break;
-            case 6:
-                output = torch::ops::quantized::mul_relu(q_input1, q_input2, scale, zero_point);
-                break;
-            case 7:
-                // Try hardtanh with different min/max values
-                float min_val = -1.0f, max_val = 1.0f;
-                if (offset + 2*sizeof(float) <= Size) {
-                    std::memcpy(&min_val, Data + offset, sizeof(float));
-                    offset += sizeof(float);
-                    std::memcpy(&max_val, Data + offset, sizeof(float));
-                    offset += sizeof(float);
-                    
-                    // Ensure min_val <= max_val
-                    if (min_val > max_val) {
-                        std::swap(min_val, max_val);
+                    try {
+                        // For quantized cat, dequantize, cat, then requantize
+                        torch::Tensor dq1 = q_input1.dequantize();
+                        torch::Tensor dq2 = q_input2.dequantize();
+                        std::vector<torch::Tensor> tensors = {dq1, dq2};
+                        torch::Tensor result = at::cat(tensors, 0);
+                        output = torch::quantize_per_tensor(result, scale, zero_point, torch::kQUInt8);
+                    } catch (const std::exception&) {
+                        output = q_input1;
                     }
+                } else {
+                    output = q_input1;
                 }
-                output = torch::ops::quantized::hardtanh(q_input1, min_val, max_val, scale, zero_point);
                 break;
+            }
+            case 5: {
+                // ReLU on quantized tensor then requantize
+                torch::Tensor dq = q_input1.dequantize();
+                dq = torch::relu(dq);
+                output = torch::quantize_per_tensor(dq, scale, zero_point, torch::kQUInt8);
+                break;
+            }
         }
         
         // Dequantize the output to verify it's valid
@@ -125,13 +143,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Access some values to ensure computation happened
         if (dequantized.numel() > 0) {
             float sum = dequantized.sum().item<float>();
-            (void)sum; // Prevent unused variable warning
+            (void)sum;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

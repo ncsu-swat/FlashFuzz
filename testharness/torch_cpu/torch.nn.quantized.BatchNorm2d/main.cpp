@@ -1,11 +1,20 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
+#include <torch/torch.h>
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+
+// Note: torch::nn::quantized::BatchNorm2d is not available in the C++ frontend.
+// This harness simulates quantized BatchNorm2d by using regular BatchNorm2d
+// with manual quantization/dequantization operations.
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,28 +24,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input_tensor;
-        try {
-            input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        } catch (const std::exception &e) {
-            return 0;
-        }
-        
-        // Ensure we have at least 4 bytes left for parameters
-        if (Size - offset < 4) {
-            return 0;
-        }
-        
-        // Extract parameters for BatchNorm2d
-        int64_t num_features = 0;
-        if (input_tensor.dim() >= 2) {
-            num_features = input_tensor.size(1); // Use channel dimension
-        } else if (input_tensor.dim() == 1 && input_tensor.size(0) > 0) {
-            num_features = input_tensor.size(0);
-        } else {
-            num_features = 1 + (Data[offset++] % 64); // Random number of features
-        }
+        // Extract num_features first (before creating tensor)
+        int64_t num_features = 1 + (Data[offset++] % 64);
         
         // Extract eps parameter (small positive value for numerical stability)
         double eps = 1e-5;
@@ -44,9 +33,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             float eps_raw;
             std::memcpy(&eps_raw, Data + offset, sizeof(float));
             offset += sizeof(float);
-            // Ensure eps is positive but not too large
             eps = std::abs(eps_raw);
-            if (eps == 0.0) eps = 1e-5;
+            if (eps < 1e-10 || std::isnan(eps) || std::isinf(eps)) eps = 1e-5;
             if (eps > 0.1) eps = 0.1;
         }
         
@@ -56,111 +44,137 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             float momentum_raw;
             std::memcpy(&momentum_raw, Data + offset, sizeof(float));
             offset += sizeof(float);
-            // Clamp momentum to [0, 1]
             momentum = std::abs(momentum_raw);
+            if (std::isnan(momentum) || std::isinf(momentum)) momentum = 0.1;
             if (momentum > 1.0) momentum = 1.0;
         }
         
-        // Create regular BatchNorm2d module (quantized version not available in C++ frontend)
+        // Extract batch and spatial dimensions
+        int64_t batch_size = 1 + (offset < Size ? Data[offset++] % 4 : 0);
+        int64_t height = 1 + (offset < Size ? Data[offset++] % 8 : 1);
+        int64_t width = 1 + (offset < Size ? Data[offset++] % 8 : 1);
+        
+        // Create BatchNorm2d module
         torch::nn::BatchNorm2d bn(torch::nn::BatchNorm2dOptions(num_features)
                                   .eps(eps)
-                                  .momentum(momentum));
+                                  .momentum(momentum)
+                                  .track_running_stats(true));
+        bn->eval(); // Set to eval mode to avoid running stats issues
         
-        // Ensure input tensor has correct shape and type for BatchNorm2d
-        if (input_tensor.dim() < 2) {
-            // Reshape to [N, C, H, W] format
-            input_tensor = input_tensor.reshape({1, num_features, 1, 1});
-        } else if (input_tensor.dim() == 2) {
-            // Add H and W dimensions
-            input_tensor = input_tensor.unsqueeze(2).unsqueeze(3);
-        } else if (input_tensor.dim() == 3) {
-            // Add W dimension
-            input_tensor = input_tensor.unsqueeze(3);
-        }
+        // Create input tensor with proper shape [N, C, H, W]
+        torch::Tensor input_tensor = torch::randn({batch_size, num_features, height, width});
         
-        // Ensure channel dimension matches num_features
-        if (input_tensor.size(1) != num_features) {
-            input_tensor = input_tensor.transpose(0, 1);
-            if (input_tensor.size(1) != num_features) {
-                // Reshape to ensure channel dimension is correct
-                std::vector<int64_t> new_shape = {input_tensor.size(0), num_features};
-                for (int i = 2; i < input_tensor.dim(); i++) {
-                    new_shape.push_back(input_tensor.size(i));
+        // Use remaining data to influence tensor values
+        if (offset < Size) {
+            size_t remaining = Size - offset;
+            size_t num_elements = std::min(remaining, static_cast<size_t>(input_tensor.numel()));
+            auto accessor = input_tensor.accessor<float, 4>();
+            size_t idx = 0;
+            for (int64_t n = 0; n < batch_size && idx < num_elements; n++) {
+                for (int64_t c = 0; c < num_features && idx < num_elements; c++) {
+                    for (int64_t h = 0; h < height && idx < num_elements; h++) {
+                        for (int64_t w = 0; w < width && idx < num_elements; w++) {
+                            accessor[n][c][h][w] = static_cast<float>(Data[offset + idx]) / 128.0f - 1.0f;
+                            idx++;
+                        }
+                    }
                 }
-                input_tensor = input_tensor.reshape(new_shape);
             }
         }
         
-        // Quantize the input tensor
-        auto scale = 1.0f / 128.0f;
-        auto zero_point = 128;
+        // Extract quantization parameters
+        float scale = 1.0f / 128.0f;
+        int64_t zero_point = 128;
         
-        // Create a quantized tensor
+        if (offset < Size) {
+            uint8_t scale_byte = Data[offset++];
+            scale = (scale_byte + 1) / 256.0f; // Scale between ~0.004 and 1.0
+        }
+        if (offset < Size) {
+            zero_point = Data[offset++];
+        }
+        
+        // Quantize the input tensor
         torch::Tensor quantized_input;
         try {
-            quantized_input = torch::quantize_per_tensor(
-                input_tensor.to(torch::kFloat),
-                scale,
-                zero_point,
-                torch::kQUInt8
-            );
-        } catch (const std::exception &e) {
-            // If quantization fails, try with a different tensor
-            input_tensor = torch::rand({1, num_features, 2, 2});
             quantized_input = torch::quantize_per_tensor(
                 input_tensor,
                 scale,
                 zero_point,
                 torch::kQUInt8
             );
+        } catch (...) {
+            // If quantization fails, return early
+            return 0;
         }
         
-        // Apply BatchNorm2d on dequantized input, then quantize output
-        torch::Tensor output;
+        // Dequantize, apply BatchNorm, re-quantize (simulating quantized BatchNorm)
+        torch::Tensor dequantized_input = quantized_input.dequantize();
+        torch::Tensor bn_output = bn(dequantized_input);
+        
+        // Re-quantize the output
+        torch::Tensor quantized_output;
         try {
-            torch::Tensor dequantized_input = quantized_input.dequantize();
-            torch::Tensor bn_output = bn(dequantized_input);
-            output = torch::quantize_per_tensor(bn_output, scale, zero_point, torch::kQUInt8);
-        } catch (const std::exception &e) {
-            // If forward pass fails, try with default parameters
-            bn = torch::nn::BatchNorm2d(torch::nn::BatchNorm2dOptions(num_features));
-            torch::Tensor dequantized_input = quantized_input.dequantize();
-            torch::Tensor bn_output = bn(dequantized_input);
-            output = torch::quantize_per_tensor(bn_output, scale, zero_point, torch::kQUInt8);
+            quantized_output = torch::quantize_per_tensor(
+                bn_output, 
+                scale, 
+                zero_point, 
+                torch::kQUInt8
+            );
+        } catch (...) {
+            // Output quantization might fail if values are out of range
+            return 0;
         }
         
-        // Test additional operations on the output
+        // Test additional operations on the quantized output
         if (offset < Size) {
             uint8_t op_selector = Data[offset++];
             
-            switch (op_selector % 3) {
+            switch (op_selector % 5) {
                 case 0:
                     // Test dequantization
-                    try {
-                        torch::Tensor dequantized = output.dequantize();
-                    } catch (...) {}
+                    {
+                        torch::Tensor dequantized = quantized_output.dequantize();
+                        (void)dequantized.sum();
+                    }
                     break;
                     
                 case 1:
-                    // Test concatenation with another tensor
-                    try {
-                        auto other_quantized = torch::quantize_per_tensor(
-                            torch::rand({1, num_features, 2, 2}),
-                            scale,
-                            zero_point,
-                            torch::kQUInt8
-                        );
-                        auto cat_dim = output.dim() > 0 ? (Data[offset % Size] % output.dim()) : 0;
-                        torch::Tensor cat_result = torch::cat({output, other_quantized}, cat_dim);
-                    } catch (...) {}
+                    // Test q_scale and q_zero_point
+                    {
+                        double out_scale = quantized_output.q_scale();
+                        int64_t out_zero_point = quantized_output.q_zero_point();
+                        (void)out_scale;
+                        (void)out_zero_point;
+                    }
                     break;
                     
                 case 2:
-                    // Test getting scale and zero_point
+                    // Test int_repr
+                    {
+                        torch::Tensor int_repr = quantized_output.int_repr();
+                        (void)int_repr.sum();
+                    }
+                    break;
+                    
+                case 3:
+                    // Test with training mode
                     try {
-                        double out_scale = output.q_scale();
-                        int64_t out_zero_point = output.q_zero_point();
-                    } catch (...) {}
+                        bn->train();
+                        torch::Tensor train_output = bn(dequantized_input);
+                        (void)train_output.sum();
+                    } catch (...) {
+                        // Training mode might fail with small batches
+                    }
+                    break;
+                    
+                case 4:
+                    // Test clone and operations
+                    {
+                        torch::Tensor cloned = quantized_output.clone();
+                        torch::Tensor dq = cloned.dequantize();
+                        (void)dq.mean();
+                    }
                     break;
             }
         }
@@ -168,7 +182,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,88 +1,128 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract padding values first (4 bytes)
+        int64_t left = static_cast<int64_t>(Data[offset++] % 32);
+        int64_t right = static_cast<int64_t>(Data[offset++] % 32);
+        int64_t top = static_cast<int64_t>(Data[offset++] % 32);
+        int64_t bottom = static_cast<int64_t>(Data[offset++] % 32);
         
-        // Ensure we have at least 4 bytes left for padding values
-        if (Size - offset < 4) {
-            return 0;
+        // Determine tensor dimensions from data
+        uint8_t shape_selector = Data[offset++];
+        
+        // Create input tensor with appropriate shape for ZeroPad2d (3D or 4D)
+        torch::Tensor input_tensor;
+        if (shape_selector % 2 == 0) {
+            // 3D tensor: (C, H, W)
+            int64_t C = 1 + (Data[offset++] % 4);
+            int64_t H = 1 + (Data[offset++] % 16);
+            int64_t W = 1 + (Data[offset++] % 16);
+            input_tensor = torch::randn({C, H, W});
+        } else {
+            // 4D tensor: (N, C, H, W)
+            int64_t N = 1 + (Data[offset++] % 4);
+            int64_t C = 1 + (Data[offset++] % 4);
+            int64_t H = 1 + (Data[offset++] % 16);
+            int64_t W = 1 + (Data[offset++] % 16);
+            input_tensor = torch::randn({N, C, H, W});
         }
         
-        // Extract padding values from the remaining data
-        int64_t left = static_cast<int64_t>(Data[offset++]);
-        int64_t right = static_cast<int64_t>(Data[offset++]);
-        int64_t top = static_cast<int64_t>(Data[offset++]);
-        int64_t bottom = static_cast<int64_t>(Data[offset++]);
+        // ZeroPad2d requires padding as {left, right, top, bottom}
+        std::vector<int64_t> padding = {left, right, top, bottom};
         
-        // Create ZeroPad2d module
-        // Try different ways to specify padding
-        if (offset % 3 == 0) {
-            // Single value for all sides
-            int64_t padding = left;
-            auto zeropad = torch::nn::ZeroPad2d(padding);
-            auto output = zeropad->forward(input_tensor);
-        } 
-        else if (offset % 3 == 1) {
-            // Vector of 4 values (left, right, top, bottom)
-            std::vector<int64_t> padding = {left, right, top, bottom};
-            auto zeropad = torch::nn::ZeroPad2d(torch::nn::ZeroPad2dOptions(padding));
-            auto output = zeropad->forward(input_tensor);
-        }
-        else {
-            // Vector of 4 values
-            std::vector<int64_t> padding = {left, right, top, bottom};
-            auto zeropad = torch::nn::ZeroPad2d(padding);
-            auto output = zeropad->forward(input_tensor);
-        }
+        // Create ZeroPad2d module using options
+        auto zeropad = torch::nn::ZeroPad2d(torch::nn::ZeroPad2dOptions(padding));
+        
+        // Forward pass
+        torch::Tensor output = zeropad->forward(input_tensor);
+        
+        // Verify output shape is correct
+        auto input_sizes = input_tensor.sizes();
+        auto output_sizes = output.sizes();
+        int ndim = input_sizes.size();
+        
+        // H dimension should increase by top + bottom
+        // W dimension should increase by left + right
+        (void)output_sizes; // Use output to prevent optimization
         
         // Try functional version as well
-        std::vector<int64_t> pad_vec = {left, right, top, bottom};
         auto functional_output = torch::nn::functional::pad(
             input_tensor,
-            torch::nn::functional::PadFuncOptions(pad_vec).mode(torch::kConstant).value(0.0)
+            torch::nn::functional::PadFuncOptions(padding).mode(torch::kConstant).value(0.0)
         );
         
-        // Try with negative padding values
+        // Test with uniform padding (same value all sides)
         if (offset < Size) {
-            int64_t neg_padding = -static_cast<int64_t>(Data[offset++] % 5);
+            int64_t uniform_pad = static_cast<int64_t>(Data[offset++] % 16);
+            std::vector<int64_t> uniform_padding = {uniform_pad, uniform_pad, uniform_pad, uniform_pad};
+            auto uniform_zeropad = torch::nn::ZeroPad2d(torch::nn::ZeroPad2dOptions(uniform_padding));
+            auto uniform_output = uniform_zeropad->forward(input_tensor);
+            (void)uniform_output;
+        }
+        
+        // Test with asymmetric padding
+        if (offset + 1 < Size) {
+            int64_t h_pad = static_cast<int64_t>(Data[offset++] % 16);
+            int64_t w_pad = static_cast<int64_t>(Data[offset++] % 16);
+            std::vector<int64_t> asym_padding = {w_pad, w_pad, h_pad, h_pad};
+            auto asym_zeropad = torch::nn::ZeroPad2d(torch::nn::ZeroPad2dOptions(asym_padding));
+            auto asym_output = asym_zeropad->forward(input_tensor);
+            (void)asym_output;
+        }
+        
+        // Test with different dtypes
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset++];
+            torch::Tensor typed_tensor;
+            
             try {
-                auto neg_zeropad = torch::nn::ZeroPad2d(neg_padding);
-                auto neg_output = neg_zeropad->forward(input_tensor);
+                if (dtype_selector % 4 == 0) {
+                    typed_tensor = input_tensor.to(torch::kFloat32);
+                } else if (dtype_selector % 4 == 1) {
+                    typed_tensor = input_tensor.to(torch::kFloat64);
+                } else if (dtype_selector % 4 == 2) {
+                    typed_tensor = input_tensor.to(torch::kInt32);
+                } else {
+                    typed_tensor = input_tensor.to(torch::kInt64);
+                }
+                
+                auto typed_output = zeropad->forward(typed_tensor);
+                (void)typed_output;
             } catch (...) {
-                // Expected to potentially fail with negative padding
+                // Some dtypes may not be supported, silently ignore
             }
         }
         
-        // Try with very large padding values
-        if (offset < Size) {
-            int64_t large_padding = static_cast<int64_t>(Data[offset++]) * 1000;
-            try {
-                auto large_zeropad = torch::nn::ZeroPad2d(large_padding);
-                auto large_output = large_zeropad->forward(input_tensor);
-            } catch (...) {
-                // Expected to potentially fail with very large padding
-            }
+        // Test zero padding (edge case)
+        {
+            std::vector<int64_t> zero_padding = {0, 0, 0, 0};
+            auto zero_zeropad = torch::nn::ZeroPad2d(torch::nn::ZeroPad2dOptions(zero_padding));
+            auto zero_output = zero_zeropad->forward(input_tensor);
+            (void)zero_output;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

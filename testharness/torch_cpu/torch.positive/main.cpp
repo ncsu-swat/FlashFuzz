@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -21,15 +25,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply torch.positive operation
         torch::Tensor result = torch::positive(input_tensor);
         
-        // Try to access the result to ensure computation is performed
-        if (result.defined()) {
-            auto sizes = result.sizes();
-            auto dtype = result.dtype();
-            
-            // Force evaluation by accessing an element if tensor is not empty
-            if (result.numel() > 0) {
-                result.item();
-            }
+        // Force evaluation by accessing the result
+        if (result.defined() && result.numel() > 0) {
+            // Use sum() to force evaluation without requiring single element
+            volatile auto val = result.sum().item<float>();
+            (void)val;
         }
         
         // Try with different tensor options if we have more data
@@ -39,35 +39,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Force evaluation
             if (another_result.defined() && another_result.numel() > 0) {
-                another_result.item();
+                volatile auto val = another_result.sum().item<float>();
+                (void)val;
             }
         }
         
         // Test with non-contiguous tensor if we have enough data
-        if (offset + 2 < Size && input_tensor.dim() > 0 && input_tensor.numel() > 1) {
-            // Create a non-contiguous view if possible
-            torch::Tensor non_contiguous;
-            if (input_tensor.dim() > 1 && input_tensor.size(0) > 1) {
-                non_contiguous = input_tensor.transpose(0, input_tensor.dim() - 1);
-            } else {
-                // For 1D tensors or tensors with first dim = 1, try another approach
-                non_contiguous = input_tensor.expand({2, -1});
-            }
-            
-            // Apply positive to non-contiguous tensor
-            if (!non_contiguous.is_contiguous()) {
-                torch::Tensor non_contiguous_result = torch::positive(non_contiguous);
+        if (input_tensor.dim() > 1 && input_tensor.size(0) > 1) {
+            try {
+                // Create a non-contiguous view via transpose
+                torch::Tensor non_contiguous = input_tensor.transpose(0, input_tensor.dim() - 1);
                 
-                // Force evaluation
-                if (non_contiguous_result.defined() && non_contiguous_result.numel() > 0) {
-                    non_contiguous_result.item();
+                // Apply positive to non-contiguous tensor
+                if (!non_contiguous.is_contiguous()) {
+                    torch::Tensor non_contiguous_result = torch::positive(non_contiguous);
+                    
+                    // Force evaluation
+                    if (non_contiguous_result.defined() && non_contiguous_result.numel() > 0) {
+                        volatile auto val = non_contiguous_result.sum().item<float>();
+                        (void)val;
+                    }
                 }
+            } catch (const std::exception &) {
+                // Silently ignore shape-related failures
             }
         }
         
         // Test with different dtypes if we have more data
         if (offset + 2 < Size) {
-            // Try to create a tensor with a different dtype
             torch::Tensor typed_tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
             // Apply positive
@@ -75,14 +74,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Force evaluation
             if (typed_result.defined() && typed_result.numel() > 0) {
-                typed_result.item();
+                volatile auto val = typed_result.sum().item<float>();
+                (void)val;
+            }
+        }
+        
+        // Test with cloned tensor (ensures we're working with owned data)
+        if (input_tensor.defined() && input_tensor.numel() > 0) {
+            try {
+                torch::Tensor cloned = input_tensor.clone();
+                torch::Tensor cloned_result = torch::positive(cloned);
+                
+                if (cloned_result.defined() && cloned_result.numel() > 0) {
+                    volatile auto val = cloned_result.sum().item<float>();
+                    (void)val;
+                }
+            } catch (const std::exception &) {
+                // Silently ignore if clone/positive has issues
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

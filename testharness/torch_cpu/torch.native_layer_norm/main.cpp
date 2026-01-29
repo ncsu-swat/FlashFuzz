@@ -1,81 +1,110 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes for basic tensor creation
         if (Size < 10) {
-            return 0;
+            return -1;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Parse normalized_shape from the remaining data
-        std::vector<int64_t> normalized_shape;
-        if (offset + 1 < Size) {
-            uint8_t normalized_rank = Data[offset++] % 4; // Limit to reasonable rank
-            normalized_shape = fuzzer_utils::parseShape(Data, offset, Size, normalized_rank);
-        } else {
-            // Default to normalizing the last dimension if no data left
-            if (input.dim() > 0) {
-                normalized_shape.push_back(input.size(-1));
-            } else {
-                normalized_shape.push_back(1);
-            }
+        // Ensure input has at least 1 dimension
+        if (input.dim() == 0) {
+            input = input.unsqueeze(0);
         }
         
-        // Create weight and bias tensors with the same shape as normalized_shape
+        // Parse normalized_shape from the remaining data
+        // normalized_shape must match the trailing dimensions of input
+        std::vector<int64_t> normalized_shape;
+        
+        if (offset + 1 < Size) {
+            // Determine how many trailing dimensions to normalize (1 to input.dim())
+            uint8_t num_dims = (Data[offset++] % input.dim()) + 1;
+            
+            // Get the trailing dimensions of input
+            for (int i = input.dim() - num_dims; i < input.dim(); i++) {
+                normalized_shape.push_back(input.size(i));
+            }
+        } else {
+            // Default: normalize the last dimension
+            normalized_shape.push_back(input.size(-1));
+        }
+        
+        // Ensure normalized_shape is not empty and has valid sizes
+        if (normalized_shape.empty()) {
+            normalized_shape.push_back(input.size(-1));
+        }
+        
+        // Create weight and bias with correct shape (matching normalized_shape)
         torch::Tensor weight;
         torch::Tensor bias;
         
-        // Create weight tensor
-        if (offset < Size) {
-            weight = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure weight has the same shape as normalized_shape
-            if (weight.dim() > 0 && weight.sizes() != c10::IntArrayRef(normalized_shape)) {
-                weight = weight.reshape(normalized_shape);
+        // Decide whether to use weight/bias based on fuzzer data
+        bool use_weight = (offset < Size) ? (Data[offset++] % 2 == 1) : true;
+        bool use_bias = (offset < Size) ? (Data[offset++] % 2 == 1) : true;
+        
+        if (use_weight) {
+            // Create weight tensor with shape matching normalized_shape
+            weight = torch::randn(normalized_shape, input.options());
+            // Optionally modify with fuzzer data
+            if (offset + sizeof(float) <= Size) {
+                float scale;
+                std::memcpy(&scale, Data + offset, sizeof(float));
+                offset += sizeof(float);
+                if (std::isfinite(scale) && scale != 0.0f) {
+                    weight = weight * scale;
+                }
             }
-        } else {
-            weight = torch::ones(normalized_shape);
         }
         
-        // Create bias tensor
-        if (offset < Size) {
-            bias = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure bias has the same shape as normalized_shape
-            if (bias.dim() > 0 && bias.sizes() != c10::IntArrayRef(normalized_shape)) {
-                bias = bias.reshape(normalized_shape);
+        if (use_bias) {
+            // Create bias tensor with shape matching normalized_shape
+            bias = torch::randn(normalized_shape, input.options());
+            if (offset + sizeof(float) <= Size) {
+                float scale;
+                std::memcpy(&scale, Data + offset, sizeof(float));
+                offset += sizeof(float);
+                if (std::isfinite(scale)) {
+                    bias = bias * scale;
+                }
             }
-        } else {
-            bias = torch::zeros(normalized_shape);
         }
         
         // Parse epsilon
-        float eps = 1e-5;
+        double eps = 1e-5;
         if (offset + sizeof(float) <= Size) {
-            std::memcpy(&eps, Data + offset, sizeof(float));
+            float eps_f;
+            std::memcpy(&eps_f, Data + offset, sizeof(float));
             offset += sizeof(float);
             
-            // Ensure epsilon is positive and not too small
-            if (eps <= 0 || std::isnan(eps)) {
-                eps = 1e-5;
+            // Ensure epsilon is positive and reasonable
+            if (std::isfinite(eps_f) && eps_f > 1e-12 && eps_f < 1.0) {
+                eps = static_cast<double>(eps_f);
             }
         }
         
         // Call native_layer_norm
-        auto output = at::native_layer_norm(
+        // The function signature: native_layer_norm(input, normalized_shape, weight, bias, eps)
+        // weight and bias can be undefined tensors
+        auto output = torch::native_layer_norm(
             input,
             normalized_shape,
-            weight,
-            bias,
+            use_weight ? weight : torch::Tensor(),
+            use_bias ? bias : torch::Tensor(),
             eps
         );
         
@@ -84,17 +113,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         auto& mean = std::get<1>(output);
         auto& rstd = std::get<2>(output);
         
-        // Perform some operations on the results to ensure they're used
-        auto sum = result.sum() + mean.sum() + rstd.sum();
-        if (sum.item<float>() == -12345.6789f) {
-            // This condition is unlikely to be true, just to prevent
-            // the compiler from optimizing away the operations
-            std::cerr << "Unexpected sum value" << std::endl;
+        // Verify outputs are valid
+        if (result.numel() > 0) {
+            auto sum = result.sum();
+            (void)sum;
+        }
+        if (mean.numel() > 0) {
+            auto mean_sum = mean.sum();
+            (void)mean_sum;
+        }
+        if (rstd.numel() > 0) {
+            auto rstd_sum = rstd.sum();
+            (void)rstd_sum;
         }
     }
     catch (const std::exception &e)
     {
-        return 0; // discard the input
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,42 +1,42 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        torch::NoGradGuard no_grad;
+        
         size_t offset = 0;
         
-        // Need at least a few bytes to create meaningful tensors
-        if (Size < 10) {
+        if (Size < 16) {
             return 0;
         }
         
         // Parse configuration parameters from the input data
-        uint8_t embed_dim = 0;
-        uint8_t num_heads = 0;
-        bool bias = false;
-        float dropout = 0.0f;
-        bool add_bias_kv = false;
-        bool add_zero_attn = false;
+        int64_t embed_dim = (Data[offset++] % 8 + 1) * 8; // 8, 16, 24, ..., 64
+        int64_t num_heads = Data[offset++] % 8 + 1; // 1-8 heads
         
-        if (offset < Size) embed_dim = (Data[offset++] % 8 + 1) * 8; // Make embed_dim a multiple of 8
-        if (offset < Size) {
-            num_heads = Data[offset++] % 8 + 1; // 1-8 heads
-            // Ensure embed_dim is divisible by num_heads
-            embed_dim = (embed_dim / num_heads) * num_heads;
-            if (embed_dim == 0) embed_dim = num_heads;
-        }
-        if (offset < Size) bias = Data[offset++] % 2 == 0;
-        if (offset < Size) {
-            uint8_t dropout_byte = Data[offset++];
-            dropout = static_cast<float>(dropout_byte) / 255.0f;
-        }
-        if (offset < Size) add_bias_kv = Data[offset++] % 2 == 0;
-        if (offset < Size) add_zero_attn = Data[offset++] % 2 == 0;
+        // Ensure embed_dim is divisible by num_heads
+        embed_dim = (embed_dim / num_heads) * num_heads;
+        if (embed_dim == 0) embed_dim = num_heads * 8;
+        
+        bool bias = Data[offset++] % 2 == 0;
+        float dropout = static_cast<float>(Data[offset++]) / 255.0f * 0.5f; // Cap at 0.5
+        bool add_bias_kv = Data[offset++] % 2 == 0;
+        bool add_zero_attn = Data[offset++] % 2 == 0;
+        
+        // Parse sequence lengths and batch size
+        int64_t seq_len_q = (Data[offset++] % 8) + 1;  // 1-8
+        int64_t seq_len_kv = (Data[offset++] % 8) + 1; // 1-8
+        int64_t batch_size = (Data[offset++] % 4) + 1; // 1-4
         
         // Create MultiheadAttention module
         torch::nn::MultiheadAttention mha(
@@ -46,133 +46,82 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 .add_bias_kv(add_bias_kv)
                 .add_zero_attn(add_zero_attn)
         );
+        mha->eval(); // Set to eval mode to disable dropout
         
-        // Create input tensors
-        torch::Tensor query;
-        torch::Tensor key;
-        torch::Tensor value;
+        // Create input tensors with proper shapes directly
+        // MultiheadAttention expects (L, N, E) format: (seq_len, batch, embed_dim)
+        torch::Tensor query = torch::randn({seq_len_q, batch_size, embed_dim});
+        torch::Tensor key = torch::randn({seq_len_kv, batch_size, embed_dim});
+        torch::Tensor value = torch::randn({seq_len_kv, batch_size, embed_dim});
+        
+        // Use fuzzer data to modify tensor values
+        if (offset + 4 <= Size) {
+            float scale_q = static_cast<float>(Data[offset++]) / 128.0f;
+            query = query * scale_q;
+        }
+        if (offset + 4 <= Size) {
+            float scale_k = static_cast<float>(Data[offset++]) / 128.0f;
+            key = key * scale_k;
+        }
+        if (offset + 4 <= Size) {
+            float scale_v = static_cast<float>(Data[offset++]) / 128.0f;
+            value = value * scale_v;
+        }
+        
+        // Decide on optional masks
+        bool use_key_padding_mask = (offset < Size) && (Data[offset++] % 2 == 0);
+        bool use_attn_mask = (offset < Size) && (Data[offset++] % 2 == 0);
+        
+        torch::Tensor key_padding_mask;
+        torch::Tensor attn_mask;
+        
+        if (use_key_padding_mask) {
+            // key_padding_mask shape: (N, S) where S is source sequence length
+            key_padding_mask = torch::zeros({batch_size, seq_len_kv}, torch::kBool);
+            // Randomly mask some positions
+            if (offset < Size) {
+                int num_masked = Data[offset++] % (seq_len_kv + 1);
+                for (int i = 0; i < num_masked && offset < Size; i++) {
+                    int64_t pos = Data[offset++] % seq_len_kv;
+                    int64_t batch_idx = (offset < Size) ? Data[offset++] % batch_size : 0;
+                    key_padding_mask[batch_idx][pos] = true;
+                }
+            }
+        }
+        
+        if (use_attn_mask) {
+            // attn_mask shape: (L, S) or (N*num_heads, L, S)
+            // Use 2D mask for simplicity
+            bool use_float_mask = (offset < Size) && (Data[offset++] % 2 == 0);
+            if (use_float_mask) {
+                attn_mask = torch::zeros({seq_len_q, seq_len_kv}, torch::kFloat32);
+                // Set some positions to -inf for masking
+                if (offset < Size) {
+                    int num_masked = Data[offset++] % (seq_len_q * seq_len_kv / 2 + 1);
+                    for (int i = 0; i < num_masked && offset + 1 < Size; i++) {
+                        int64_t row = Data[offset++] % seq_len_q;
+                        int64_t col = Data[offset++] % seq_len_kv;
+                        attn_mask[row][col] = -std::numeric_limits<float>::infinity();
+                    }
+                }
+            } else {
+                attn_mask = torch::zeros({seq_len_q, seq_len_kv}, torch::kBool);
+                if (offset < Size) {
+                    int num_masked = Data[offset++] % (seq_len_q * seq_len_kv / 2 + 1);
+                    for (int i = 0; i < num_masked && offset + 1 < Size; i++) {
+                        int64_t row = Data[offset++] % seq_len_q;
+                        int64_t col = Data[offset++] % seq_len_kv;
+                        attn_mask[row][col] = true;
+                    }
+                }
+            }
+        }
+        
+        // Call the MultiheadAttention forward function
+        torch::Tensor attn_output;
+        torch::Tensor attn_output_weights;
         
         try {
-            query = fuzzer_utils::createTensor(Data, Size, offset);
-            key = fuzzer_utils::createTensor(Data, Size, offset);
-            value = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Reshape tensors to valid dimensions for MultiheadAttention if needed
-            // MultiheadAttention expects query, key, value of shape (L, N, E)
-            // where L = sequence length, N = batch size, E = embedding dimension
-            
-            // Ensure tensors have at least 3 dimensions
-            if (query.dim() < 3) {
-                std::vector<int64_t> new_shape;
-                if (query.dim() == 0) {
-                    new_shape = {1, 1, embed_dim};
-                } else if (query.dim() == 1) {
-                    new_shape = {query.size(0), 1, embed_dim};
-                } else { // dim == 2
-                    new_shape = {query.size(0), query.size(1), embed_dim};
-                }
-                query = query.reshape(new_shape);
-            }
-            
-            if (key.dim() < 3) {
-                std::vector<int64_t> new_shape;
-                if (key.dim() == 0) {
-                    new_shape = {1, 1, embed_dim};
-                } else if (key.dim() == 1) {
-                    new_shape = {key.size(0), 1, embed_dim};
-                } else { // dim == 2
-                    new_shape = {key.size(0), key.size(1), embed_dim};
-                }
-                key = key.reshape(new_shape);
-            }
-            
-            if (value.dim() < 3) {
-                std::vector<int64_t> new_shape;
-                if (value.dim() == 0) {
-                    new_shape = {1, 1, embed_dim};
-                } else if (value.dim() == 1) {
-                    new_shape = {value.size(0), 1, embed_dim};
-                } else { // dim == 2
-                    new_shape = {value.size(0), value.size(1), embed_dim};
-                }
-                value = value.reshape(new_shape);
-            }
-            
-            // Ensure the last dimension is embed_dim
-            if (query.size(2) != embed_dim) {
-                query = query.reshape({query.size(0), query.size(1), embed_dim});
-            }
-            if (key.size(2) != embed_dim) {
-                key = key.reshape({key.size(0), key.size(1), embed_dim});
-            }
-            if (value.size(2) != embed_dim) {
-                value = value.reshape({value.size(0), value.size(1), embed_dim});
-            }
-            
-            // Create optional parameters
-            torch::Tensor key_padding_mask;
-            torch::Tensor attn_mask;
-            
-            bool use_key_padding_mask = false;
-            bool use_attn_mask = false;
-            
-            if (offset < Size) {
-                use_key_padding_mask = Data[offset++] % 2 == 0;
-            }
-            
-            if (offset < Size) {
-                use_attn_mask = Data[offset++] % 2 == 0;
-            }
-            
-            if (use_key_padding_mask) {
-                try {
-                    key_padding_mask = fuzzer_utils::createTensor(Data, Size, offset);
-                    // Reshape to match batch size and key sequence length
-                    if (key_padding_mask.dim() == 0) {
-                        key_padding_mask = key_padding_mask.reshape({1, 1});
-                    } else if (key_padding_mask.dim() == 1) {
-                        key_padding_mask = key_padding_mask.reshape({1, key_padding_mask.size(0)});
-                    }
-                    
-                    // Ensure dimensions match batch size and key sequence length
-                    key_padding_mask = key_padding_mask.reshape({key.size(1), key.size(0)});
-                    
-                    // Convert to boolean mask
-                    key_padding_mask = key_padding_mask.to(torch::kBool);
-                } catch (const std::exception& e) {
-                    use_key_padding_mask = false;
-                }
-            }
-            
-            if (use_attn_mask) {
-                try {
-                    attn_mask = fuzzer_utils::createTensor(Data, Size, offset);
-                    
-                    // Reshape to match query and key sequence lengths
-                    if (attn_mask.dim() == 0) {
-                        attn_mask = attn_mask.reshape({1, 1});
-                    } else if (attn_mask.dim() == 1) {
-                        attn_mask = attn_mask.reshape({1, attn_mask.size(0)});
-                    }
-                    
-                    // Ensure dimensions match query and key sequence lengths
-                    attn_mask = attn_mask.reshape({query.size(0), key.size(0)});
-                    
-                    // Convert to appropriate dtype (float for additive mask, bool for multiplicative mask)
-                    if (offset < Size && Data[offset++] % 2 == 0) {
-                        attn_mask = attn_mask.to(torch::kFloat32);
-                    } else {
-                        attn_mask = attn_mask.to(torch::kBool);
-                    }
-                } catch (const std::exception& e) {
-                    use_attn_mask = false;
-                }
-            }
-            
-            // Call the MultiheadAttention forward function
-            torch::Tensor attn_output;
-            torch::Tensor attn_output_weights;
-            
             if (use_key_padding_mask && use_attn_mask) {
                 std::tie(attn_output, attn_output_weights) = mha->forward(
                     query, key, value, key_padding_mask, true, attn_mask
@@ -191,31 +140,37 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 );
             }
             
-            // Test some operations on the output to ensure it's valid
+            // Verify output shapes and values
             auto output_sum = attn_output.sum();
             auto weights_sum = attn_output_weights.sum();
             
-            // Test with different need_weights values
+            // Test with need_weights=false
             std::tie(attn_output, attn_output_weights) = mha->forward(
                 query, key, value, {}, false, {}
             );
             
-            // Test with average_attn_weights=false
+            // Test with average_attn_weights=false if supported
             if (offset < Size && Data[offset++] % 2 == 0) {
-                std::tie(attn_output, attn_output_weights) = mha->forward(
-                    query, key, value, {}, true, {}, false
-                );
+                try {
+                    std::tie(attn_output, attn_output_weights) = mha->forward(
+                        query, key, value, {}, true, {}, false
+                    );
+                } catch (...) {
+                    // average_attn_weights parameter might not be supported in all versions
+                }
             }
-            
-        } catch (const std::exception& e) {
-            // Catch exceptions from tensor creation or reshaping
+        } catch (const c10::Error& e) {
+            // Expected errors from invalid configurations, silently ignore
+            return 0;
+        } catch (const std::runtime_error& e) {
+            // Shape mismatches and similar runtime errors, silently ignore
             return 0;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

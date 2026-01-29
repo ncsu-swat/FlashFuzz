@@ -1,146 +1,109 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create tensors
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor b
+        // Extract boolean options from data
+        bool upper = Data[offset++] & 0x1;
+        bool transpose = Data[offset++] & 0x1;
+        bool unitriangular = Data[offset++] & 0x1;
+        
+        // Extract matrix dimension (limit to reasonable size)
+        int64_t n = (Data[offset++] % 16) + 1;  // 1 to 16
+        int64_t nrhs = (Data[offset++] % 8) + 1; // 1 to 8 right-hand sides
+        
+        // Create tensor A (n x n triangular matrix)
+        torch::Tensor A = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        // Convert to float if needed (triangular_solve requires floating point)
+        if (!A.is_floating_point()) {
+            A = A.to(torch::kFloat32);
+        }
+        
+        // Reshape A to be a square matrix
+        A = A.flatten();
+        int64_t total_elements = A.numel();
+        if (total_elements < n * n) {
+            // Pad with ones on diagonal pattern
+            auto padding = torch::ones({n * n - total_elements}, A.options());
+            A = torch::cat({A, padding}, 0);
+        }
+        A = A.slice(0, 0, n * n).reshape({n, n});
+        
+        // Make A triangular and ensure diagonal is non-zero to avoid singular matrix
+        if (upper) {
+            A = A.triu();
+        } else {
+            A = A.tril();
+        }
+        
+        // Add small value to diagonal to avoid singularity (unless unitriangular)
+        if (!unitriangular) {
+            A = A + torch::eye(n, A.options()) * 0.1;
+        }
+        
+        // Create tensor b (n x nrhs)
         torch::Tensor b = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create input tensor A (triangular matrix)
-        torch::Tensor A;
-        if (offset < Size) {
-            A = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a simple triangular matrix
-            A = torch::ones({2, 2}, b.options());
-            A.triu_();
+        // Convert to same dtype as A
+        b = b.to(A.dtype());
+        
+        // Reshape b to be compatible with A
+        b = b.flatten();
+        int64_t b_elements = b.numel();
+        if (b_elements < n * nrhs) {
+            auto padding = torch::zeros({n * nrhs - b_elements}, b.options());
+            b = torch::cat({b, padding}, 0);
         }
+        b = b.slice(0, 0, n * nrhs).reshape({n, nrhs});
         
-        // Get boolean options from remaining data
-        bool upper = true;
-        bool transpose = false;
-        bool unitriangular = false;
-        
-        if (offset < Size) {
-            upper = Data[offset++] & 0x1;
-        }
-        
-        if (offset < Size) {
-            transpose = Data[offset++] & 0x1;
-        }
-        
-        if (offset < Size) {
-            unitriangular = Data[offset++] & 0x1;
-        }
-        
-        // Try to make A at least 2D if it's not already
-        if (A.dim() < 2) {
-            if (A.dim() == 0) {
-                A = A.unsqueeze(0).unsqueeze(0);
-            } else if (A.dim() == 1) {
-                A = A.unsqueeze(0);
-            }
-        }
-        
-        // Make sure A is square in the last two dimensions
-        if (A.dim() >= 2) {
-            auto last_dim = A.size(-1);
-            auto second_last_dim = A.size(-2);
-            
-            if (last_dim != second_last_dim && last_dim > 0 && second_last_dim > 0) {
-                // Resize to make square
-                auto min_dim = std::min(last_dim, second_last_dim);
-                std::vector<int64_t> new_sizes(A.sizes().begin(), A.sizes().end());
-                new_sizes[new_sizes.size() - 1] = min_dim;
-                new_sizes[new_sizes.size() - 2] = min_dim;
-                A = A.index({"...", torch::indexing::Slice(0, min_dim), torch::indexing::Slice(0, min_dim)});
-            }
-            
-            // Make sure A is triangular
-            if (upper) {
-                A = A.triu();
-            } else {
-                A = A.tril();
-            }
-        }
-        
-        // Make sure b has compatible dimensions with A
-        if (b.dim() > 0 && A.dim() >= 2) {
-            auto A_rows = A.size(-2);
-            
-            if (b.dim() == 1) {
-                // For 1D b, make sure its length matches A's rows
-                if (b.size(0) != A_rows && A_rows > 0) {
-                    b = b.index({torch::indexing::Slice(0, A_rows)});
-                    if (b.size(0) < A_rows) {
-                        // Pad if needed
-                        auto padding = A_rows - b.size(0);
-                        auto pad_tensor = torch::zeros({padding}, b.options());
-                        b = torch::cat({b, pad_tensor}, 0);
-                    }
-                }
-            } else if (b.dim() >= 2) {
-                // For multi-dimensional b, make sure its second-to-last dimension matches A's rows
-                if (b.size(-2) != A_rows && A_rows > 0) {
-                    std::vector<torch::indexing::TensorIndex> indices(b.dim(), torch::indexing::Slice());
-                    indices[b.dim() - 2] = torch::indexing::Slice(0, A_rows);
-                    b = b.index(indices);
-                    
-                    if (b.size(-2) < A_rows) {
-                        // Create a new tensor with the right size and copy data
-                        std::vector<int64_t> new_sizes(b.sizes().begin(), b.sizes().end());
-                        new_sizes[new_sizes.size() - 2] = A_rows;
-                        auto new_b = torch::zeros(new_sizes, b.options());
-                        
-                        std::vector<torch::indexing::TensorIndex> src_indices(b.dim(), torch::indexing::Slice());
-                        std::vector<torch::indexing::TensorIndex> dst_indices(b.dim(), torch::indexing::Slice());
-                        dst_indices[b.dim() - 2] = torch::indexing::Slice(0, b.size(-2));
-                        
-                        new_b.index_put_(dst_indices, b.index(src_indices));
-                        b = new_b;
-                    }
-                }
-            }
-        }
-        
-        // Apply triangular_solve
+        // Call triangular_solve
         auto result = torch::triangular_solve(b, A, upper, transpose, unitriangular);
         
-        // Access the solution and LU factors to ensure they're computed
+        // Access results to ensure computation
         auto solution = std::get<0>(result);
         auto A_clone = std::get<1>(result);
         
-        // Perform some operations on the results to ensure they're valid
-        auto sum = solution.sum();
-        auto product = A_clone.matmul(solution);
+        // Verify solution is computed (use values to prevent dead code elimination)
+        auto sum = solution.sum().item<float>();
+        (void)sum;
         
-        // Check if the solution is valid by comparing A * solution with b
-        if (solution.numel() > 0 && A_clone.numel() > 0) {
-            auto residual = product - b;
-            auto norm = residual.norm().item<double>();
+        // Also test with batched input
+        if (offset + 4 < Size) {
+            int64_t batch = (Data[offset++] % 3) + 1; // 1 to 3 batches
             
-            // This is just to use the computed values and prevent dead code elimination
-            if (std::isnan(norm) || std::isinf(norm)) {
-                return 0;
+            torch::Tensor A_batched = A.unsqueeze(0).expand({batch, n, n}).contiguous();
+            torch::Tensor b_batched = b.unsqueeze(0).expand({batch, n, nrhs}).contiguous();
+            
+            try {
+                auto result_batched = torch::triangular_solve(b_batched, A_batched, upper, transpose, unitriangular);
+                auto sol_batched = std::get<0>(result_batched);
+                auto sum_batched = sol_batched.sum().item<float>();
+                (void)sum_batched;
+            } catch (const std::exception &) {
+                // Batched operation may fail for certain configurations, ignore
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

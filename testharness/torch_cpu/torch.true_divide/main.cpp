@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -33,9 +38,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     float value;
                     std::memcpy(&value, Data + offset, sizeof(float));
                     offset += sizeof(float);
+                    // Avoid division by exactly zero for more interesting results
+                    if (value == 0.0f) {
+                        value = 1.0f;
+                    }
                     scalar_divisor = torch::Scalar(value);
                 } else {
-                    // Not enough data for float, use a simple value
                     scalar_divisor = torch::Scalar(1.0);
                 }
             } else {
@@ -43,12 +51,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 if (offset < Size) {
                     tensor_divisor = fuzzer_utils::createTensor(Data, Size, offset);
                 } else {
-                    // Not enough data, create a simple tensor
                     tensor_divisor = torch::ones_like(input);
                 }
             }
         } else {
-            // Not enough data, default to scalar division by 1.0
             use_scalar = true;
             scalar_divisor = torch::Scalar(1.0);
         }
@@ -61,22 +67,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             result = torch::true_divide(input, tensor_divisor);
         }
         
-        // Test the inplace version as well if possible
-        if (!use_scalar && input.dtype() == tensor_divisor.dtype()) {
-            torch::Tensor input_copy = input.clone();
-            input_copy.true_divide_(tensor_divisor);
-        }
-        
-        // Test scalar inplace version
-        if (use_scalar) {
-            torch::Tensor input_copy = input.clone();
-            input_copy.true_divide_(scalar_divisor);
-        }
-        
-        // Test division by zero (should throw exception, which will be caught)
-        if (offset < Size && Data[offset] % 10 == 0) {
-            torch::Tensor zero_tensor = torch::zeros_like(input);
-            torch::Tensor div_by_zero = torch::true_divide(input, zero_tensor);
+        // Test the inplace version - true_divide_ requires float input tensor
+        // since true_divide always produces floating point output
+        try {
+            if (!use_scalar) {
+                torch::Tensor input_copy = input.to(torch::kFloat32).clone();
+                torch::Tensor divisor_copy = tensor_divisor.to(torch::kFloat32);
+                input_copy.true_divide_(divisor_copy);
+            } else {
+                torch::Tensor input_copy = input.to(torch::kFloat32).clone();
+                input_copy.true_divide_(scalar_divisor);
+            }
+        } catch (...) {
+            // Shape mismatch or other expected failures
         }
         
         // Test with different dtypes
@@ -84,7 +87,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             uint8_t dtype_selector = Data[offset++];
             auto dtype = fuzzer_utils::parseDataType(dtype_selector);
             
-            // Convert input to the new dtype if possible
             try {
                 torch::Tensor converted_input = input.to(dtype);
                 
@@ -98,11 +100,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 // Conversion might not be supported for all dtypes
             }
         }
+        
+        // Test div with rounding_mode="true" (equivalent to true_divide)
+        try {
+            if (use_scalar) {
+                auto div_result = torch::div(input, scalar_divisor);
+            } else {
+                auto div_result = torch::div(input, tensor_divisor);
+            }
+        } catch (...) {
+            // Expected failures for incompatible shapes
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

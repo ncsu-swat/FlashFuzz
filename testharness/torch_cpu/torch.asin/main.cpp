@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -40,21 +45,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Try with different memory format if applicable
             if ((option_byte & 0x02) && input.dim() >= 4) {
-                torch::Tensor channels_last = input.to(torch::MemoryFormat::ChannelsLast);
-                torch::asin(channels_last);
+                try {
+                    torch::Tensor channels_last = input.to(torch::MemoryFormat::ChannelsLast);
+                    torch::asin(channels_last);
+                } catch (...) {
+                    // Memory format conversion may fail for some tensor configurations
+                }
             }
-            
-            // Try with different device if GPU is available
-            if ((option_byte & 0x04) && torch::cuda::is_available()) {
-                torch::Tensor cuda_input = input.to(torch::kCUDA);
-                torch::asin(cuda_input);
+        }
+        
+        // Test with different dtypes to improve coverage
+        if (offset < Size) {
+            uint8_t dtype_byte = Data[offset++];
+            try {
+                if (dtype_byte & 0x01) {
+                    torch::Tensor float_input = input.to(torch::kFloat32);
+                    torch::asin(float_input);
+                }
+                if (dtype_byte & 0x02) {
+                    torch::Tensor double_input = input.to(torch::kFloat64);
+                    torch::asin(double_input);
+                }
+                if (dtype_byte & 0x04) {
+                    // Complex input
+                    torch::Tensor complex_input = input.to(torch::kComplexFloat);
+                    torch::asin(complex_input);
+                }
+            } catch (...) {
+                // Some dtype conversions may fail
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

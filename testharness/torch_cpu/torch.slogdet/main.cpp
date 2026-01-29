@@ -1,117 +1,120 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Skip if we don't have enough data
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor for slogdet
-        // slogdet expects a square matrix or batch of square matrices
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // slogdet requires at least a 2D tensor (matrix)
-        if (input.dim() < 2) {
-            // Add dimensions if needed
-            if (input.dim() == 0) {
-                // Scalar to 2x2 matrix
-                input = input.unsqueeze(0).unsqueeze(0).expand({2, 2});
-            } else if (input.dim() == 1) {
-                // Vector to square matrix
-                int64_t size = input.size(0);
-                if (size == 0) {
-                    size = 2; // Default size if empty
-                    input = torch::ones({size});
-                }
-                input = input.unsqueeze(0).expand({size, size});
-            }
+        // Use first byte to determine matrix size (2-8)
+        int64_t matrix_size = 2 + (Data[offset++] % 7);
+        
+        // Use second byte to determine batch dimensions (0-2)
+        int batch_dims = Data[offset++] % 3;
+        
+        // Use third byte to determine dtype
+        uint8_t dtype_selector = Data[offset++] % 3;
+        torch::ScalarType dtype;
+        switch (dtype_selector) {
+            case 0: dtype = torch::kFloat32; break;
+            case 1: dtype = torch::kFloat64; break;
+            default: dtype = torch::kFloat32; break;
         }
         
-        // Ensure the last two dimensions are square
-        auto sizes = input.sizes();
-        int64_t dim = input.dim();
+        // Build the shape for the tensor
+        std::vector<int64_t> shape;
+        for (int i = 0; i < batch_dims && offset < Size; i++) {
+            int64_t batch_size = 1 + (Data[offset++] % 4);  // batch size 1-4
+            shape.push_back(batch_size);
+        }
+        shape.push_back(matrix_size);
+        shape.push_back(matrix_size);
         
-        if (dim >= 2) {
-            int64_t last_dim = sizes[dim-1];
-            int64_t second_last_dim = sizes[dim-2];
+        // Calculate total elements needed
+        int64_t total_elements = 1;
+        for (auto s : shape) {
+            total_elements *= s;
+        }
+        
+        // Create tensor with remaining data
+        torch::Tensor input;
+        if (offset < Size) {
+            // Create tensor from fuzzer data
+            torch::Tensor raw_data = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
             
-            if (last_dim != second_last_dim) {
-                // Make the matrix square by reshaping or expanding
-                int64_t square_size = std::max(last_dim, second_last_dim);
-                
-                // Create a new shape with the last two dimensions being square
-                std::vector<int64_t> new_shape(sizes.begin(), sizes.end());
-                new_shape[dim-1] = square_size;
-                new_shape[dim-2] = square_size;
-                
-                // Reshape or expand to make square
-                if (input.numel() > 0) {
-                    // Try to reshape if possible
-                    if (input.numel() >= square_size * square_size) {
-                        input = input.reshape(new_shape);
-                    } else {
-                        // Otherwise create a new tensor and copy data
-                        auto new_input = torch::zeros(new_shape, input.options());
-                        
-                        // Copy as much data as possible
-                        auto min_last = std::min(last_dim, square_size);
-                        auto min_second_last = std::min(second_last_dim, square_size);
-                        
-                        // Create slices for copying
-                        std::vector<torch::indexing::TensorIndex> src_indices(dim, torch::indexing::Slice());
-                        std::vector<torch::indexing::TensorIndex> dst_indices(dim, torch::indexing::Slice());
-                        
-                        src_indices[dim-1] = torch::indexing::Slice(0, min_last);
-                        src_indices[dim-2] = torch::indexing::Slice(0, min_second_last);
-                        
-                        dst_indices[dim-1] = torch::indexing::Slice(0, min_last);
-                        dst_indices[dim-2] = torch::indexing::Slice(0, min_second_last);
-                        
-                        new_input.index_put_(dst_indices, input.index(src_indices));
-                        input = new_input;
-                    }
-                } else {
-                    // If empty tensor, create a new one with the right shape
-                    input = torch::zeros(new_shape, input.options());
-                }
+            // Flatten and resize to match our target shape
+            raw_data = raw_data.flatten().to(dtype);
+            
+            if (raw_data.numel() >= total_elements) {
+                input = raw_data.slice(0, 0, total_elements).reshape(shape);
+            } else if (raw_data.numel() > 0) {
+                // Repeat data to fill the shape
+                int64_t repeats = (total_elements + raw_data.numel() - 1) / raw_data.numel();
+                auto repeated = raw_data.repeat({repeats});
+                input = repeated.slice(0, 0, total_elements).reshape(shape);
+            } else {
+                // Create random tensor if no valid data
+                input = torch::randn(shape, torch::dtype(dtype));
             }
+        } else {
+            // Create random tensor
+            input = torch::randn(shape, torch::dtype(dtype));
         }
         
-        // Apply slogdet operation
-        auto result = torch::slogdet(input);
+        // Ensure tensor is contiguous and has correct dtype for slogdet
+        input = input.contiguous();
         
-        // Unpack the result (sign, logabsdet)
-        auto sign = std::get<0>(result);
-        auto logabsdet = std::get<1>(result);
-        
-        // Try to access the values to ensure computation is complete
-        if (sign.numel() > 0) {
-            auto sign_item = sign.item();
-        }
-        
-        if (logabsdet.numel() > 0) {
-            auto logabsdet_item = logabsdet.item();
-        }
-        
-        // Compare results if they exist
-        if (sign.numel() > 0) {
-            bool signs_valid = torch::isfinite(sign).all().item<bool>();
-            bool logabsdet_valid = torch::isfinite(logabsdet).all().item<bool>();
+        // Inner try-catch for expected failures (singular matrices, etc.)
+        try {
+            // Apply slogdet operation
+            auto result = torch::slogdet(input);
+            
+            // Unpack the result (sign, logabsdet)
+            auto sign = std::get<0>(result);
+            auto logabsdet = std::get<1>(result);
+            
+            // Force computation by accessing values
+            if (sign.numel() == 1) {
+                volatile auto sign_val = sign.item<double>();
+                volatile auto logabsdet_val = logabsdet.item<double>();
+                (void)sign_val;
+                (void)logabsdet_val;
+            } else if (sign.numel() > 0) {
+                // For batched input, sum to force computation
+                volatile auto sign_sum = sign.sum().item<double>();
+                volatile auto logabsdet_sum = logabsdet.sum().item<double>();
+                (void)sign_sum;
+                (void)logabsdet_sum;
+            }
+            
+            // Additional checks to exercise more code paths
+            auto sign_finite = torch::isfinite(sign);
+            auto logabsdet_finite = torch::isfinite(logabsdet);
+            
+        } catch (const c10::Error& e) {
+            // Expected failures for singular/ill-conditioned matrices - ignore silently
+        } catch (const std::runtime_error& e) {
+            // Expected runtime errors - ignore silently
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

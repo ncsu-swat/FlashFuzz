@@ -1,113 +1,99 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least a few bytes for basic parameters
-        if (Size < 10) {
+        if (Size < 12) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Parse parameters for Conv1d first (before creating input tensor)
+        int64_t in_channels = (Data[offset++] % 16) + 1;  // 1-16 channels
+        int64_t out_channels = (Data[offset++] % 16) + 1; // 1-16 channels
+        int64_t kernel_size = (Data[offset++] % 7) + 1;   // 1-7 kernel size
+        int64_t stride = (Data[offset++] % 4) + 1;        // 1-4 stride
+        int64_t padding = Data[offset++] % 4;             // 0-3 padding
+        int64_t dilation = (Data[offset++] % 3) + 1;      // 1-3 dilation
+        bool bias = Data[offset++] % 2 == 0;              // 50% chance of bias
         
-        // Ensure we have at least 1 byte left for parameters
-        if (offset >= Size) {
-            return 0;
+        // Groups handling: groups must divide both in_channels and out_channels
+        int64_t groups = (Data[offset++] % 4) + 1;  // 1-4 groups
+        
+        // Adjust in_channels and out_channels to be divisible by groups
+        in_channels = groups * ((in_channels + groups - 1) / groups);
+        out_channels = groups * ((out_channels + groups - 1) / groups);
+        
+        // Batch size and sequence length
+        int64_t batch_size = (Data[offset++] % 4) + 1;    // 1-4 batch size
+        
+        // Sequence length must be at least large enough for the effective kernel size
+        // effective_kernel_size = dilation * (kernel_size - 1) + 1
+        int64_t effective_kernel_size = dilation * (kernel_size - 1) + 1;
+        int64_t min_seq_length = effective_kernel_size;
+        int64_t seq_length = min_seq_length + (Data[offset++] % 16);  // Add some extra length
+        
+        // Create input tensor with proper shape [batch_size, in_channels, sequence_length]
+        torch::Tensor input = torch::randn({batch_size, in_channels, seq_length});
+        
+        // Also test with different dtypes based on fuzzer input
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset++] % 3;
+            if (dtype_selector == 1) {
+                input = input.to(torch::kDouble);
+            }
+            // dtype_selector == 0 or 2: keep as float32
         }
         
-        // Parse parameters for Conv1d
-        int64_t in_channels = 0;
-        int64_t out_channels = 0;
-        int64_t kernel_size = 0;
-        int64_t stride = 1;
-        int64_t padding = 0;
-        int64_t dilation = 1;
-        int64_t groups = 1;
-        bool bias = true;
+        // Create Conv1d module with various options
+        torch::nn::Conv1dOptions options(in_channels, out_channels, kernel_size);
+        options.stride(stride)
+               .padding(padding)
+               .dilation(dilation)
+               .groups(groups)
+               .bias(bias);
         
-        // Extract parameters from remaining data
+        // Test different padding modes if we have more data
         if (offset < Size) {
-            in_channels = (Data[offset++] % 16) + 1; // 1-16 channels
-        }
-        
-        if (offset < Size) {
-            out_channels = (Data[offset++] % 16) + 1; // 1-16 channels
-        }
-        
-        if (offset < Size) {
-            kernel_size = (Data[offset++] % 7) + 1; // 1-7 kernel size
-        }
-        
-        if (offset < Size) {
-            stride = (Data[offset++] % 4) + 1; // 1-4 stride
-        }
-        
-        if (offset < Size) {
-            padding = Data[offset++] % 4; // 0-3 padding
-        }
-        
-        if (offset < Size) {
-            dilation = (Data[offset++] % 3) + 1; // 1-3 dilation
-        }
-        
-        if (offset < Size) {
-            // Ensure groups divides in_channels
-            groups = (Data[offset++] % in_channels) + 1;
-            if (groups > 1) {
-                // Ensure in_channels is divisible by groups
-                in_channels = groups * ((in_channels / groups) + 1);
+            uint8_t padding_mode = Data[offset++] % 4;
+            switch (padding_mode) {
+                case 0:
+                    options.padding_mode(torch::kZeros);
+                    break;
+                case 1:
+                    options.padding_mode(torch::kReflect);
+                    // Reflect padding requires seq_length > padding
+                    if (seq_length <= padding) {
+                        options.padding(0);
+                    }
+                    break;
+                case 2:
+                    options.padding_mode(torch::kReplicate);
+                    break;
+                case 3:
+                    options.padding_mode(torch::kCircular);
+                    break;
             }
         }
         
-        if (offset < Size) {
-            bias = Data[offset++] % 2 == 0; // 50% chance of bias
-        }
+        torch::nn::Conv1d conv(options);
         
-        // Reshape input tensor if needed to match Conv1d requirements
-        // Conv1d expects input of shape [batch_size, in_channels, sequence_length]
-        if (input.dim() < 3) {
-            // Create a new shape with at least 3 dimensions
-            std::vector<int64_t> new_shape;
-            
-            // Add batch dimension if needed
-            if (input.dim() == 0) {
-                new_shape.push_back(1); // batch size
-                new_shape.push_back(in_channels); // channels
-                new_shape.push_back(8); // sequence length
-            } else if (input.dim() == 1) {
-                new_shape.push_back(1); // batch size
-                new_shape.push_back(in_channels); // channels
-                new_shape.push_back(input.size(0)); // use existing dim as sequence length
-            } else if (input.dim() == 2) {
-                new_shape.push_back(input.size(0)); // use first dim as batch
-                new_shape.push_back(in_channels); // channels
-                new_shape.push_back(input.size(1)); // use second dim as sequence length
-            }
-            
-            // Reshape or create new tensor
-            input = torch::ones(new_shape, input.options());
-        } else {
-            // If tensor already has 3+ dimensions, ensure channel dim matches in_channels
-            std::vector<int64_t> new_shape = input.sizes().vec();
-            new_shape[1] = in_channels; // Set channel dimension
-            input = torch::ones(new_shape, input.options());
+        // Match dtype of conv weights with input
+        if (input.dtype() == torch::kDouble) {
+            conv->to(torch::kDouble);
         }
-        
-        // Create Conv1d module
-        torch::nn::Conv1d conv(torch::nn::Conv1dOptions(in_channels, out_channels, kernel_size)
-                                .stride(stride)
-                                .padding(padding)
-                                .dilation(dilation)
-                                .groups(groups)
-                                .bias(bias));
         
         // Apply Conv1d
         torch::Tensor output = conv->forward(input);
@@ -117,8 +103,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         auto mean = output.mean();
         auto max_val = output.max();
         
+        // Test backward pass if possible
+        if (output.requires_grad() || input.requires_grad()) {
+            try {
+                output.sum().backward();
+            } catch (...) {
+                // Backward might fail in some cases, that's ok
+            }
+        }
+        
         // Ensure the operations are not optimized away
-        if (sum.item<float>() == -1.0f && mean.item<float>() == -1.0f && max_val.item<float>() == -1.0f) {
+        if (sum.item<double>() == -1.0 && mean.item<double>() == -1.0 && max_val.item<double>() == -1.0) {
             return 1; // This condition is unlikely to be true
         }
     }

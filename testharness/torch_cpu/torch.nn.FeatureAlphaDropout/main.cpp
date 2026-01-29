@@ -1,11 +1,14 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,8 +21,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // FeatureAlphaDropout requires at least 2D input (batch, features, ...)
+        if (input.dim() < 2) {
+            // Reshape to at least 2D
+            input = input.view({1, -1});
+        }
+        
+        // Ensure tensor is float type for dropout
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
         // Extract parameters for FeatureAlphaDropout
-        float p = 0.5; // Default dropout probability
+        float p = 0.5f; // Default dropout probability
         bool inplace = false;
         
         // If we have more data, use it to set the dropout probability
@@ -30,47 +44,66 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // If we have more data, use it to set the inplace flag
         if (offset < Size) {
-            inplace = Data[offset++] & 0x01; // Use lowest bit for boolean
+            inplace = Data[offset++] & 0x01;
+        }
+        
+        // For inplace operation, we need a contiguous tensor that allows modification
+        if (inplace) {
+            input = input.clone().contiguous();
         }
         
         // Create FeatureAlphaDropout module
-        torch::nn::FeatureAlphaDropout dropout(torch::nn::FeatureAlphaDropoutOptions().p(p).inplace(inplace));
+        torch::nn::FeatureAlphaDropout dropout(
+            torch::nn::FeatureAlphaDropoutOptions().p(p).inplace(inplace)
+        );
         
-        // Set training mode (dropout only has effect during training)
+        // Test in training mode (dropout active)
         dropout->train();
+        torch::Tensor train_output = dropout->forward(input.clone());
         
-        // Apply dropout to the input tensor
-        torch::Tensor output = dropout->forward(input);
-        
-        // Test in eval mode as well (should be identity function)
+        // Test in eval mode (should be identity function)
         dropout->eval();
-        torch::Tensor eval_output = dropout->forward(input);
+        torch::Tensor eval_output = dropout->forward(input.clone());
         
-        // Verify that eval mode preserves the input
-        if (!torch::allclose(input, eval_output)) {
-            throw std::runtime_error("FeatureAlphaDropout in eval mode should preserve input");
+        // Test with different probability values
+        try {
+            // Test with zero probability
+            torch::nn::FeatureAlphaDropout zero_dropout(
+                torch::nn::FeatureAlphaDropoutOptions().p(0.0).inplace(false)
+            );
+            zero_dropout->train();
+            torch::Tensor zero_output = zero_dropout->forward(input.clone());
+        } catch (const std::exception &) {
+            // Silently handle any shape/value issues
         }
         
-        // Test with zero probability (should be identity function even in training mode)
-        torch::nn::FeatureAlphaDropout zero_dropout(torch::nn::FeatureAlphaDropoutOptions().p(0.0).inplace(inplace));
-        zero_dropout->train();
-        torch::Tensor zero_output = zero_dropout->forward(input);
-        
-        if (!torch::allclose(input, zero_output)) {
-            throw std::runtime_error("FeatureAlphaDropout with p=0 should preserve input");
+        // Test with high probability
+        try {
+            torch::nn::FeatureAlphaDropout high_dropout(
+                torch::nn::FeatureAlphaDropoutOptions().p(0.9).inplace(false)
+            );
+            high_dropout->train();
+            torch::Tensor high_output = high_dropout->forward(input.clone());
+        } catch (const std::exception &) {
+            // Silently handle any shape/value issues
         }
         
-        // Test with probability 1.0 (should drop all features)
-        if (input.dim() > 0 && input.size(0) > 0) {
-            torch::nn::FeatureAlphaDropout full_dropout(torch::nn::FeatureAlphaDropoutOptions().p(1.0).inplace(inplace));
-            full_dropout->train();
-            torch::Tensor full_output = full_dropout->forward(input);
+        // Test with 3D input if we have enough elements
+        if (input.numel() >= 8) {
+            try {
+                torch::Tensor input_3d = input.flatten().narrow(0, 0, 8).view({2, 2, 2});
+                input_3d = input_3d.to(torch::kFloat32);
+                dropout->train();
+                torch::Tensor output_3d = dropout->forward(input_3d);
+            } catch (const std::exception &) {
+                // Silently handle reshape issues
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

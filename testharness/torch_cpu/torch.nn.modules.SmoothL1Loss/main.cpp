@@ -1,10 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -13,7 +19,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input and target tensors
+        // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Ensure we have enough data for the target tensor
@@ -21,7 +27,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
+        // Create target tensor with the SAME shape as input
+        // This is required for SmoothL1Loss
         torch::Tensor target = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        // Reshape target to match input shape if they differ
+        try {
+            if (!input.sizes().equals(target.sizes())) {
+                target = target.view({-1}).narrow(0, 0, std::min(target.numel(), input.numel()));
+                target = target.expand_as(input.view({-1})).view(input.sizes());
+            }
+        } catch (...) {
+            // If reshape fails, create target with same shape
+            target = torch::rand_like(input);
+        }
         
         // Get reduction mode from the input data
         torch::nn::SmoothL1LossOptions::reduction_t reduction_mode = torch::kMean;
@@ -46,6 +65,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&beta, Data + offset, sizeof(double));
             offset += sizeof(double);
             
+            // Handle NaN and Inf
+            if (std::isnan(beta) || std::isinf(beta)) {
+                beta = 1.0;
+            }
+            
             // Ensure beta is positive (as required by SmoothL1Loss)
             beta = std::abs(beta);
             
@@ -68,39 +92,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply the loss function
         torch::Tensor loss = loss_fn(input, target);
         
-        // Ensure computation is completed
-        loss.item<float>();
+        // Force computation - use sum() to handle both scalar and tensor outputs
+        (void)loss.sum().item<float>();
         
-        // Test with different options
+        // Test with different beta values
         if (offset < Size) {
-            // Try with different beta
             double beta2 = 0.5;
             torch::nn::SmoothL1LossOptions options2;
-            options2.reduction(reduction_mode).beta(beta2);
+            options2.reduction(torch::kMean).beta(beta2);
             torch::nn::SmoothL1Loss loss_fn2(options2);
             torch::Tensor loss2 = loss_fn2(input, target);
-            loss2.item<float>();
+            (void)loss2.sum().item<float>();
             
-            // Try with different reduction
+            // Try with kSum reduction
             torch::nn::SmoothL1LossOptions options3;
             options3.reduction(torch::kSum).beta(beta);
             torch::nn::SmoothL1Loss loss_fn3(options3);
             torch::Tensor loss3 = loss_fn3(input, target);
-            loss3.item<float>();
+            (void)loss3.sum().item<float>();
         }
         
         // Test the functional version
         torch::Tensor functional_loss = torch::nn::functional::smooth_l1_loss(
-            input, target, torch::nn::functional::SmoothL1LossFuncOptions()
+            input, target, 
+            torch::nn::functional::SmoothL1LossFuncOptions()
                 .reduction(reduction_mode)
                 .beta(beta));
         
-        functional_loss.item<float>();
+        (void)functional_loss.sum().item<float>();
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

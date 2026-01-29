@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -23,6 +28,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&min_value, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Handle NaN/Inf values that could cause issues
+            if (std::isnan(min_value) || std::isinf(min_value)) {
+                min_value = 0.0;
+            }
         }
         
         // Apply clamp_min operation
@@ -32,6 +41,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size && Data[offset] % 2 == 0) {
             torch::Tensor input_copy = input_tensor.clone();
             input_copy.clamp_min_(min_value);
+            offset++;
         }
         
         // Try with tensor min value if there's more data
@@ -54,11 +64,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Try with named tensor variant if there's more data
-        if (offset < Size) {
-            torch::Tensor result3 = torch::clamp_min(input_tensor, min_value);
-        }
-        
         // Try with different output dtypes if there's more data
         if (offset < Size) {
             uint8_t dtype_selector = Data[offset++];
@@ -71,11 +76,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 // Silently ignore dtype compatibility errors
             }
         }
+        
+        // Test with out= parameter variant
+        if (offset < Size) {
+            try {
+                torch::Tensor out_tensor = torch::empty_like(input_tensor);
+                torch::clamp_min_out(out_tensor, input_tensor, min_value);
+            }
+            catch (const std::exception&) {
+                // Silently ignore out tensor errors
+            }
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

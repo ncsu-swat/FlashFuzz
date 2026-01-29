@@ -1,10 +1,14 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -13,7 +17,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input, variance, and target tensors
+        // Create input tensor with gradients enabled
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
         if (offset >= Size) {
@@ -28,24 +32,59 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         torch::Tensor target = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Ensure all tensors are floating point
+        if (!torch::isFloatingType(input.scalar_type())) {
+            input = input.to(torch::kFloat);
+        }
+        if (!torch::isFloatingType(variance.scalar_type())) {
+            variance = variance.to(torch::kFloat);
+        }
+        if (!torch::isFloatingType(target.scalar_type())) {
+            target = target.to(torch::kFloat);
+        }
+        
+        // Ensure all tensors have the same dtype
+        variance = variance.to(input.scalar_type());
+        target = target.to(input.scalar_type());
+        
         // Ensure variance is positive (required by GaussianNLLLoss)
         variance = torch::abs(variance) + 1e-6;
         
-        // Parse reduction mode from the remaining data
-        torch::Reduction::Reduction reduction_mode = torch::kMean;
+        // Make shapes compatible: use input's shape for all tensors
+        // GaussianNLLLoss requires input, target to have same shape
+        // variance can be same shape or broadcastable
+        if (input.numel() > 0) {
+            auto input_sizes = input.sizes().vec();
+            
+            // Reshape target to match input
+            int64_t input_numel = input.numel();
+            target = target.flatten();
+            if (target.numel() < input_numel) {
+                // Expand by repeating
+                int64_t repeats = (input_numel / target.numel()) + 1;
+                target = target.repeat({repeats});
+            }
+            target = target.narrow(0, 0, input_numel).reshape(input_sizes);
+            
+            // Reshape variance to match input
+            variance = variance.flatten();
+            if (variance.numel() < input_numel) {
+                int64_t repeats = (input_numel / variance.numel()) + 1;
+                variance = variance.repeat({repeats});
+            }
+            variance = variance.narrow(0, 0, input_numel).reshape(input_sizes);
+            // Re-ensure variance is positive after reshape
+            variance = torch::abs(variance) + 1e-6;
+        }
+        
+        // Enable gradients for backward pass
+        input = input.clone().detach().requires_grad_(true);
+        
+        // Parse reduction mode from the remaining data (0=None, 1=Mean, 2=Sum)
+        int reduction_mode = 1; // Default to Mean
         if (offset < Size) {
             uint8_t reduction_byte = Data[offset++];
-            switch (reduction_byte % 3) {
-                case 0:
-                    reduction_mode = torch::kNone;
-                    break;
-                case 1:
-                    reduction_mode = torch::kMean;
-                    break;
-                case 2:
-                    reduction_mode = torch::kSum;
-                    break;
-            }
+            reduction_mode = reduction_byte % 3;
         }
         
         // Parse full parameter
@@ -60,44 +99,44 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&eps, Data + offset, sizeof(double));
             offset += sizeof(double);
             
-            // Ensure eps is positive and not too large
+            // Ensure eps is positive and reasonable
             eps = std::abs(eps);
+            if (std::isnan(eps) || std::isinf(eps)) {
+                eps = 1e-6;
+            }
             if (eps < 1e-12) eps = 1e-12;
             if (eps > 1.0) eps = 1.0;
         }
         
-        // Try to make input, variance, and target compatible if possible
-        if (input.dim() > 0 && variance.dim() > 0 && target.dim() > 0) {
-            // Convert to same dtype if needed
-            if (input.scalar_type() != target.scalar_type()) {
-                if (torch::isFloatingType(input.scalar_type())) {
-                    target = target.to(input.scalar_type());
-                } else if (torch::isFloatingType(target.scalar_type())) {
-                    input = input.to(target.scalar_type());
-                } else {
-                    input = input.to(torch::kFloat);
-                    target = target.to(torch::kFloat);
-                }
-            }
-            
-            // Convert variance to same dtype
-            variance = variance.to(input.scalar_type());
+        // Create GaussianNLLLoss module with appropriate options
+        torch::nn::GaussianNLLLossOptions options;
+        options.full(full);
+        options.eps(eps);
+        
+        // Set reduction mode
+        if (reduction_mode == 0) {
+            options.reduction(torch::kNone);
+        } else if (reduction_mode == 1) {
+            options.reduction(torch::kMean);
+        } else {
+            options.reduction(torch::kSum);
         }
         
-        // Apply the loss function using functional API
-        torch::Tensor loss = torch::nn::functional::gaussian_nll_loss(
-            input, target, variance, 
-            torch::nn::functional::GaussianNLLLossFuncOptions()
-                .full(full)
-                .eps(eps)
-                .reduction(reduction_mode)
-        );
+        torch::nn::GaussianNLLLoss loss_fn(options);
+        
+        // Apply the loss function
+        torch::Tensor loss = loss_fn(input, target, variance);
         
         // Perform backward pass if possible
-        if (loss.numel() > 0 && torch::isFloatingType(loss.scalar_type())) {
+        if (loss.numel() > 0 && loss.requires_grad()) {
             try {
-                loss.backward();
-            } catch (const std::exception &e) {
+                // For reduction=None, we need to sum before backward
+                if (reduction_mode == 0) {
+                    loss.sum().backward();
+                } else {
+                    loss.backward();
+                }
+            } catch (...) {
                 // Backward pass failed, but we can continue
             }
         }
@@ -105,7 +144,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -19,7 +24,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Extract a dimension value from the data if available
-        int64_t dim = -1;
+        int64_t dim = 0;
         bool has_dim = false;
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&dim, Data + offset, sizeof(int64_t));
@@ -33,73 +38,118 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             keepdim = Data[offset++] & 0x1;
         }
         
-        // Apply torch.any in different ways
+        // Extract test case selector
+        uint8_t test_case = 0;
+        if (offset < Size) {
+            test_case = Data[offset++] % 4;
+        }
+        
         torch::Tensor result;
         
-        // Test case 1: torch.any without arguments
-        result = torch::any(input_tensor);
-        
-        // Test case 2: torch.any with dimension and keepdim
-        if (has_dim && input_tensor.dim() > 0) {
-            // Ensure dim is within valid range for the tensor
-            dim = dim % (2 * input_tensor.dim()) - input_tensor.dim();
-            
-            result = torch::any(input_tensor, dim, keepdim);
-        }
-        
-        // Test case 3: torch.any with dimension only
-        if (has_dim && input_tensor.dim() > 0) {
-            result = torch::any(input_tensor, dim);
-        }
-        
-        // Test case 4: torch.any with named dimension
-        if (input_tensor.dim() > 0) {
-            // Create a named tensor if possible
-            std::vector<torch::Dimname> names;
-            for (int i = 0; i < input_tensor.dim(); i++) {
-                names.push_back(torch::Dimname::wildcard());
+        switch (test_case) {
+            case 0: {
+                // Test case 1: torch.any without arguments - returns scalar bool
+                result = torch::any(input_tensor);
+                break;
             }
             
-            auto named_tensor = input_tensor.refine_names(names);
+            case 1: {
+                // Test case 2: torch.any with dimension and keepdim
+                if (input_tensor.dim() > 0) {
+                    // Normalize dim to valid range [-ndim, ndim-1]
+                    int64_t ndim = input_tensor.dim();
+                    int64_t normalized_dim = ((dim % ndim) + ndim) % ndim;
+                    
+                    try {
+                        result = torch::any(input_tensor, normalized_dim, keepdim);
+                    } catch (...) {
+                        // Shape-related errors are expected for some inputs
+                    }
+                } else {
+                    // For 0-dim tensors, call without dim
+                    result = torch::any(input_tensor);
+                }
+                break;
+            }
             
-            if (has_dim && dim >= 0 && dim < named_tensor.dim()) {
-                result = torch::any(named_tensor, named_tensor.names()[dim], keepdim);
+            case 2: {
+                // Test case 3: torch.any with dimension only (keepdim defaults to false)
+                if (input_tensor.dim() > 0) {
+                    int64_t ndim = input_tensor.dim();
+                    int64_t normalized_dim = ((dim % ndim) + ndim) % ndim;
+                    
+                    try {
+                        result = torch::any(input_tensor, normalized_dim);
+                    } catch (...) {
+                        // Shape-related errors are expected
+                    }
+                } else {
+                    result = torch::any(input_tensor);
+                }
+                break;
+            }
+            
+            case 3: {
+                // Test case 4: torch.any_out with out parameter
+                if (input_tensor.dim() > 0) {
+                    int64_t ndim = input_tensor.dim();
+                    int64_t normalized_dim = ((dim % ndim) + ndim) % ndim;
+                    
+                    try {
+                        // Calculate output shape
+                        std::vector<int64_t> out_shape;
+                        for (int64_t i = 0; i < ndim; i++) {
+                            if (i == normalized_dim) {
+                                if (keepdim) {
+                                    out_shape.push_back(1);
+                                }
+                            } else {
+                                out_shape.push_back(input_tensor.size(i));
+                            }
+                        }
+                        
+                        torch::Tensor out = torch::empty(out_shape, torch::kBool);
+                        result = torch::any_out(out, input_tensor, normalized_dim, keepdim);
+                    } catch (...) {
+                        // Shape mismatch or other errors are expected
+                    }
+                } else {
+                    // For scalar output
+                    try {
+                        torch::Tensor out = torch::empty({}, torch::kBool);
+                        // For 0-dim tensor, we need to use different approach
+                        result = torch::any(input_tensor);
+                    } catch (...) {
+                        // Expected for some edge cases
+                    }
+                }
+                break;
             }
         }
         
-        // Test case 5: torch.any with multiple dimensions
-        if (input_tensor.dim() >= 2) {
-            std::vector<int64_t> dims;
-            
-            // Extract up to 2 dimensions
-            int64_t dim1 = 0;
-            int64_t dim2 = 1;
-            
-            if (has_dim) {
-                dim1 = dim % input_tensor.dim();
-                if (dim1 < 0) dim1 += input_tensor.dim();
-                
-                dim2 = (dim1 + 1) % input_tensor.dim();
-            }
-            
-            dims.push_back(dim1);
-            dims.push_back(dim2);
-            
-            result = torch::any(input_tensor, dims, keepdim);
+        // Additional coverage: test with different tensor types
+        // Convert to bool tensor and test (any works on all types but bool is canonical)
+        try {
+            torch::Tensor bool_tensor = input_tensor.to(torch::kBool);
+            torch::Tensor bool_result = torch::any(bool_tensor);
+            (void)bool_result;
+        } catch (...) {
+            // Conversion may fail for some dtypes
         }
         
-        // Test case 6: torch.any with out parameter using any_out
-        if (input_tensor.dim() > 0 && has_dim) {
-            dim = dim % (2 * input_tensor.dim()) - input_tensor.dim();
-            
-            torch::Tensor out = torch::empty({}, torch::kBool);
-            result = torch::any_out(out, input_tensor, dim, keepdim);
+        // Test with integer tensor
+        try {
+            torch::Tensor int_tensor = input_tensor.to(torch::kInt);
+            torch::Tensor int_result = torch::any(int_tensor);
+            (void)int_result;
+        } catch (...) {
+            // Conversion may fail
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
+    return 0;  // Keep the input
 }

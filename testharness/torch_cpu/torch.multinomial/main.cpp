@@ -1,95 +1,107 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes to create a tensor
         if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor for multinomial
         torch::Tensor weights = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Ensure weights are non-negative (multinomial requires non-negative weights)
-        weights = torch::abs(weights);
+        // Ensure weights are non-negative and convert to float (multinomial requires float)
+        weights = torch::abs(weights).to(torch::kFloat32);
         
-        // Extract parameters for multinomial from remaining data
         int64_t num_samples = 1;
         bool replacement = false;
         
         if (offset + 2 <= Size) {
-            // Extract num_samples from the next byte
             num_samples = static_cast<int64_t>(Data[offset++]) % 10 + 1;
-            
-            // Extract replacement flag from the next byte
             replacement = Data[offset++] & 0x1;
         }
         
-        // Try different tensor shapes and edge cases
+        // Reshape weights to be 1D or 2D (multinomial requirement)
         if (weights.dim() == 0) {
-            // Scalar tensor - reshape to 1D
             weights = weights.reshape({1});
-        } else if (weights.dim() == 1) {
-            // 1D tensor - already in correct format
-        } else {
-            // For higher dimensions, flatten to 1D or use the last dimension
-            if (weights.dim() > 1) {
-                if (Data[offset % Size] % 2 == 0) {
-                    // Flatten to 1D
-                    weights = weights.flatten();
-                } else {
-                    // Use the last dimension
-                    int64_t last_dim = weights.size(-1);
-                    weights = weights.reshape({-1, last_dim});
-                }
+        } else if (weights.dim() > 2) {
+            if (offset < Size && Data[offset++] % 2 == 0) {
+                weights = weights.flatten();
+            } else {
+                int64_t last_dim = weights.size(-1);
+                weights = weights.reshape({-1, last_dim});
             }
         }
         
-        // Apply multinomial operation
+        // Ensure at least one positive weight to avoid "invalid multinomial distribution" error
+        // Add a small epsilon to ensure sum > 0
+        weights = weights + 1e-6f;
+        
+        // Get the number of categories (last dimension size)
+        int64_t num_categories = weights.size(-1);
+        
+        // If replacement is false, num_samples cannot exceed num_categories
+        if (!replacement && num_samples > num_categories) {
+            num_samples = num_categories;
+        }
+        
+        // Ensure num_samples is at least 1 and num_categories is at least 1
+        if (num_samples < 1) {
+            num_samples = 1;
+        }
+        if (num_categories < 1) {
+            return 0;
+        }
+        
         torch::Tensor result;
         
-        // Try different variants of multinomial
-        if (offset < Size) {
-            uint8_t variant = Data[offset++] % 2;
-            
-            switch (variant) {
-                case 0:
-                    // Basic multinomial
-                    result = torch::multinomial(weights, num_samples, replacement);
-                    break;
-                    
-                case 1:
-                    // Multinomial with generator
-                    {
-                        auto gen = torch::Generator();
-                        if (offset < Size) {
-                            gen.set_current_seed(Data[offset++]);
+        // Inner try-catch for expected failures (don't log these)
+        try {
+            if (offset < Size) {
+                uint8_t variant = Data[offset++] % 2;
+                
+                switch (variant) {
+                    case 0:
+                        result = torch::multinomial(weights, num_samples, replacement);
+                        break;
+                        
+                    case 1:
+                        {
+                            auto gen = torch::make_generator<torch::CPUGeneratorImpl>();
+                            if (offset < Size) {
+                                gen.set_current_seed(static_cast<uint64_t>(Data[offset++]));
+                            }
+                            result = torch::multinomial(weights, num_samples, replacement, gen);
                         }
-                        result = torch::multinomial(weights, num_samples, replacement, gen);
-                    }
-                    break;
+                        break;
+                }
+            } else {
+                result = torch::multinomial(weights, num_samples, replacement);
             }
-        } else {
-            // Default to basic multinomial if no more data
-            result = torch::multinomial(weights, num_samples, replacement);
+            
+            // Access result to ensure computation is not optimized away
+            if (result.numel() > 0) {
+                auto sum = result.sum().item<int64_t>();
+                (void)sum;
+            }
         }
-        
-        // Access result to ensure computation is not optimized away
-        auto sum = result.sum().item<int64_t>();
-        (void)sum;
+        catch (const c10::Error &e) {
+            // Expected errors from invalid tensor configurations - silently ignore
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

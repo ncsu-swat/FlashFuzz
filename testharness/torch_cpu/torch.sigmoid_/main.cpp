@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,38 +22,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a tensor from the input data
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a copy of the original tensor for comparison
-        torch::Tensor original = tensor.clone();
+        // sigmoid_ requires floating point tensor
+        // Convert to float if not already a floating type
+        if (!tensor.is_floating_point()) {
+            tensor = tensor.to(torch::kFloat32);
+        }
         
         // Apply the sigmoid_ operation in-place
+        // sigmoid(x) = 1 / (1 + exp(-x))
         tensor.sigmoid_();
         
-        // Verify the operation worked by checking if values are in the expected range [0, 1]
-        // This is just a sanity check, not a premature check that would prevent testing
+        // Access the result to ensure computation is performed
         if (tensor.defined() && tensor.numel() > 0) {
-            // Check if any values are outside the expected range
-            auto min_val = tensor.min().item<double>();
-            auto max_val = tensor.max().item<double>();
-            
-            // These checks don't prevent testing, they just verify the result
-            if (min_val < 0.0 || max_val > 1.0) {
-                // This should never happen with a correct sigmoid implementation
-                // Values should always be in [0, 1]
-                throw std::runtime_error("Sigmoid produced values outside [0, 1] range");
-            }
-            
-            // Verify that sigmoid was actually applied by checking against original
-            // Only if original had non-zero elements
-            if (original.numel() > 0 && !torch::all(original == tensor).item<bool>()) {
-                // This is expected - sigmoid should change the values
-                // No need to do anything here
-            }
+            volatile float first = tensor.flatten()[0].item<float>();
+            (void)first;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

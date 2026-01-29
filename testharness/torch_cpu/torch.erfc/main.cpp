@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstdint>        // For uint64_t
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -29,8 +35,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Try with different output types if possible
             if (input.scalar_type() != torch::kBool) {
-                torch::Tensor result_float = torch::erfc(input.to(torch::kFloat));
-                torch::Tensor result_double = torch::erfc(input.to(torch::kDouble));
+                try {
+                    torch::Tensor result_float = torch::erfc(input.to(torch::kFloat));
+                    torch::Tensor result_double = torch::erfc(input.to(torch::kDouble));
+                } catch (const std::exception&) {
+                    // Ignore type conversion exceptions
+                }
                 
                 // Try with complex inputs if we have enough data
                 if (offset + 2 < Size) {
@@ -61,11 +71,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 // Ignore exceptions from scalar tensor
             }
         }
+        
+        // Try with out parameter version
+        try {
+            torch::Tensor out_tensor = torch::empty_like(input);
+            torch::erfc_out(out_tensor, input);
+        } catch (const std::exception&) {
+            // Ignore out parameter exceptions
+        }
+        
+        // Try with half precision if supported
+        try {
+            torch::Tensor half_input = input.to(torch::kHalf);
+            torch::Tensor half_result = torch::erfc(half_input);
+        } catch (const std::exception&) {
+            // Ignore half precision exceptions
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

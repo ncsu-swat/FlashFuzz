@@ -1,26 +1,26 @@
-#include "fuzzer_utils.h"           // General fuzzing utilities
-#include <ATen/ops/linalg_eig.h>    // at::linalg_eig
-#include <cmath>                    // std::sqrt
-#include <iostream>                 // For cerr
-#include <tuple>                    // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <ATen/ops/linalg_eig.h>
+#include <cmath>
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create a tensor
         if (Size < 4) {
             return 0;
         }
         
-        // Create a square matrix for torch.eig operation
         torch::Tensor raw_input = fuzzer_utils::createTensor(Data, Size, offset);
 
-        // Bound total elements to keep allocations reasonable and reshape to square
         constexpr int64_t max_elements = 4096;
         auto flat = raw_input.flatten();
         if (flat.numel() == 0) {
@@ -38,44 +38,61 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         torch::Tensor input = flat.narrow(0, 0, target_elems).reshape({square_size, square_size});
 
-        // Ensure the tensor has a compatible dtype for eig (torch.eig requires floating real types)
-        if (input.dtype() != torch::kFloat && input.dtype() != torch::kDouble) {
+        // linalg_eig requires floating point types (float, double, complex float, complex double)
+        if (!input.is_floating_point() && !input.is_complex()) {
             input = input.to(torch::kFloat);
         }
         
-        // Get a boolean parameter from the input data if available
-        bool eigenvectors = true;
+        // Determine if we should test batched input
+        bool use_batch = false;
+        int64_t batch_size = 1;
         if (offset < Size) {
-            eigenvectors = Data[offset++] & 0x1;
-        }
-        
-        // Apply eig operation (torch.eig target API)
-        auto result = at::linalg_eig(input);
-        
-        // Access the eigenvalues and eigenvectors
-        auto eigenvalues = std::get<0>(result);
-        auto eigenvectors_tensor = std::get<1>(result);
-        
-        // Perform some operations with the results to ensure they're used
-        if (eigenvectors) {
-            auto vec_norm = torch::sum(torch::abs(eigenvectors_tensor));
-            
-            // Use the sum to prevent optimization from removing the computation
-            if (vec_norm.item<double>() == -12345.6789) {
-                return 1; // This will never happen, just to use the result
+            use_batch = Data[offset++] & 0x1;
+            if (use_batch && offset < Size) {
+                batch_size = std::max<int64_t>(1, (Data[offset++] % 4) + 1);
             }
         }
         
-        // Use eigenvalues to prevent optimization from removing the computation
-        auto sum_eigenvalues = torch::sum(torch::abs(eigenvalues));
-        if (sum_eigenvalues.item<double>() == -12345.6789) {
-            return 1; // This will never happen, just to use the result
+        torch::Tensor matrix_input;
+        if (use_batch && square_size > 1) {
+            // Create batched input by stacking copies
+            std::vector<torch::Tensor> batch_list;
+            for (int64_t i = 0; i < batch_size; i++) {
+                batch_list.push_back(input.clone());
+            }
+            matrix_input = torch::stack(batch_list, 0);
+        } else {
+            matrix_input = input;
         }
+        
+        // torch.eig is deprecated and removed; use linalg_eig instead
+        // linalg_eig computes eigenvalues and eigenvectors of a square matrix
+        auto result = at::linalg_eig(matrix_input);
+        
+        auto eigenvalues = std::get<0>(result);
+        auto eigenvectors_tensor = std::get<1>(result);
+        
+        // Verify shapes are correct
+        // eigenvalues should have shape (..., n) where n is the matrix size
+        // eigenvectors should have shape (..., n, n)
+        
+        // Use results to prevent optimization
+        auto eigenvalues_abs = torch::abs(eigenvalues);
+        auto sum_eigenvalues = torch::sum(eigenvalues_abs);
+        
+        auto vec_abs = torch::abs(eigenvectors_tensor);
+        auto vec_norm = torch::sum(vec_abs);
+        
+        // Volatile access to prevent dead code elimination
+        volatile double ev_sum = sum_eigenvalues.item<double>();
+        volatile double vec_sum = vec_norm.item<double>();
+        (void)ev_sum;
+        (void)vec_sum;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

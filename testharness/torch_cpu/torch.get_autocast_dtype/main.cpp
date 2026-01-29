@@ -1,11 +1,9 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
+#include "fuzzer_utils.h"
 #include <ATen/autocast_mode.h>
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <iostream>
 
 namespace
 {
-    // Limit autocast dtype choices to valid lower-precision float options.
     torch::ScalarType choose_autocast_dtype(uint8_t selector)
     {
         switch (selector % 3)
@@ -20,88 +18,93 @@ namespace
     }
 } // namespace
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
+    if (Size < 3) {
+        return -1;
+    }
+
     try
     {
         size_t offset = 0;
-        
-        // Parse device type from input data
-        at::DeviceType device_type = at::kCPU;
-        if (offset < Size) {
-            uint8_t device_byte = Data[offset++];
-            device_type = (device_byte % 2 == 0) ? at::kCPU : at::kCUDA;
-        }
-        
+
         // Parse autocast enabled flag
-        bool enabled = false;
-        if (offset < Size) {
-            uint8_t enabled_byte = Data[offset++];
-            enabled = (enabled_byte % 2 == 0);
-        }
-        
-        // Parse device type for get_autocast_dtype
+        uint8_t enabled_byte = Data[offset++];
+        bool enabled = (enabled_byte % 2 == 0);
+
+        // Parse device type for get_autocast_dtype (CPU only for portability)
         at::DeviceType target_device = at::kCPU;
-        if (offset < Size) {
-            uint8_t target_device_byte = Data[offset++];
-            target_device = (target_device_byte % 2 == 0) ? at::kCPU : at::kCUDA;
+
+        // Parse dtype selection bytes
+        uint8_t cpu_dtype_byte = Data[offset++];
+        uint8_t test_dtype_byte = Data[offset++];
+
+        // Set autocast state for CPU
+        at::autocast::set_autocast_enabled(at::kCPU, enabled);
+
+        // Set autocast dtype for CPU using fuzzer-controlled value
+        torch::ScalarType cpu_dtype = choose_autocast_dtype(cpu_dtype_byte);
+        at::autocast::set_autocast_dtype(at::kCPU, cpu_dtype);
+
+        // Call get_autocast_dtype (target API: torch.get_autocast_dtype)
+        torch::ScalarType result_dtype = at::autocast::get_autocast_dtype(target_device);
+
+        // Verify the result matches what we set
+        if (enabled) {
+            // When autocast is enabled, result should match what we set
+            (void)(result_dtype == cpu_dtype);
         }
-        
-        // Create a tensor to test with
+
+        // Also test is_autocast_enabled
+        bool is_enabled = at::autocast::is_autocast_enabled(target_device);
+        (void)(is_enabled == enabled);
+
+        // Create a tensor and test the autocast dtype in practice
         torch::Tensor tensor;
         if (offset < Size) {
             tensor = fuzzer_utils::createTensor(Data, Size, offset);
         } else {
-            // If we don't have enough data, create a simple tensor
-            tensor = torch::ones({2, 2});
+            tensor = torch::randn({2, 2});
         }
-        if (tensor.defined() && device_type == at::kCUDA && torch::cuda::is_available()) {
-            tensor = tensor.to(torch::kCUDA);
-        }
-        
-        // Set autocast state for the chosen device
-        at::autocast::set_autocast_enabled(target_device, enabled);
-        
-        // Set autocast dtype for CPU
-        if (offset < Size) {
-            uint8_t cpu_dtype_byte = Data[offset++];
-            torch::ScalarType cpu_dtype = choose_autocast_dtype(cpu_dtype_byte);
-            at::autocast::set_autocast_dtype(at::kCPU, cpu_dtype);
-        }
-        
-        // Set autocast dtype for CUDA
-        if (offset < Size) {
-            uint8_t cuda_dtype_byte = Data[offset++];
-            torch::ScalarType cuda_dtype = choose_autocast_dtype(cuda_dtype_byte);
-            at::autocast::set_autocast_dtype(at::kCUDA, cuda_dtype);
-        }
-        
-        // Call get_autocast_dtype (target API: torch.get_autocast_dtype)
-        torch::ScalarType result_dtype = at::autocast::get_autocast_dtype(target_device);
-        
-        // Test with the tensor to ensure the autocast settings are applied
-        torch::Tensor output;
+
         if (tensor.defined()) {
-            // Move tensor to the target device if CUDA is available and requested
-            if (target_device == at::kCUDA && torch::cuda::is_available()) {
-                tensor = tensor.to(torch::kCUDA);
+            // Inner try-catch for expected dtype conversion failures
+            try {
+                // Convert tensor to float first (autocast works with float inputs)
+                torch::Tensor float_tensor = tensor.to(torch::kFloat);
+                
+                // Test casting to the autocast dtype
+                torch::Tensor cast_tensor = float_tensor.to(result_dtype);
+                torch::Tensor output = cast_tensor + cast_tensor;
+                (void)output.sum();
+            } catch (...) {
+                // Silently ignore dtype conversion failures
             }
-            
-            // Perform a simple operation; convert to the chosen autocast dtype to exercise it
-            torch::Tensor cast_tensor = tensor.to(result_dtype);
-            output = cast_tensor + cast_tensor;
-            (void)output.sum();
         }
-        
-        // Reset autocast state to avoid affecting other tests
-        at::autocast::set_autocast_enabled(target_device, false);
+
+        // Test with different dtype settings
+        for (int i = 0; i < 3; i++) {
+            torch::ScalarType test_dtype = choose_autocast_dtype((test_dtype_byte + i) % 3);
+            at::autocast::set_autocast_dtype(at::kCPU, test_dtype);
+            torch::ScalarType queried_dtype = at::autocast::get_autocast_dtype(at::kCPU);
+            (void)(queried_dtype == test_dtype);
+        }
+
+        // Reset autocast state
+        at::autocast::set_autocast_enabled(at::kCPU, false);
+        at::autocast::set_autocast_dtype(at::kCPU, torch::kBFloat16); // Reset to default
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

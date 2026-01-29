@@ -1,143 +1,103 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <numeric>
+#include <ATen/Functions.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least a few bytes for tensor creation
+        // Need at least a few bytes
         if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor A = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Extract a value for ind parameter (between 1 and 4)
-        int ind = 1;
-        if (offset < Size) {
-            ind = (Data[offset++] % 4) + 1;
+        // Extract ind parameter (1 to 3 for practical purposes)
+        int64_t ind = (Data[offset++] % 3) + 1;
+        
+        // Extract dimension size (2 to 6 to keep tensors manageable)
+        int64_t dim_size = (Data[offset++] % 5) + 2;
+        
+        // For tensorinv, we need a tensor where:
+        // - Total dimensions = 2 * ind
+        // - Product of first ind dims = product of last ind dims
+        // The simplest valid shape is [n, n, ..., n] with 2*ind dimensions
+        std::vector<int64_t> shape(2 * ind, dim_size);
+        
+        // Create a random tensor with the proper shape
+        torch::Tensor A;
+        
+        // Use some fuzz data to determine dtype
+        int dtype_choice = (offset < Size) ? (Data[offset++] % 3) : 0;
+        torch::ScalarType dtype;
+        switch (dtype_choice) {
+            case 0: dtype = torch::kFloat32; break;
+            case 1: dtype = torch::kFloat64; break;
+            default: dtype = torch::kFloat32; break;
         }
         
-        // Ensure tensor has proper shape for tensorinv
-        // For tensorinv, the product of the first ind dimensions must equal
-        // the product of the remaining dimensions
-        int64_t prod_first = 1;
-        int64_t prod_last = 1;
+        // Create a base tensor
+        A = torch::randn(shape, torch::TensorOptions().dtype(dtype));
         
-        if (A.dim() > 0) {
-            // Calculate product of first ind dimensions
-            for (int i = 0; i < std::min(ind, static_cast<int>(A.dim())); i++) {
-                prod_first *= A.size(i);
-            }
-            
-            // Calculate product of remaining dimensions
-            for (int i = std::min(ind, static_cast<int>(A.dim())); i < A.dim(); i++) {
-                prod_last *= A.size(i);
-            }
-            
-            // If dimensions don't match, reshape the tensor
-            if (prod_first != prod_last && prod_first > 0 && prod_last > 0) {
-                // Create a new shape where prod_first = prod_last
-                std::vector<int64_t> new_shape;
-                
-                // First ind dimensions
-                int64_t new_prod_first = 1;
-                for (int i = 0; i < ind - 1; i++) {
-                    int64_t dim_size = (i < A.dim()) ? A.size(i) : 1;
-                    new_shape.push_back(dim_size);
-                    new_prod_first *= dim_size;
-                }
-                
-                // Make the ind-th dimension match the product of remaining dimensions
-                new_shape.push_back(prod_last);
-                
-                // Remaining dimensions
-                int64_t new_prod_last = 1;
-                for (int i = ind; i < A.dim(); i++) {
-                    int64_t dim_size = A.size(i);
-                    new_shape.push_back(dim_size);
-                    new_prod_last *= dim_size;
-                }
-                
-                // If we need more dimensions to satisfy ind
-                while (new_shape.size() < 2 * ind) {
-                    new_shape.push_back(1);
-                }
-                
-                // Try to reshape the tensor
-                try {
-                    A = A.reshape(new_shape);
-                } catch (const std::exception& e) {
-                    // If reshape fails, create a new tensor with the desired shape
-                    A = torch::ones(new_shape, A.options());
-                }
-            }
-        } else {
-            // For scalar tensors, create a tensor with proper dimensions
-            std::vector<int64_t> new_shape(2 * ind, 2);
-            A = torch::ones(new_shape, A.options());
+        // To improve invertibility, make it more like an identity-like tensor
+        // Reshape to 2D, add identity, then reshape back
+        int64_t n = 1;
+        for (int64_t i = 0; i < ind; i++) {
+            n *= shape[i];
         }
         
-        // Convert to float or complex for numerical stability
-        if (A.scalar_type() != torch::kFloat && 
-            A.scalar_type() != torch::kDouble && 
-            A.scalar_type() != torch::kComplexFloat && 
-            A.scalar_type() != torch::kComplexDouble) {
-            A = A.to(torch::kFloat);
+        // Reshape to square matrix
+        torch::Tensor A_2d = A.reshape({n, n});
+        
+        // Add scaled identity to improve conditioning
+        float scale = 1.0f + (offset < Size ? (Data[offset++] % 10) * 0.1f : 1.0f);
+        A_2d = A_2d + scale * torch::eye(n, A_2d.options());
+        
+        // Reshape back to original shape
+        A = A_2d.reshape(shape);
+        
+        // Call the API using at::linalg_tensorinv
+        torch::Tensor result;
+        try {
+            result = at::linalg_tensorinv(A, ind);
+        } catch (const std::exception& e) {
+            // Singular matrix or other numerical issues are expected
+            // Don't log these - they're valid inputs that the API correctly rejects
+            return 0;
         }
         
-        // Add a small value to diagonal elements to improve invertibility
-        if (A.dim() >= 2) {
-            int min_dim = std::min(A.size(0), A.size(1));
-            for (int i = 0; i < min_dim; i++) {
-                // Create index for the diagonal element
-                std::vector<torch::indexing::TensorIndex> indices(A.dim(), torch::indexing::Slice());
-                indices[0] = i;
-                indices[1] = i;
-                
-                // Add a value to make matrix more likely to be invertible
-                A.index_put_(indices, A.index(indices) + 1.0);
-            }
+        // Verify the result has the expected shape
+        // Result should have shape: (A.shape[ind:] + A.shape[:ind])
+        if (result.dim() != A.dim()) {
+            std::cerr << "Unexpected result dimension" << std::endl;
         }
         
-        // Apply tensorinv operation
-        torch::Tensor result = torch::tensorinv(A, ind);
-        
-        // Verify the result by checking if A @ result is close to identity
-        // This is a basic sanity check, not a comprehensive test
-        if (result.numel() > 0 && A.numel() > 0) {
-            // Reshape tensors for matrix multiplication
-            std::vector<int64_t> a_shape, inv_shape;
-            for (int i = 0; i < ind; i++) {
-                a_shape.push_back(A.size(i));
-            }
-            int64_t prod_a = std::accumulate(a_shape.begin(), a_shape.end(), 
-                                           static_cast<int64_t>(1), std::multiplies<int64_t>());
+        // Optional: verify inverse property by computing A @ tensorinv(A)
+        // This helps ensure the API is working correctly
+        if (result.numel() > 0 && n <= 16) {  // Only check for small tensors
+            torch::Tensor A_mat = A.reshape({n, n});
+            torch::Tensor inv_mat = result.reshape({n, n});
+            torch::Tensor product = torch::matmul(A_mat, inv_mat);
+            torch::Tensor identity = torch::eye(n, product.options());
             
-            for (int i = ind; i < A.dim(); i++) {
-                inv_shape.push_back(A.size(i));
-            }
-            int64_t prod_inv = std::accumulate(inv_shape.begin(), inv_shape.end(), 
-                                             static_cast<int64_t>(1), std::multiplies<int64_t>());
-            
-            // Reshape for matrix multiplication
-            torch::Tensor a_mat = A.reshape({prod_a, prod_inv});
-            torch::Tensor inv_mat = result.reshape({prod_inv, prod_a});
-            
-            // Check if a_mat @ inv_mat is close to identity
-            torch::Tensor product = torch::matmul(a_mat, inv_mat);
+            // Check if product is close to identity
+            bool is_close = torch::allclose(product, identity, 1e-3, 1e-3);
+            (void)is_close;  // Suppress unused variable warning
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

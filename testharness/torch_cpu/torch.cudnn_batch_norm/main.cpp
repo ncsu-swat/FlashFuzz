@@ -1,131 +1,129 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Check if we have enough data
-        if (Size < 5) {
+        // cudnn_batch_norm requires CUDA
+        if (!torch::cuda::is_available()) {
+            // Cannot test cudnn_batch_norm without CUDA
             return 0;
         }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create weight and bias tensors
-        torch::Tensor weight, bias;
-        
-        if (offset < Size) {
-            weight = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // Create default weight tensor with same shape as input's first dimension
-            if (input.dim() > 1) {
-                weight = torch::ones({input.size(1)}, input.options());
-            } else {
-                weight = torch::ones({1}, input.options());
-            }
+
+        if (Size < 10) {
+            return 0;
         }
-        
-        if (offset < Size) {
-            bias = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // Create default bias tensor with same shape as input's first dimension
-            if (input.dim() > 1) {
-                bias = torch::zeros({input.size(1)}, input.options());
-            } else {
-                bias = torch::zeros({1}, input.options());
-            }
-        }
-        
-        // Create running_mean and running_var tensors
-        torch::Tensor running_mean, running_var;
-        
-        if (offset < Size) {
-            running_mean = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // Create default running_mean tensor
-            if (input.dim() > 1) {
-                running_mean = torch::zeros({input.size(1)}, input.options());
-            } else {
-                running_mean = torch::zeros({1}, input.options());
-            }
-        }
-        
-        if (offset < Size) {
-            running_var = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // Create default running_var tensor
-            if (input.dim() > 1) {
-                running_var = torch::ones({input.size(1)}, input.options());
-            } else {
-                running_var = torch::ones({1}, input.options());
-            }
-        }
-        
-        // Get training mode and momentum from input data
-        bool training = true;
+
+        size_t offset = 0;
+
+        // Extract parameters from fuzzer data
+        uint8_t n_val = (Data[offset++] % 4) + 1;      // batch size: 1-4
+        uint8_t c_val = (Data[offset++] % 8) + 1;      // channels: 1-8
+        uint8_t h_val = (Data[offset++] % 8) + 1;      // height: 1-8
+        uint8_t w_val = (Data[offset++] % 8) + 1;      // width: 1-8
+        bool training = Data[offset++] % 2 == 0;
+
+        int64_t N = static_cast<int64_t>(n_val);
+        int64_t C = static_cast<int64_t>(c_val);
+        int64_t H = static_cast<int64_t>(h_val);
+        int64_t W = static_cast<int64_t>(w_val);
+
+        // Extract momentum (0.0 to 1.0)
         double momentum = 0.1;
+        if (offset < Size) {
+            momentum = static_cast<double>(Data[offset++]) / 255.0;
+        }
+
+        // Extract eps (small positive value)
         double eps = 1e-5;
-        
-        if (offset + 1 < Size) {
-            training = Data[offset++] % 2 == 0;
+        if (offset < Size) {
+            // Map to range [1e-8, 1e-2]
+            eps = 1e-8 + (static_cast<double>(Data[offset++]) / 255.0) * (1e-2 - 1e-8);
         }
-        
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&momentum, Data + offset, sizeof(double));
-            offset += sizeof(double);
+
+        // Create 4D input tensor (NCHW format) required by cudnn_batch_norm
+        torch::Tensor input = torch::randn({N, C, H, W}, torch::kFloat32);
+
+        // Create weight (gamma) - must be 1D with size C
+        torch::Tensor weight = torch::ones({C}, torch::kFloat32);
+        if (offset + C <= Size) {
+            for (int64_t i = 0; i < C && offset < Size; i++) {
+                weight[i] = static_cast<float>(Data[offset++]) / 128.0f - 1.0f;
+            }
         }
-        
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&eps, Data + offset, sizeof(double));
-            offset += sizeof(double);
+
+        // Create bias (beta) - must be 1D with size C
+        torch::Tensor bias = torch::zeros({C}, torch::kFloat32);
+        if (offset + C <= Size) {
+            for (int64_t i = 0; i < C && offset < Size; i++) {
+                bias[i] = static_cast<float>(Data[offset++]) / 128.0f - 1.0f;
+            }
         }
-        
-        // Move tensors to CUDA if available
-        if (torch::cuda::is_available()) {
-            input = input.cuda();
-            weight = weight.cuda();
-            bias = bias.cuda();
-            running_mean = running_mean.cuda();
-            running_var = running_var.cuda();
-        }
-        
+
+        // Create running_mean - must be 1D with size C
+        torch::Tensor running_mean = torch::zeros({C}, torch::kFloat32);
+
+        // Create running_var - must be 1D with size C, and positive
+        torch::Tensor running_var = torch::ones({C}, torch::kFloat32);
+
+        // Move all tensors to CUDA
+        input = input.cuda();
+        weight = weight.cuda();
+        bias = bias.cuda();
+        running_mean = running_mean.cuda();
+        running_var = running_var.cuda();
+
         // Apply cudnn_batch_norm
-        auto result = torch::cudnn_batch_norm(
-            input,
-            weight,
-            bias,
-            running_mean,
-            running_var,
-            training,
-            momentum,
-            eps
-        );
-        
-        // Get the output tensor
-        torch::Tensor output = std::get<0>(result);
-        
-        // Ensure the output is moved back to CPU if it was on CUDA
-        if (output.is_cuda()) {
+        try {
+            auto result = torch::cudnn_batch_norm(
+                input,
+                weight,
+                bias,
+                running_mean,
+                running_var,
+                training,
+                momentum,
+                eps
+            );
+
+            // Get output tensors from the tuple
+            torch::Tensor output = std::get<0>(result);
+            torch::Tensor save_mean = std::get<1>(result);
+            torch::Tensor save_var = std::get<2>(result);
+            torch::Tensor reserve = std::get<3>(result);
+
+            // Force computation and validate
             output = output.cpu();
+            auto sum = output.sum().item<float>();
+            (void)sum;
+
+            // Also validate other outputs
+            if (!save_mean.numel() == 0) {
+                save_mean = save_mean.cpu();
+            }
+            if (!save_var.numel() == 0) {
+                save_var = save_var.cpu();
+            }
         }
-        
-        // Perform some operation on the output to ensure it's used
-        auto sum = output.sum().item<float>();
-        if (std::isnan(sum) || std::isinf(sum)) {
+        catch (const c10::Error &e) {
+            // Expected errors from invalid configurations - silently ignore
             return 0;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

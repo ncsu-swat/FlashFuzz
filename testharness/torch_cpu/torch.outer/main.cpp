@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -20,10 +25,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Check if we have enough data left for the second tensor
         if (offset >= Size) {
-            // Try to use the operation with just one tensor
-            // This will likely fail, but we want to test this edge case
+            // Try to use the operation with just one tensor (self outer product)
             try {
-                auto result = torch::outer(vec1, vec1);
+                torch::Tensor flat_vec = vec1.flatten();
+                auto result = torch::outer(flat_vec, flat_vec);
             } catch (...) {
                 // Expected to fail in some cases
             }
@@ -32,8 +37,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         torch::Tensor vec2 = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Try to flatten tensors if they're not 1D
-        // This allows us to test outer product with tensors of any rank
+        // Flatten tensors to 1D as required by torch::outer
         if (vec1.dim() != 1) {
             vec1 = vec1.flatten();
         }
@@ -44,6 +48,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Apply the outer product operation
         auto result = torch::outer(vec1, vec2);
+        
+        // Verify result shape is correct: [vec1.size(0), vec2.size(0)]
+        if (result.dim() != 2 || result.size(0) != vec1.size(0) || result.size(1) != vec2.size(0)) {
+            std::cerr << "Unexpected result shape" << std::endl;
+        }
         
         // Test with empty tensors
         if (offset + 1 < Size) {
@@ -79,9 +88,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test with different data types if we have more data
         if (offset + 1 < Size) {
             uint8_t test_dtype = Data[offset++];
-            if (test_dtype % 3 == 0) {
+            if (test_dtype % 3 == 0 && offset < Size) {
                 // Try converting to a different dtype
-                torch::ScalarType target_dtype = fuzzer_utils::parseDataType(Data[offset % Size]);
+                torch::ScalarType target_dtype = fuzzer_utils::parseDataType(Data[offset++]);
                 try {
                     auto converted_vec1 = vec1.to(target_dtype);
                     auto converted_vec2 = vec2.to(target_dtype);
@@ -95,13 +104,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test with out parameter if we have more data
         if (offset + 1 < Size) {
             uint8_t test_out = Data[offset++];
-            if (test_out % 2 == 0) {
+            if (test_out % 2 == 0 && vec1.size(0) > 0 && vec2.size(0) > 0) {
                 try {
                     // Create output tensor with correct shape
                     auto out_tensor = torch::empty({vec1.size(0), vec2.size(0)}, result.options());
-                    torch::outer_out(out_tensor, vec1, vec2);
+                    torch::outer_outf(vec1, vec2, out_tensor);
                 } catch (...) {
                     // Might fail for some combinations
+                }
+            }
+        }
+        
+        // Test ger (alias for outer) if we have more data
+        if (offset + 1 < Size) {
+            uint8_t test_ger = Data[offset++];
+            if (test_ger % 2 == 0) {
+                try {
+                    auto result_ger = torch::ger(vec1, vec2);
+                } catch (...) {
+                    // Might fail
                 }
             }
         }
@@ -109,7 +130,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

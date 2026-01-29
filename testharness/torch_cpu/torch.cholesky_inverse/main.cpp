@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For std::sqrt
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -29,25 +35,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // If the tensor is not 2D, try to reshape it
         if (input.dim() != 2) {
             int64_t total_elements = input.numel();
-            int64_t dim_size = static_cast<int64_t>(std::sqrt(total_elements));
+            int64_t dim_size = static_cast<int64_t>(std::sqrt(static_cast<double>(total_elements)));
             
             // Reshape to square matrix if possible
-            if (dim_size * dim_size <= total_elements) {
+            if (dim_size > 0 && dim_size * dim_size <= total_elements) {
                 input = input.reshape({dim_size, dim_size});
             } else if (total_elements > 0) {
-                // If we can't make a perfect square, make the closest rectangular shape
-                input = input.reshape({1, total_elements});
+                // If we can't make a perfect square, make a 1x1 or small square
+                dim_size = std::max<int64_t>(1, dim_size);
+                if (dim_size * dim_size <= total_elements) {
+                    input = input.flatten().slice(0, 0, dim_size * dim_size).reshape({dim_size, dim_size});
+                } else {
+                    input = input.flatten().slice(0, 0, 1).reshape({1, 1});
+                }
             }
         }
         
         // Make sure the matrix is square (required for cholesky_inverse)
         if (input.dim() == 2 && input.size(0) != input.size(1)) {
             int64_t min_dim = std::min(input.size(0), input.size(1));
-            input = input.slice(0, 0, min_dim).slice(1, 0, min_dim);
+            if (min_dim > 0) {
+                input = input.slice(0, 0, min_dim).slice(1, 0, min_dim);
+            }
         }
         
         // Make the input positive definite by multiplying with its transpose
-        // This is a common technique to create a positive definite matrix
         if (input.dim() == 2 && input.size(0) > 0 && input.size(1) > 0) {
             // Convert to floating point if needed
             if (!input.is_floating_point() && !input.is_complex()) {
@@ -70,53 +82,75 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor cholesky_factor;
             try {
                 cholesky_factor = torch::linalg_cholesky(pd_matrix, upper);
-            } catch (const std::exception& e) {
-                // If cholesky fails, we can't test cholesky_inverse
+            } catch (...) {
+                // If cholesky fails (e.g., numerical issues), skip this input silently
                 return 0;
             }
             
             // Now apply cholesky_inverse to the Cholesky factor
-            try {
-                torch::Tensor result = torch::cholesky_inverse(cholesky_factor, upper);
-                
-                // Optional: verify the result by comparing with the inverse of the original matrix
-                if (offset < Size && (Data[offset++] & 0x01)) {
-                    try {
-                        torch::Tensor direct_inverse = torch::inverse(pd_matrix);
-                        torch::allclose(result, direct_inverse);
-                    } catch (...) {
-                        // Ignore verification errors
-                    }
+            torch::Tensor result = torch::cholesky_inverse(cholesky_factor, upper);
+            
+            // Optional: verify the result by comparing with the inverse of the original matrix
+            if (offset < Size && (Data[offset++] & 0x01)) {
+                try {
+                    torch::Tensor direct_inverse = torch::inverse(pd_matrix);
+                    torch::allclose(result, direct_inverse);
+                } catch (...) {
+                    // Ignore verification errors (numerical precision issues)
                 }
-            } catch (const std::exception& e) {
-                // Catch exceptions from cholesky_inverse
-                return 0;
             }
         }
         
-        // Test with empty tensor
+        // Test with batched input
         if (offset < Size && (Data[offset++] & 0x01)) {
             try {
-                torch::Tensor empty_tensor = torch::empty({0, 0}, torch::kFloat32);
-                torch::cholesky_inverse(empty_tensor, upper);
+                int64_t batch_size = (offset < Size) ? (Data[offset++] % 4) + 1 : 2;
+                int64_t mat_size = (offset < Size) ? (Data[offset++] % 5) + 2 : 3;
+                
+                // Create a batch of positive definite matrices
+                torch::Tensor batch_input = torch::randn({batch_size, mat_size, mat_size}, torch::kFloat32);
+                torch::Tensor batch_pd = torch::matmul(batch_input, batch_input.transpose(-2, -1));
+                batch_pd = batch_pd + torch::eye(mat_size, torch::kFloat32).unsqueeze(0) * 1e-3;
+                
+                torch::Tensor batch_chol = torch::linalg_cholesky(batch_pd, upper);
+                torch::Tensor batch_result = torch::cholesky_inverse(batch_chol, upper);
+                (void)batch_result;
             } catch (...) {
-                // Expected to fail, just catch the exception
+                // Silently ignore errors from batched test
             }
         }
         
-        // Test with 1x1 tensor
+        // Test with 1x1 tensor (valid edge case)
         if (offset < Size && (Data[offset++] & 0x01)) {
             try {
-                torch::Tensor scalar_tensor = torch::ones({1, 1}, torch::kFloat32);
-                torch::cholesky_inverse(scalar_tensor, upper);
+                float val = (offset < Size) ? (static_cast<float>(Data[offset++]) / 255.0f + 0.1f) : 1.0f;
+                torch::Tensor scalar_tensor = torch::tensor({{val}}, torch::kFloat32);
+                torch::Tensor scalar_result = torch::cholesky_inverse(scalar_tensor, upper);
+                (void)scalar_result;
             } catch (...) {
-                // May fail depending on the value, just catch the exception
+                // May fail for very small values, ignore
+            }
+        }
+        
+        // Test with double precision
+        if (offset < Size && (Data[offset++] & 0x01)) {
+            try {
+                torch::Tensor double_input = torch::randn({3, 3}, torch::kFloat64);
+                torch::Tensor double_pd = torch::matmul(double_input, double_input.transpose(-2, -1));
+                double_pd = double_pd + torch::eye(3, torch::kFloat64) * 1e-6;
+                
+                torch::Tensor double_chol = torch::linalg_cholesky(double_pd, upper);
+                torch::Tensor double_result = torch::cholesky_inverse(double_chol, upper);
+                (void)double_result;
+            } catch (...) {
+                // Silently ignore
             }
         }
     }
     catch (const std::exception &e)
     {
-        return 0; // discard the input
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

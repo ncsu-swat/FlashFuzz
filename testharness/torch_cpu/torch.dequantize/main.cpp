@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstring>        // For std::memcpy
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,8 +24,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a tensor to dequantize
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Try to quantize the tensor first to ensure we have a quantized tensor
-        // We'll use per_tensor quantization with different scale/zero_point values
+        // Ensure tensor is float for quantization
+        if (!tensor.is_floating_point()) {
+            tensor = tensor.to(torch::kFloat32);
+        }
         
         // Extract scale and zero_point from the remaining data
         float scale = 0.1f;
@@ -31,16 +39,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Ensure scale is positive and not too extreme
             scale = std::abs(scale);
-            if (scale < 1e-6f) scale = 1e-6f;
+            if (!std::isfinite(scale) || scale < 1e-6f) scale = 1e-6f;
             if (scale > 1e6f) scale = 1e6f;
         }
         
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&zero_point, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
-            
-            // Ensure zero_point is within valid range for quantization
-            zero_point = zero_point % 256;
         }
         
         // Try different quantization types based on remaining data
@@ -50,34 +55,55 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         torch::Tensor quantized_tensor;
+        bool quantization_succeeded = false;
         
         // Try to quantize the tensor with different dtypes
         try {
             switch (quant_type % 3) {
-                case 0:
+                case 0: {
                     // Per-tensor quantization with qint8
-                    quantized_tensor = torch::quantize_per_tensor(tensor, scale, zero_point, torch::kQInt8);
+                    // zero_point for qint8 should be in [-128, 127]
+                    int64_t zp = (zero_point % 256) - 128;
+                    quantized_tensor = torch::quantize_per_tensor(tensor, scale, zp, torch::kQInt8);
+                    quantization_succeeded = true;
                     break;
-                case 1:
+                }
+                case 1: {
                     // Per-tensor quantization with quint8
-                    quantized_tensor = torch::quantize_per_tensor(tensor, scale, zero_point, torch::kQUInt8);
+                    // zero_point for quint8 should be in [0, 255]
+                    int64_t zp = std::abs(zero_point) % 256;
+                    quantized_tensor = torch::quantize_per_tensor(tensor, scale, zp, torch::kQUInt8);
+                    quantization_succeeded = true;
                     break;
-                case 2:
+                }
+                case 2: {
                     // Per-tensor quantization with qint32
-                    quantized_tensor = torch::quantize_per_tensor(tensor, scale, zero_point, torch::kQInt32);
+                    // zero_point for qint32 must be 0
+                    quantized_tensor = torch::quantize_per_tensor(tensor, scale, 0, torch::kQInt32);
+                    quantization_succeeded = true;
                     break;
+                }
             }
         } catch (const std::exception& e) {
-            // If quantization fails, create a pre-quantized tensor for testing
-            // This allows us to test dequantize even if quantize fails
-            auto options = torch::TensorOptions().dtype(torch::kQInt8);
-            quantized_tensor = torch::_empty_affine_quantized({2, 2}, options, scale, zero_point);
+            // Quantization failed, try to create a simple quantized tensor
+        }
+        
+        if (!quantization_succeeded) {
+            // Create a simple float tensor and quantize it
+            try {
+                auto simple_tensor = torch::randn({2, 2});
+                quantized_tensor = torch::quantize_per_tensor(simple_tensor, 0.1, 0, torch::kQUInt8);
+                quantization_succeeded = true;
+            } catch (const std::exception& e) {
+                // If we still can't create a quantized tensor, skip this input
+                return 0;
+            }
         }
         
         // Now dequantize the tensor
         torch::Tensor dequantized_tensor = torch::dequantize(quantized_tensor);
         
-        // Try to access some properties of the dequantized tensor to ensure it's valid
+        // Verify the dequantized tensor is valid and non-quantized
         auto sizes = dequantized_tensor.sizes();
         auto dtype = dequantized_tensor.dtype();
         
@@ -85,6 +111,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (dequantized_tensor.numel() > 0) {
             torch::Tensor result = dequantized_tensor + 1.0;
             result = result * 2.0;
+            // Compute sum to exercise more code paths
+            auto sum = result.sum();
+        }
+        
+        // Test dequantize on a list of quantized tensors
+        if (offset < Size && Data[offset] % 4 == 0) {
+            try {
+                std::vector<torch::Tensor> quantized_list = {quantized_tensor};
+                if (quantization_succeeded) {
+                    // Add another quantized tensor to the list
+                    auto another_tensor = torch::randn_like(dequantized_tensor);
+                    auto another_quantized = torch::quantize_per_tensor(another_tensor, scale, 0, torch::kQUInt8);
+                    quantized_list.push_back(another_quantized);
+                }
+                auto dequantized_list = torch::dequantize(quantized_list);
+            } catch (const std::exception& e) {
+                // Expected - some configurations may fail
+            }
         }
         
         // Try to dequantize a non-quantized tensor (should throw an exception)
@@ -92,23 +136,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             try {
                 torch::Tensor invalid_dequantize = torch::dequantize(tensor);
             } catch (const std::exception& e) {
-                // Expected exception, continue
+                // Expected exception for non-quantized tensor
             }
         }
         
         // Try to dequantize the already dequantized tensor (should throw an exception)
-        if (offset < Size && Data[offset] % 3 == 0) {
+        if (offset + 1 < Size && Data[offset + 1] % 3 == 0) {
             try {
                 torch::Tensor double_dequantize = torch::dequantize(dequantized_tensor);
             } catch (const std::exception& e) {
-                // Expected exception, continue
+                // Expected exception
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

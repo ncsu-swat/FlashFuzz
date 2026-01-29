@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,66 +28,81 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         bool keepdim = false;
         
         // If we have more data, use it to determine dimension and keepdim
-        if (offset + 2 < Size) {
-            // Extract a dimension value from the data
-            dim = static_cast<int64_t>(Data[offset++]) % (input.dim() + 1) - 1; // -1 means no dimension specified
-            keepdim = Data[offset++] & 0x1; // Use lowest bit to determine keepdim
+        if (offset + 2 <= Size) {
+            dim = static_cast<int64_t>(Data[offset++]);
+            keepdim = Data[offset++] & 0x1;
         }
         
-        // Test different variants of torch::max
-        
-        // Variant 1: max of all elements
+        // Variant 1: max of all elements (returns single-element tensor)
         torch::Tensor result1 = torch::max(input);
+        (void)result1;
         
-        // Variant 2: max along dimension
+        // Variant 2: max along dimension (returns tuple of values and indices)
         if (input.dim() > 0) {
-            if (dim >= 0) {
-                // Max along specific dimension
-                auto result2 = torch::max(input, dim, keepdim);
-                torch::Tensor values = std::get<0>(result2);
-                torch::Tensor indices = std::get<1>(result2);
-            }
+            // Normalize dim to valid range
+            int64_t valid_dim = dim % input.dim();
+            if (valid_dim < 0) valid_dim += input.dim();
+            
+            auto result2 = torch::max(input, valid_dim, keepdim);
+            torch::Tensor values = std::get<0>(result2);
+            torch::Tensor indices = std::get<1>(result2);
+            (void)values;
+            (void)indices;
         }
         
-        // Variant 3: element-wise maximum of two tensors
-        if (offset < Size) {
-            // Create a second tensor if we have more data
-            torch::Tensor other;
+        // Variant 3: element-wise maximum of two tensors (torch::maximum)
+        if (offset + 4 <= Size) {
             try {
-                other = fuzzer_utils::createTensor(Data, Size, offset);
+                torch::Tensor other = fuzzer_utils::createTensor(Data, Size, offset);
                 
-                // Try element-wise max if shapes are broadcastable
-                try {
-                    torch::Tensor result3 = torch::max(input, other);
-                } catch (const c10::Error &) {
-                    // Shapes might not be broadcastable, which is expected in some cases
-                }
+                // Use torch::maximum for element-wise max of two tensors
+                // This broadcasts if shapes are compatible
+                torch::Tensor result3 = torch::maximum(input, other);
+                (void)result3;
             } catch (const std::exception &) {
-                // Failed to create second tensor, continue with other tests
+                // Shapes might not be broadcastable, which is expected
             }
         }
         
-        // Variant 4: max with scalar
+        // Variant 4: element-wise maximum with scalar using torch::clamp_min
+        // (torch::max doesn't take a scalar directly, use clamp_min instead)
         if (offset < Size) {
-            // Use a byte from the input as a scalar value
-            double scalar_value = static_cast<double>(Data[offset++]);
-            auto result4_tuple = torch::max(input, scalar_value);
-            torch::Tensor result4 = std::get<0>(result4_tuple);
+            double scalar_value = static_cast<double>(Data[offset++]) / 10.0;
+            torch::Tensor result4 = torch::clamp_min(input, scalar_value);
+            (void)result4;
         }
         
-        // Variant 5: named max along dimension
-        if (input.dim() > 0 && dim >= 0) {
-            try {
-                auto result5 = torch::max(input, torch::Dimname::wildcard(), keepdim);
-            } catch (const c10::Error &) {
-                // Named dimensions might not be supported for this tensor
+        // Variant 5: max with output tensor (in-place style)
+        if (input.dim() > 0 && input.numel() > 0) {
+            int64_t valid_dim = 0;
+            if (input.dim() > 1) {
+                valid_dim = (offset < Size) ? (Data[offset++] % input.dim()) : 0;
             }
+            
+            torch::Tensor values_out = torch::empty({0}, input.options());
+            torch::Tensor indices_out = torch::empty({0}, torch::kLong);
+            
+            try {
+                auto result5 = torch::max_out(values_out, indices_out, input, valid_dim, keepdim);
+                (void)result5;
+            } catch (const std::exception &) {
+                // May fail due to dtype or shape issues
+            }
+        }
+        
+        // Variant 6: amax - another way to compute max along dimensions
+        if (input.dim() > 0) {
+            int64_t valid_dim = dim % input.dim();
+            if (valid_dim < 0) valid_dim += input.dim();
+            
+            torch::Tensor result6 = torch::amax(input, {valid_dim}, keepdim);
+            (void)result6;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

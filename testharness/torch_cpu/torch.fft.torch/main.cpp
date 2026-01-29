@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -27,12 +32,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&n, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
+            // Clamp n to reasonable range to avoid OOM
+            n = std::abs(n) % 1024 + 1;
         }
         
         // Parse dim (dimension along which to perform FFT)
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&dim, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
+            // Normalize dim to valid range
+            if (input_tensor.dim() > 0) {
+                dim = dim % input_tensor.dim();
+            } else {
+                dim = -1;
+            }
         }
         
         // Parse norm type
@@ -65,69 +78,105 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // FFT with all parameters
             auto result4 = torch::fft::fft(input_tensor, n, dim, norm);
             
-            // Try other FFT variants if input is appropriate
-            if (input_tensor.dim() >= 1) {
-                // rfft (real FFT)
-                if (input_tensor.is_floating_point()) {
-                    auto rfft_result = torch::fft::rfft(input_tensor);
-                }
-                
-                // hfft (Hermitian FFT)
-                if (input_tensor.is_complex()) {
-                    auto hfft_result = torch::fft::hfft(input_tensor);
-                }
-                
-                // ifft (inverse FFT)
-                auto ifft_result = torch::fft::ifft(input_tensor);
-                
-                // irfft (inverse real FFT)
-                if (input_tensor.is_complex()) {
-                    auto irfft_result = torch::fft::irfft(input_tensor);
-                }
-                
-                // ihfft (inverse Hermitian FFT)
-                if (input_tensor.is_floating_point()) {
-                    auto ihfft_result = torch::fft::ihfft(input_tensor);
-                }
+            // ifft (inverse FFT)
+            auto ifft_result = torch::fft::ifft(input_tensor);
+        } catch (const c10::Error &e) {
+            // Expected for invalid tensor types/shapes
+        }
+
+        // Try real FFT variants
+        try {
+            if (input_tensor.is_floating_point() && input_tensor.dim() >= 1) {
+                auto rfft_result = torch::fft::rfft(input_tensor);
+                auto ihfft_result = torch::fft::ihfft(input_tensor);
             }
-            
-            // Try 2D FFT variants if tensor has at least 2 dimensions
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+        
+        // Try complex FFT variants
+        try {
+            if (input_tensor.is_complex() && input_tensor.dim() >= 1) {
+                auto hfft_result = torch::fft::hfft(input_tensor);
+                auto irfft_result = torch::fft::irfft(input_tensor);
+            }
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+        
+        // Try 2D FFT variants if tensor has at least 2 dimensions
+        try {
             if (input_tensor.dim() >= 2) {
                 auto fft2_result = torch::fft::fft2(input_tensor);
                 auto ifft2_result = torch::fft::ifft2(input_tensor);
-                
-                if (input_tensor.is_floating_point()) {
-                    auto rfft2_result = torch::fft::rfft2(input_tensor);
-                }
-                
-                if (input_tensor.is_complex()) {
-                    auto irfft2_result = torch::fft::irfft2(input_tensor);
-                }
             }
-            
-            // Try n-dimensional FFT variants
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+
+        try {
+            if (input_tensor.dim() >= 2 && input_tensor.is_floating_point()) {
+                auto rfft2_result = torch::fft::rfft2(input_tensor);
+            }
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+        
+        try {
+            if (input_tensor.dim() >= 2 && input_tensor.is_complex()) {
+                auto irfft2_result = torch::fft::irfft2(input_tensor);
+            }
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+        
+        // Try n-dimensional FFT variants
+        try {
             auto fftn_result = torch::fft::fftn(input_tensor);
             auto ifftn_result = torch::fft::ifftn(input_tensor);
-            
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+        
+        try {
             if (input_tensor.is_floating_point()) {
                 auto rfftn_result = torch::fft::rfftn(input_tensor);
             }
-            
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+        
+        try {
             if (input_tensor.is_complex()) {
                 auto irfftn_result = torch::fft::irfftn(input_tensor);
             }
-            
-            // Try fftshift and ifftshift
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
+        }
+        
+        // Try fftshift and ifftshift
+        try {
             auto fftshift_result = torch::fft::fftshift(input_tensor);
             auto ifftshift_result = torch::fft::ifftshift(input_tensor);
         } catch (const c10::Error &e) {
-            // PyTorch-specific exceptions are expected and okay
+            // Expected for invalid inputs
+        }
+
+        // Try fftfreq and rfftfreq
+        try {
+            if (n > 0) {
+                auto options = torch::TensorOptions().dtype(torch::kFloat64);
+                auto fftfreq_result = torch::fft::fftfreq(n, options);
+                auto rfftfreq_result = torch::fft::rfftfreq(n, options);
+            }
+        } catch (const c10::Error &e) {
+            // Expected for invalid inputs
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

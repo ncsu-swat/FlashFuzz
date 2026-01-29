@@ -1,89 +1,116 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        if (Size < 20) {
+            return 0;
+        }
+
         size_t offset = 0;
-        
-        if (Size < 10) {
-            return 0;
-        }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create weight tensor
-        torch::Tensor weight;
-        if (offset < Size) {
-            weight = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            return 0;
-        }
-        
-        // Create bias tensor (optional)
-        torch::Tensor bias;
-        bool use_bias = offset < Size && Data[offset++] % 2 == 0;
-        if (use_bias && offset < Size) {
-            bias = fuzzer_utils::createTensor(Data, Size, offset);
-        }
-        
-        // Parse stride
-        std::vector<int64_t> stride;
-        if (offset < Size) {
-            uint8_t stride_size = Data[offset++] % 3 + 1; // 1-3 dimensions
-            for (uint8_t i = 0; i < stride_size && offset + sizeof(int64_t) <= Size; i++) {
-                int64_t s;
-                std::memcpy(&s, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
-                stride.push_back(std::abs(s) % 4 + 1); // 1-4 stride
-            }
-        } else {
-            stride = {1};
-        }
-        
-        // Parse padding
-        std::vector<int64_t> padding;
-        if (offset < Size) {
-            uint8_t padding_size = Data[offset++] % 3 + 1; // 1-3 dimensions
-            for (uint8_t i = 0; i < padding_size && offset + sizeof(int64_t) <= Size; i++) {
-                int64_t p;
-                std::memcpy(&p, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
-                padding.push_back(std::abs(p) % 3); // 0-2 padding
-            }
-        } else {
-            padding = {0};
-        }
-        
-        // Parse dilation
-        std::vector<int64_t> dilation;
-        if (offset < Size) {
-            uint8_t dilation_size = Data[offset++] % 3 + 1; // 1-3 dimensions
-            for (uint8_t i = 0; i < dilation_size && offset + sizeof(int64_t) <= Size; i++) {
-                int64_t d;
-                std::memcpy(&d, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
-                dilation.push_back(std::abs(d) % 3 + 1); // 1-3 dilation
-            }
-        } else {
-            dilation = {1};
-        }
-        
+
+        // Determine convolution dimensions (1D, 2D, or 3D)
+        uint8_t conv_dims = (Data[offset++] % 3) + 1; // 1, 2, or 3
+
+        // Parse basic parameters
+        int64_t batch_size = (Data[offset++] % 4) + 1;      // 1-4
+        int64_t in_channels = (Data[offset++] % 8) + 1;     // 1-8
+        int64_t out_channels = (Data[offset++] % 8) + 1;    // 1-8
+        int64_t groups = (Data[offset++] % 4) + 1;          // 1-4
+
+        // Adjust channels to be divisible by groups
+        in_channels = ((in_channels + groups - 1) / groups) * groups;
+        out_channels = ((out_channels + groups - 1) / groups) * groups;
+
         // Parse transposed flag
-        bool transposed = offset < Size && Data[offset++] % 2 == 0;
-        
-        // Parse groups
-        int64_t groups = 1;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&groups, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            groups = std::abs(groups) % 4 + 1; // 1-4 groups
+        bool transposed = Data[offset++] % 2 == 0;
+
+        // Parse spatial dimensions, stride, padding, dilation, output_padding
+        std::vector<int64_t> input_spatial;
+        std::vector<int64_t> kernel_spatial;
+        std::vector<int64_t> stride;
+        std::vector<int64_t> padding;
+        std::vector<int64_t> dilation;
+        std::vector<int64_t> output_padding;
+
+        for (int i = 0; i < conv_dims && offset + 5 <= Size; i++) {
+            int64_t spatial_size = (Data[offset++] % 16) + 4;  // 4-19
+            int64_t kernel_size = (Data[offset++] % 5) + 1;    // 1-5
+            int64_t s = (Data[offset++] % 3) + 1;              // 1-3
+            int64_t p = Data[offset++] % 3;                     // 0-2
+            int64_t d = (Data[offset++] % 2) + 1;              // 1-2
+
+            input_spatial.push_back(spatial_size);
+            kernel_spatial.push_back(kernel_size);
+            stride.push_back(s);
+            padding.push_back(p);
+            dilation.push_back(d);
+
+            // Output padding for transposed convolution (must be < stride)
+            if (transposed) {
+                output_padding.push_back(Data[offset < Size ? offset++ : 0] % s);
+            } else {
+                output_padding.push_back(0);
+            }
         }
-        
+
+        // Ensure we have valid dimensions
+        if (input_spatial.size() != static_cast<size_t>(conv_dims)) {
+            return 0;
+        }
+
+        // Build input shape: [N, C, D1, D2, ...]
+        std::vector<int64_t> input_shape = {batch_size, in_channels};
+        for (int64_t dim : input_spatial) {
+            input_shape.push_back(dim);
+        }
+
+        // Build weight shape:
+        // For regular conv: [out_channels, in_channels/groups, K1, K2, ...]
+        // For transposed conv: [in_channels, out_channels/groups, K1, K2, ...]
+        std::vector<int64_t> weight_shape;
+        if (transposed) {
+            weight_shape = {in_channels, out_channels / groups};
+        } else {
+            weight_shape = {out_channels, in_channels / groups};
+        }
+        for (int64_t k : kernel_spatial) {
+            weight_shape.push_back(k);
+        }
+
+        // Determine dtype from fuzzer data
+        torch::Dtype dtype = torch::kFloat32;
+        if (offset < Size) {
+            uint8_t dtype_choice = Data[offset++] % 3;
+            if (dtype_choice == 1) {
+                dtype = torch::kFloat64;
+            } else if (dtype_choice == 2) {
+                dtype = torch::kFloat16;
+            }
+        }
+
+        // Create input tensor
+        torch::Tensor input = torch::randn(input_shape, torch::TensorOptions().dtype(dtype));
+
+        // Create weight tensor
+        torch::Tensor weight = torch::randn(weight_shape, torch::TensorOptions().dtype(dtype));
+
+        // Create bias tensor (optional)
+        c10::optional<torch::Tensor> bias = c10::nullopt;
+        bool use_bias = offset < Size && Data[offset++] % 2 == 0;
+        if (use_bias) {
+            bias = torch::randn({out_channels}, torch::TensorOptions().dtype(dtype));
+        }
+
         // Apply convolution operation
         torch::Tensor output;
         try {
@@ -95,27 +122,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 padding,
                 dilation,
                 transposed,
-                {0}, // output_padding (using default)
+                output_padding,
                 groups
             );
         } catch (const c10::Error& e) {
-            // PyTorch-specific exceptions are expected and handled
+            // PyTorch-specific exceptions are expected for invalid combinations
             return 0;
         }
-        
-        // Perform some operations on the output to ensure it's used
+
+        // Perform operations on output to ensure it's used and computed
         if (output.defined()) {
             auto sum = output.sum();
-            if (sum.item<float>() == -1.0f) {
-                // This is just to prevent the compiler from optimizing away the sum calculation
-                return 1;
-            }
+            auto mean = output.mean();
+            
+            // Access the values to ensure computation happens
+            volatile float sum_val = sum.item<float>();
+            volatile float mean_val = mean.item<float>();
+            (void)sum_val;
+            (void)mean_val;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

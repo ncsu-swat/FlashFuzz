@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,6 +28,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&fill_value, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Handle NaN/Inf to avoid issues
+            if (std::isnan(fill_value) || std::isinf(fill_value)) {
+                fill_value = 0.0;
+            }
         }
         
         // Create a scalar tensor for the fill value
@@ -48,7 +57,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 // Try with layout, device, requires_grad options if we have more data
                 if (offset < Size) {
-                    bool requires_grad = (Data[offset++] % 2) == 1;
+                    bool requires_grad_input = (Data[offset++] % 2) == 1;
+                    
+                    // Only enable requires_grad for floating point types
+                    bool is_floating = (dtype == torch::kFloat32 || 
+                                       dtype == torch::kFloat64 || 
+                                       dtype == torch::kFloat16 ||
+                                       dtype == torch::kBFloat16);
+                    bool requires_grad = requires_grad_input && is_floating;
                     
                     torch::Tensor result3 = torch::full_like(
                         input_tensor,
@@ -64,16 +80,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         uint8_t memory_format_selector = Data[offset++];
                         torch::MemoryFormat memory_format;
                         
-                        // Select a memory format based on the input data
+                        int64_t ndim = input_tensor.dim();
+                        
+                        // Select a memory format based on the input data and tensor dimensions
                         switch (memory_format_selector % 4) {
                             case 0:
                                 memory_format = torch::MemoryFormat::Contiguous;
                                 break;
                             case 1:
-                                memory_format = torch::MemoryFormat::ChannelsLast;
+                                // ChannelsLast requires 4D tensor
+                                if (ndim == 4) {
+                                    memory_format = torch::MemoryFormat::ChannelsLast;
+                                } else {
+                                    memory_format = torch::MemoryFormat::Contiguous;
+                                }
                                 break;
                             case 2:
-                                memory_format = torch::MemoryFormat::ChannelsLast3d;
+                                // ChannelsLast3d requires 5D tensor
+                                if (ndim == 5) {
+                                    memory_format = torch::MemoryFormat::ChannelsLast3d;
+                                } else {
+                                    memory_format = torch::MemoryFormat::Contiguous;
+                                }
                                 break;
                             default:
                                 memory_format = torch::MemoryFormat::Preserve;
@@ -111,7 +139,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         catch (const c10::Error &e) {
-            // Catch PyTorch-specific errors
+            // Catch PyTorch-specific errors silently (expected for invalid combinations)
         }
     }
     catch (const std::exception &e)

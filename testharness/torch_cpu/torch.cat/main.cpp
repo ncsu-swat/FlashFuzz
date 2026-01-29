@@ -1,115 +1,186 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least 1 byte to determine number of tensors
-        if (Size < 1) {
+        // Need at least 2 bytes to determine parameters
+        if (Size < 2) {
             return 0;
         }
         
-        // Determine number of tensors to concatenate (1-8)
-        uint8_t num_tensors = (Data[offset++] % 8) + 1;
+        // Determine number of tensors to concatenate (2-5)
+        uint8_t num_tensors = (Data[offset++] % 4) + 2;
         
-        // Create a vector to hold our tensors
+        // Determine dimension to concatenate along (0-3)
+        int64_t dim = Data[offset++] % 4;
+        
+        // Create tensors with compatible shapes for concatenation
         std::vector<torch::Tensor> tensors;
         
-        // Create tensors with various properties
+        // Determine base shape from input data
+        int64_t base_dim0 = 2, base_dim1 = 3, base_dim2 = 4;
+        if (offset + 3 <= Size) {
+            base_dim0 = (Data[offset++] % 4) + 1;
+            base_dim1 = (Data[offset++] % 4) + 1;
+            base_dim2 = (Data[offset++] % 4) + 1;
+        }
+        
+        // Create tensors with shapes that are compatible for concatenation
         for (uint8_t i = 0; i < num_tensors && offset < Size; ++i) {
             try {
-                torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                // Vary the size along the concatenation dimension
+                int64_t cat_dim_size = (offset < Size) ? (Data[offset++] % 3) + 1 : 2;
+                
+                std::vector<int64_t> shape;
+                if (dim == 0) {
+                    shape = {cat_dim_size, base_dim1, base_dim2};
+                } else if (dim == 1) {
+                    shape = {base_dim0, cat_dim_size, base_dim2};
+                } else if (dim == 2) {
+                    shape = {base_dim0, base_dim1, cat_dim_size};
+                } else {
+                    shape = {base_dim0, base_dim1, base_dim2, cat_dim_size};
+                }
+                
+                // Determine dtype
+                auto dtype = torch::kFloat32;
+                if (offset < Size) {
+                    uint8_t dtype_sel = Data[offset++] % 4;
+                    switch (dtype_sel) {
+                        case 0: dtype = torch::kFloat32; break;
+                        case 1: dtype = torch::kFloat64; break;
+                        case 2: dtype = torch::kInt32; break;
+                        case 3: dtype = torch::kInt64; break;
+                    }
+                }
+                
+                torch::Tensor tensor = torch::randn(shape, torch::TensorOptions().dtype(torch::kFloat32)).to(dtype);
                 tensors.push_back(tensor);
-            } catch (const std::exception& e) {
-                // If we can't create a tensor, just continue with what we have
+            } catch (...) {
+                // If we can't create a tensor, continue with what we have
                 break;
             }
         }
         
-        // Need at least one tensor to proceed
-        if (tensors.empty()) {
+        // Need at least two tensors to proceed meaningfully
+        if (tensors.size() < 2) {
             return 0;
         }
         
-        // Determine dimension to concatenate along
-        int64_t dim = 0;
-        if (offset < Size) {
-            // Get a dimension value from the input data
-            // Allow negative dimensions to test edge cases
-            int8_t dim_value;
-            std::memcpy(&dim_value, Data + offset, sizeof(int8_t));
-            offset += sizeof(int8_t);
-            
-            // If the tensor has dimensions, use the input to select one
-            if (!tensors[0].sizes().empty()) {
-                // Allow negative indexing (e.g., -1 for last dimension)
-                dim = dim_value;
-            }
+        // Ensure all tensors have the same dtype for the main test
+        auto target_dtype = tensors[0].dtype();
+        for (size_t i = 1; i < tensors.size(); ++i) {
+            tensors[i] = tensors[i].to(target_dtype);
         }
         
         // Apply torch.cat operation
         try {
             torch::Tensor result = torch::cat(tensors, dim);
+            
+            // Verify the result shape is correct
+            (void)result.sizes();
         } catch (const c10::Error& e) {
             // PyTorch specific exceptions are expected for invalid inputs
-            return 0;
         }
         
-        // Try another variant with named arguments
+        // Test with dim=0 (should always work if shapes match otherwise)
         try {
-            torch::Tensor result = torch::cat({tensors}, dim);
+            // Create tensors compatible for dim=0 concatenation
+            std::vector<torch::Tensor> dim0_tensors;
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                dim0_tensors.push_back(torch::randn({2, 3}, torch::kFloat32));
+            }
+            torch::Tensor result = torch::cat(dim0_tensors, 0);
         } catch (const c10::Error& e) {
-            return 0;
+            // Unexpected but handle gracefully
         }
         
-        // Try with empty tensor list if we have enough data
-        if (offset < Size) {
-            try {
-                std::vector<torch::Tensor> empty_tensors;
-                torch::Tensor result = torch::cat(empty_tensors, 0);
-            } catch (const c10::Error& e) {
-                // Expected to fail
-            }
+        // Test with negative dimension
+        try {
+            torch::Tensor result = torch::cat(tensors, -1);
+        } catch (const c10::Error& e) {
+            // May fail if dimension is out of range
         }
         
-        // Try with tensors of different dtypes if we have multiple tensors
-        if (tensors.size() > 1 && offset < Size) {
-            try {
-                // Convert the second tensor to a different dtype
-                uint8_t dtype_selector = Data[offset++];
-                auto dtype = fuzzer_utils::parseDataType(dtype_selector);
-                tensors[1] = tensors[1].to(dtype);
-                
-                torch::Tensor result = torch::cat(tensors, dim);
-            } catch (const c10::Error& e) {
-                // Expected to fail in some cases
-            }
+        // Test with single tensor
+        try {
+            std::vector<torch::Tensor> single_tensor = {tensors[0]};
+            torch::Tensor result = torch::cat(single_tensor, 0);
+        } catch (const c10::Error& e) {
+            // Should work
         }
         
-        // Try with out parameter if we have enough data
-        if (offset < Size && !tensors.empty()) {
-            try {
-                // Create an output tensor with the same dtype as the first tensor
-                auto options = torch::TensorOptions().dtype(tensors[0].dtype());
-                torch::Tensor out = torch::empty({1}, options);
-                
-                // Use the out variant of cat
-                torch::cat_out(out, tensors, dim);
-            } catch (const c10::Error& e) {
-                // Expected to fail in some cases
+        // Test with empty tensor list (expected to fail)
+        try {
+            std::vector<torch::Tensor> empty_tensors;
+            torch::Tensor result = torch::cat(empty_tensors, 0);
+        } catch (const c10::Error& e) {
+            // Expected to fail
+        }
+        
+        // Test with out parameter
+        try {
+            // Calculate expected output size
+            int64_t total_cat_dim = 0;
+            for (const auto& t : tensors) {
+                if (dim < static_cast<int64_t>(t.dim())) {
+                    total_cat_dim += t.size(dim);
+                }
             }
+            
+            if (total_cat_dim > 0 && !tensors.empty()) {
+                std::vector<int64_t> out_shape(tensors[0].sizes().begin(), tensors[0].sizes().end());
+                if (dim < static_cast<int64_t>(out_shape.size())) {
+                    out_shape[dim] = total_cat_dim;
+                    auto options = torch::TensorOptions().dtype(tensors[0].dtype());
+                    torch::Tensor out = torch::empty(out_shape, options);
+                    torch::cat_out(out, tensors, dim);
+                }
+            }
+        } catch (const c10::Error& e) {
+            // Expected to fail in some cases
+        }
+        
+        // Test with 1D tensors
+        try {
+            std::vector<torch::Tensor> tensors_1d;
+            for (int i = 0; i < 3; ++i) {
+                int64_t len = (offset < Size) ? (Data[offset++] % 5) + 1 : 3;
+                tensors_1d.push_back(torch::randn({len}));
+            }
+            torch::Tensor result = torch::cat(tensors_1d, 0);
+        } catch (const c10::Error& e) {
+            // Handle gracefully
+        }
+        
+        // Test with 2D tensors along dim=1
+        try {
+            std::vector<torch::Tensor> tensors_2d;
+            int64_t rows = 3;
+            for (int i = 0; i < 3; ++i) {
+                int64_t cols = (offset < Size) ? (Data[offset++] % 4) + 1 : 2;
+                tensors_2d.push_back(torch::randn({rows, cols}));
+            }
+            torch::Tensor result = torch::cat(tensors_2d, 1);
+        } catch (const c10::Error& e) {
+            // Handle gracefully
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

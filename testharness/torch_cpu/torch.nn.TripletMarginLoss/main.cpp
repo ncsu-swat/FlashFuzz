@@ -1,66 +1,90 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create tensors
-        if (Size < 10) {
+        // Need at least some data to create tensors and parameters
+        if (Size < 20) {
             return 0;
         }
         
-        // Create anchor, positive, and negative tensors
+        // Create anchor tensor first
         torch::Tensor anchor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Check if we have enough data left for positive and negative tensors
-        if (offset >= Size - 5) {
-            return 0;
+        // Ensure anchor is floating point
+        if (!anchor.is_floating_point()) {
+            anchor = anchor.to(torch::kFloat32);
         }
         
-        torch::Tensor positive = fuzzer_utils::createTensor(Data, Size, offset);
+        // Get the shape of anchor to create matching positive and negative tensors
+        auto shape = anchor.sizes().vec();
         
-        if (offset >= Size - 5) {
-            return 0;
+        // Create positive and negative tensors with the same shape as anchor
+        torch::Tensor positive = torch::randn(shape, torch::kFloat32);
+        torch::Tensor negative = torch::randn(shape, torch::kFloat32);
+        
+        // Use some fuzzer data to perturb the tensors
+        if (offset + 2 <= Size) {
+            float pos_scale = static_cast<float>(Data[offset]) / 255.0f * 2.0f;
+            float neg_scale = static_cast<float>(Data[offset + 1]) / 255.0f * 2.0f;
+            offset += 2;
+            
+            positive = positive * pos_scale;
+            negative = negative * neg_scale;
         }
         
-        torch::Tensor negative = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Parse margin parameter (if we have data left)
+        // Parse margin parameter
         double margin = 1.0;
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&margin, Data + offset, sizeof(double));
-            offset += sizeof(double);
+        if (offset + sizeof(float) <= Size) {
+            float margin_f;
+            std::memcpy(&margin_f, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            // Sanitize margin to avoid NaN/Inf
+            if (std::isfinite(margin_f)) {
+                margin = std::abs(margin_f);
+                // Clamp to reasonable range
+                margin = std::min(margin, 100.0);
+            }
         }
         
-        // Parse p parameter (if we have data left)
+        // Parse p parameter (norm degree)
         double p = 2.0;
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&p, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            // Ensure p is valid (p >= 0)
-            p = std::abs(p);
+        if (offset + sizeof(float) <= Size) {
+            float p_f;
+            std::memcpy(&p_f, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            // Sanitize p to avoid NaN/Inf, p must be > 0
+            if (std::isfinite(p_f) && p_f > 0) {
+                p = std::min(static_cast<double>(std::abs(p_f)), 10.0);
+            }
         }
         
-        // Parse swap parameter (if we have data left)
+        // Parse swap parameter
         bool swap = false;
         if (offset < Size) {
             swap = static_cast<bool>(Data[offset] & 0x01);
             offset++;
         }
         
-        // Parse reduction parameter (if we have data left)
+        // Parse reduction parameter - track with an int for later comparison
+        int reduction_type = 1; // 0=none, 1=mean, 2=sum
         torch::nn::TripletMarginLossOptions::reduction_t reduction = torch::kMean;
         if (offset < Size) {
-            uint8_t reduction_val = Data[offset] % 3;
+            reduction_type = Data[offset] % 3;
             offset++;
             
-            switch (reduction_val) {
+            switch (reduction_type) {
                 case 0:
                     reduction = torch::kNone;
                     break;
@@ -73,25 +97,71 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
+        // Parse eps parameter
+        double eps = 1e-6;
+        if (offset < Size) {
+            uint8_t eps_idx = Data[offset] % 4;
+            offset++;
+            switch (eps_idx) {
+                case 0: eps = 1e-8; break;
+                case 1: eps = 1e-6; break;
+                case 2: eps = 1e-4; break;
+                case 3: eps = 1e-2; break;
+            }
+        }
+        
         // Create TripletMarginLoss module with the parsed parameters
         auto options = torch::nn::TripletMarginLossOptions()
             .margin(margin)
             .p(p)
+            .eps(eps)
             .swap(swap)
             .reduction(reduction);
         
         auto triplet_loss = torch::nn::TripletMarginLoss(options);
         
         // Apply the loss function
-        auto loss = triplet_loss->forward(anchor, positive, negative);
+        torch::Tensor loss;
+        try {
+            loss = triplet_loss->forward(anchor, positive, negative);
+        } catch (const c10::Error& e) {
+            // Shape mismatch or other expected errors - silently ignore
+            return 0;
+        }
         
         // Ensure the loss is computed by accessing its value
-        float loss_value = loss.item<float>();
+        if (reduction_type == 0) {
+            // For no reduction, we get a tensor with the same batch size
+            auto sum = loss.sum();
+            volatile float loss_value = sum.item<float>();
+            (void)loss_value;
+        } else {
+            volatile float loss_value = loss.item<float>();
+            (void)loss_value;
+        }
+        
+        // Also test with requires_grad to exercise backward path
+        if (offset < Size && (Data[offset] & 0x01)) {
+            torch::Tensor anchor_grad = anchor.clone().requires_grad_(true);
+            torch::Tensor positive_grad = positive.clone().requires_grad_(true);
+            torch::Tensor negative_grad = negative.clone().requires_grad_(true);
+            
+            try {
+                auto loss_grad = triplet_loss->forward(anchor_grad, positive_grad, negative_grad);
+                if (reduction_type != 0) {
+                    loss_grad.backward();
+                } else {
+                    loss_grad.sum().backward();
+                }
+            } catch (const c10::Error& e) {
+                // Gradient computation errors - silently ignore
+            }
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

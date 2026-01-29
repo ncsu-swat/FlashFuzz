@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,100 +19,168 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for Linear (using regular Linear instead of LazyLinear)
+        // Extract in_features from fuzzer data
         int64_t in_features = 0;
-        int64_t out_features = 0;
-        bool bias = true;
-        
-        // Get in_features from the input tensor if possible
-        if (input.dim() >= 1) {
-            in_features = input.size(-1);
+        if (offset + sizeof(int32_t) <= Size) {
+            int32_t tmp;
+            std::memcpy(&tmp, Data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+            // Make in_features reasonable (1 to 256)
+            in_features = std::abs(tmp) % 256 + 1;
         } else {
-            // For scalar or empty tensor, use a default value
-            in_features = 1;
+            in_features = 16;
         }
         
-        // Get out_features from the remaining data
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&out_features, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Make out_features reasonable but allow edge cases
-            out_features = std::abs(out_features) % 1024 + 1;
+        // Extract out_features from fuzzer data
+        int64_t out_features = 0;
+        if (offset + sizeof(int32_t) <= Size) {
+            int32_t tmp;
+            std::memcpy(&tmp, Data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+            // Make out_features reasonable (1 to 256)
+            out_features = std::abs(tmp) % 256 + 1;
         } else {
-            out_features = 10; // Default value
+            out_features = 10;
         }
         
         // Get bias parameter if data available
+        bool use_bias = true;
         if (offset < Size) {
-            bias = Data[offset++] & 0x1; // Use lowest bit to determine bias
+            use_bias = Data[offset++] & 0x1;
         }
         
-        // Create Linear module (using regular Linear instead of LazyLinear)
-        torch::nn::Linear linear(torch::nn::LinearOptions(in_features, out_features).bias(bias));
+        // Create Linear module with both in_features and out_features specified
+        auto linear = torch::nn::Linear(torch::nn::LinearOptions(in_features, out_features).bias(use_bias));
         
-        // Apply the Linear module to the input tensor
+        // Create input tensor with matching in_features dimension
+        // Extract batch size from fuzzer data
+        int64_t batch_size = 1;
+        if (offset < Size) {
+            batch_size = (Data[offset++] % 16) + 1;
+        }
+        
+        // Create input tensor with correct shape [batch_size, in_features]
+        torch::Tensor input = torch::randn({batch_size, in_features});
+        
+        // Apply Linear layer
         torch::Tensor output;
-        
-        // Handle different input dimensions
-        if (input.dim() == 0) {
-            // For scalar input, reshape to 1D tensor with one element
-            output = linear(input.reshape({1, 1}));
-        } else if (input.dim() == 1) {
-            // For 1D input, add batch dimension
-            output = linear(input.unsqueeze(0));
-        } else {
-            // For 2D+ inputs, apply directly
+        try {
             output = linear(input);
-        }
-        
-        // Force computation to ensure any errors are triggered
-        output = output.contiguous();
-        
-        // Access some elements to ensure computation
-        if (output.numel() > 0) {
-            float sum = output.sum().item<float>();
-            (void)sum; // Prevent unused variable warning
-        }
-        
-        // Test with different input shapes if possible
-        if (offset + 4 < Size && input.dim() > 0) {
-            // Create another tensor with different shape but same last dimension
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+            output = output.contiguous();
             
-            // Ensure the last dimension matches in_features
-            std::vector<int64_t> new_shape = input2.sizes().vec();
-            if (!new_shape.empty()) {
-                new_shape.back() = in_features;
-                input2 = input2.reshape(new_shape);
+            // Force computation
+            if (output.numel() > 0) {
+                float sum = output.sum().item<float>();
+                (void)sum;
+            }
+        } catch (const std::exception&) {
+            // Shape mismatches are expected for some fuzzer inputs
+        }
+        
+        // Test with different batch sizes
+        try {
+            int64_t batch2 = (Size > offset && offset < Size) ? (Data[offset % Size] % 32 + 1) : 8;
+            torch::Tensor input2 = torch::randn({batch2, in_features});
+            torch::Tensor output2 = linear(input2);
+            output2 = output2.contiguous();
+            
+            if (output2.numel() > 0) {
+                float mean = output2.mean().item<float>();
+                (void)mean;
+            }
+        } catch (const std::exception&) {
+            // Ignore errors
+        }
+        
+        // Test with 3D input (batch, seq, features)
+        try {
+            int64_t seq_len = (Size > offset && offset < Size) ? (Data[offset % Size] % 8 + 1) : 3;
+            torch::Tensor input3d = torch::randn({2, seq_len, in_features});
+            torch::Tensor output3d = linear(input3d);
+            output3d = output3d.contiguous();
+            
+            if (output3d.numel() > 0) {
+                float val = output3d.sum().item<float>();
+                (void)val;
+            }
+        } catch (const std::exception&) {
+            // Ignore errors
+        }
+        
+        // Test zero batch size
+        try {
+            torch::Tensor zero_batch = torch::empty({0, in_features});
+            torch::Tensor zero_output = linear(zero_batch);
+            zero_output = zero_output.contiguous();
+        } catch (const std::exception&) {
+            // Ignore zero-batch errors
+        }
+        
+        // Test accessing parameters
+        try {
+            if (linear->weight.defined()) {
+                auto weight_shape = linear->weight.sizes();
+                (void)weight_shape;
                 
-                // Apply the same Linear module to the new input
-                torch::Tensor output2 = linear(input2);
-                output2 = output2.contiguous();
+                // Verify weight shape
+                if (weight_shape.size() == 2) {
+                    float w_sum = linear->weight.sum().item<float>();
+                    (void)w_sum;
+                }
             }
+            if (use_bias && linear->bias.defined()) {
+                auto bias_shape = linear->bias.sizes();
+                (void)bias_shape;
+                
+                float b_sum = linear->bias.sum().item<float>();
+                (void)b_sum;
+            }
+        } catch (const std::exception&) {
+            // Ignore errors
         }
         
-        // Test with zero batch size if possible
-        if (input.dim() >= 2) {
-            std::vector<int64_t> zero_batch_shape = input.sizes().vec();
-            zero_batch_shape[0] = 0;
+        // Test with tensor created from fuzzer data
+        try {
+            torch::Tensor fuzz_input = fuzzer_utils::createTensor(Data, Size, offset);
             
-            try {
-                torch::Tensor zero_batch_input = torch::empty(zero_batch_shape, input.options());
-                torch::Tensor zero_batch_output = linear(zero_batch_input);
-                zero_batch_output = zero_batch_output.contiguous();
-            } catch (const std::exception&) {
-                // Ignore exceptions for zero-batch case
+            // Reshape to match expected input dimensions if possible
+            if (fuzz_input.numel() >= in_features) {
+                int64_t fuzz_batch = fuzz_input.numel() / in_features;
+                if (fuzz_batch > 0) {
+                    fuzz_input = fuzz_input.reshape({fuzz_batch, in_features});
+                    if (!fuzz_input.is_floating_point()) {
+                        fuzz_input = fuzz_input.to(torch::kFloat32);
+                    }
+                    torch::Tensor fuzz_output = linear(fuzz_input);
+                    fuzz_output = fuzz_output.contiguous();
+                }
             }
+        } catch (const std::exception&) {
+            // Ignore shape mismatch errors
+        }
+        
+        // Test with a fresh Linear module with different parameters
+        try {
+            int64_t in2 = (in_features % 64) + 1;
+            int64_t out2 = (out_features % 64) + 1;
+            auto linear2 = torch::nn::Linear(torch::nn::LinearOptions(in2, out2).bias(!use_bias));
+            
+            torch::Tensor test_input = torch::randn({4, in2});
+            torch::Tensor test_output = linear2(test_input);
+            test_output = test_output.contiguous();
+            
+            if (test_output.numel() > 0) {
+                float val = test_output.mean().item<float>();
+                (void)val;
+            }
+        } catch (const std::exception&) {
+            // Ignore errors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

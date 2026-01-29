@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -35,171 +40,231 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             param = Data[offset++];
         }
         
+        // Ensure tensors are float for most linalg operations
+        if (A.scalar_type() != torch::kFloat && A.scalar_type() != torch::kDouble) {
+            A = A.to(torch::kFloat);
+        }
+        if (B.defined() && B.scalar_type() != torch::kFloat && B.scalar_type() != torch::kDouble) {
+            B = B.to(torch::kFloat);
+        }
+        
         // Test various torch linalg operations based on the selector
+        // Note: In C++ frontend, linalg functions use torch::linalg_* naming convention
         switch (op_selector % 20) {
             case 0: {
-                // torch.norm
+                // torch.linalg.norm - vector norm (use torch::norm as fallback)
                 torch::Tensor result = torch::norm(A);
                 break;
             }
             case 1: {
-                // torch.matrix_norm with different ord values
+                // torch.linalg.det (determinant) - available as torch::linalg_det
                 if (A.dim() >= 2) {
-                    int ord = param % 3;
-                    torch::Tensor result = torch::norm(A, ord);
+                    try {
+                        torch::Tensor result = torch::linalg_det(A);
+                    } catch (...) {
+                        // May fail for non-square matrices
+                    }
                 }
                 break;
             }
             case 2: {
-                // torch.det (determinant)
+                // torch.linalg.slogdet - available as torch::linalg_slogdet
                 if (A.dim() >= 2) {
-                    torch::Tensor result = torch::det(A);
+                    try {
+                        auto result = torch::linalg_slogdet(A);
+                    } catch (...) {
+                        // May fail for non-square matrices
+                    }
                 }
                 break;
             }
             case 3: {
-                // torch.slogdet (sign of determinant and log-determinant)
+                // torch.linalg.matrix_rank - available as torch::linalg_matrix_rank
                 if (A.dim() >= 2) {
-                    auto result = torch::slogdet(A);
+                    try {
+                        torch::Tensor result = torch::linalg_matrix_rank(A);
+                    } catch (...) {
+                        // May fail for certain matrix shapes
+                    }
                 }
                 break;
             }
             case 4: {
-                // torch.matrix_rank
+                // torch.linalg.svd - available as torch::linalg_svd
                 if (A.dim() >= 2) {
-                    torch::Tensor result = torch::matrix_rank(A);
+                    try {
+                        bool full_matrices = param % 2 == 0;
+                        auto result = torch::linalg_svd(A, full_matrices);
+                    } catch (...) {
+                        // SVD may fail for certain matrices
+                    }
                 }
                 break;
             }
             case 5: {
-                // torch.svd (singular value decomposition)
+                // torch.linalg.eig - available as torch::linalg_eig
                 if (A.dim() >= 2) {
-                    bool compute_uv = param % 2 == 0;
-                    auto result = torch::svd(A, compute_uv);
+                    try {
+                        auto result = torch::linalg_eig(A);
+                    } catch (...) {
+                        // May fail for non-square matrices
+                    }
                 }
                 break;
             }
             case 6: {
-                // torch.eig (eigenvalues and eigenvectors)
+                // torch.linalg.eigh - available as torch::linalg_eigh
                 if (A.dim() >= 2) {
-                    bool eigenvectors = param % 2 == 0;
-                    auto result = torch::eig(A, eigenvectors);
+                    try {
+                        std::string uplo = (param % 2 == 0) ? "U" : "L";
+                        auto result = torch::linalg_eigh(A, uplo);
+                    } catch (...) {
+                        // May fail for non-symmetric or non-square matrices
+                    }
                 }
                 break;
             }
             case 7: {
-                // torch.symeig (symmetric eigenvalues)
+                // torch.linalg.inv - available as torch::linalg_inv
                 if (A.dim() >= 2) {
-                    bool eigenvectors = param % 2 == 0;
-                    auto result = torch::symeig(A, eigenvectors);
+                    try {
+                        torch::Tensor result = torch::linalg_inv(A);
+                    } catch (...) {
+                        // May fail for singular matrices
+                    }
                 }
                 break;
             }
             case 8: {
-                // torch.inverse (matrix inverse)
+                // torch.linalg.pinv - available as torch::linalg_pinv
                 if (A.dim() >= 2) {
-                    torch::Tensor result = torch::inverse(A);
+                    try {
+                        torch::Tensor result = torch::linalg_pinv(A);
+                    } catch (...) {
+                        // May fail for certain matrices
+                    }
                 }
                 break;
             }
             case 9: {
-                // torch.pinverse (pseudo-inverse)
+                // torch.linalg.matrix_power - available as torch::linalg_matrix_power
                 if (A.dim() >= 2) {
-                    torch::Tensor result = torch::pinverse(A);
+                    try {
+                        int64_t n = (param % 5) - 2; // Powers between -2 and 2
+                        torch::Tensor result = torch::linalg_matrix_power(A, n);
+                    } catch (...) {
+                        // May fail for non-square or singular matrices with negative powers
+                    }
                 }
                 break;
             }
             case 10: {
-                // torch.matrix_power
-                if (A.dim() >= 2) {
-                    int n = param % 5 - 2; // Powers between -2 and 2
-                    torch::Tensor result = torch::matrix_power(A, n);
+                // torch.linalg.solve - available as torch::linalg_solve
+                if (A.dim() >= 2 && B.defined() && B.dim() >= 1) {
+                    try {
+                        auto result = torch::linalg_solve(A, B);
+                    } catch (...) {
+                        // Solving might fail for non-invertible matrices or shape mismatch
+                    }
                 }
                 break;
             }
             case 11: {
-                // torch.solve
-                if (A.dim() >= 2 && B.defined() && B.dim() >= 1) {
+                // torch.linalg.cholesky - available as torch::linalg_cholesky
+                if (A.dim() >= 2) {
                     try {
-                        auto result = torch::solve(B, A);
+                        torch::Tensor result = torch::linalg_cholesky(A);
                     } catch (...) {
-                        // Solving might fail for non-invertible matrices
+                        // Cholesky fails for non-positive-definite matrices
                     }
                 }
                 break;
             }
             case 12: {
-                // torch.cholesky
+                // torch.linalg.qr - available as torch::linalg_qr
                 if (A.dim() >= 2) {
                     try {
-                        torch::Tensor result = torch::cholesky(A);
+                        std::string mode = (param % 2 == 0) ? "reduced" : "complete";
+                        auto result = torch::linalg_qr(A, mode);
                     } catch (...) {
-                        // Cholesky might fail for non-positive-definite matrices
+                        // QR may fail for certain matrices
                     }
                 }
                 break;
             }
             case 13: {
-                // torch.qr
+                // torch.linalg.lu - available as torch::linalg_lu
                 if (A.dim() >= 2) {
-                    auto result = torch::qr(A);
+                    try {
+                        auto result = torch::linalg_lu(A);
+                    } catch (...) {
+                        // LU may fail for certain matrices
+                    }
                 }
                 break;
             }
             case 14: {
-                // torch.lu
+                // torch.linalg.lu_factor - available as torch::linalg_lu_factor
                 if (A.dim() >= 2) {
-                    auto result = torch::lu(A);
+                    try {
+                        auto result = torch::linalg_lu_factor(A);
+                    } catch (...) {
+                        // LU factorization may fail
+                    }
                 }
                 break;
             }
             case 15: {
-                // torch.lu_unpack
-                if (A.dim() >= 2) {
+                // torch.linalg.cross - available as torch::linalg_cross
+                if (A.dim() >= 1 && B.defined() && B.dim() >= 1) {
                     try {
-                        auto lu_result = torch::lu(A);
-                        auto result = torch::lu_unpack(std::get<0>(lu_result), std::get<1>(lu_result));
+                        torch::Tensor result = torch::linalg_cross(A, B);
                     } catch (...) {
-                        // LU decomposition might fail
+                        // Cross product has specific dimension requirements (size 3)
                     }
                 }
                 break;
             }
             case 16: {
-                // torch.cross
-                if (A.dim() >= 1 && B.defined() && B.dim() >= 1) {
-                    try {
-                        torch::Tensor result = torch::cross(A, B);
-                    } catch (...) {
-                        // Cross product has specific dimension requirements
-                    }
+                // torch.linalg.vector_norm - available as torch::linalg_vector_norm
+                try {
+                    double ord_vals[] = {1.0, 2.0, std::numeric_limits<double>::infinity()};
+                    double ord = ord_vals[param % 3];
+                    torch::Tensor result = torch::linalg_vector_norm(A, ord);
+                } catch (...) {
+                    // May fail for certain inputs
                 }
                 break;
             }
             case 17: {
-                // torch.norm with vector norm
-                torch::Tensor result = torch::norm(A);
-                break;
-            }
-            case 18: {
-                // torch.cond (condition number)
+                // torch.linalg.cond - available as torch::linalg_cond
                 if (A.dim() >= 2) {
                     try {
-                        torch::Tensor result = torch::cond(A);
+                        torch::Tensor result = torch::linalg_cond(A);
                     } catch (...) {
                         // Condition number might fail for singular matrices
                     }
                 }
                 break;
             }
-            case 19: {
-                // torch.chain_matmul (multiple matrix multiplication)
-                if (A.dim() >= 2 && B.defined() && B.dim() >= 2) {
-                    std::vector<torch::Tensor> tensors = {A, B};
+            case 18: {
+                // torch.linalg.eigvals - available as torch::linalg_eigvals
+                if (A.dim() >= 2) {
                     try {
-                        torch::Tensor result = torch::chain_matmul(tensors);
+                        torch::Tensor result = torch::linalg_eigvals(A);
                     } catch (...) {
-                        // Matrix multiplication has specific dimension requirements
+                        // May fail for non-square matrices
+                    }
+                }
+                break;
+            }
+            case 19: {
+                // torch.linalg.matrix_norm - available as torch::linalg_matrix_norm
+                if (A.dim() >= 2) {
+                    try {
+                        torch::Tensor result = torch::linalg_matrix_norm(A);
+                    } catch (...) {
+                        // May fail for certain matrix shapes
                     }
                 }
                 break;
@@ -209,7 +274,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

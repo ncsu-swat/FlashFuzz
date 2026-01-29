@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,29 +19,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor - ensure it's a floating point type for ReLU6
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create ReLU6 module
+        // ReLU6 requires floating point input
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Create ReLU6 module with default options (inplace=false)
         torch::nn::ReLU6 relu6_module;
         
         // Apply ReLU6 operation
         torch::Tensor output = relu6_module->forward(input);
         
-        // Verify the output by comparing with manual implementation
-        torch::Tensor expected_output = torch::clamp(input, 0, 6);
-        
-        // Check if the outputs match
-        auto diff = torch::abs(output - expected_output);
-        auto max_diff = torch::max(diff).item<float>();
+        // Also test the inplace variant
+        if (Size > 10 && (Data[0] % 2 == 0)) {
+            torch::nn::ReLU6 relu6_inplace(torch::nn::ReLU6Options().inplace(true));
+            torch::Tensor input_copy = input.clone();
+            relu6_inplace->forward(input_copy);
+        }
         
         // Use the tensor in some way to prevent optimization
-        if (output.defined() && !output.numel()) {
-            // Just to use the tensor
-            auto sum = output.sum().item<float>();
-            if (std::isnan(sum)) {
-                return 0;
-            }
+        if (output.defined() && output.numel() > 0) {
+            auto sum = output.sum();
+            // Access to ensure computation happens
+            volatile float s = sum.item<float>();
+            (void)s;
+        }
+        
+        // Test functional form as well for better coverage
+        torch::Tensor func_output = torch::nn::functional::relu6(input);
+        
+        if (func_output.defined() && func_output.numel() > 0) {
+            volatile float s = func_output.sum().item<float>();
+            (void)s;
         }
     }
     catch (const std::exception &e)

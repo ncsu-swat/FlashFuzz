@@ -1,75 +1,104 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Flatten input to get total number of elements
+        int64_t numel = input_tensor.numel();
+        if (numel == 0) {
+            return 0; // Can't take from empty tensor
+        }
+        
         // Create indices tensor
         torch::Tensor indices_tensor;
-        if (offset < Size) {
+        if (offset + 4 < Size) {
             indices_tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Ensure indices are integers
-            if (indices_tensor.scalar_type() != torch::kInt64 && 
-                indices_tensor.scalar_type() != torch::kInt32 && 
-                indices_tensor.scalar_type() != torch::kInt16 && 
-                indices_tensor.scalar_type() != torch::kInt8) {
+            // Convert to Int64 for indices
+            if (!indices_tensor.is_floating_point()) {
+                indices_tensor = indices_tensor.to(torch::kInt64);
+            } else {
                 indices_tensor = indices_tensor.to(torch::kInt64);
             }
+            
+            // Clamp indices to valid range [-numel, numel-1]
+            // torch::take treats the input as 1D and uses flattened indices
+            // Negative indices wrap around
+            indices_tensor = indices_tensor.remainder(numel);
         } else {
-            // If we don't have enough data for a second tensor, create a simple indices tensor
-            indices_tensor = torch::tensor({0, 1, -1}, torch::kInt64);
+            // Create a simple indices tensor with valid indices
+            int64_t idx0 = 0;
+            int64_t idx1 = numel > 1 ? 1 : 0;
+            int64_t idx2 = numel > 2 ? -1 : 0; // -1 wraps to last element
+            indices_tensor = torch::tensor({idx0, idx1, idx2}, torch::kInt64);
         }
         
-        // Apply torch.take operation
-        torch::Tensor result;
-        
-        // Try different variants of the take operation
-        if (offset < Size && Data[offset] % 3 == 0) {
-            // Basic take operation
-            result = torch::take(input_tensor, indices_tensor);
-        } else if (offset < Size && Data[offset] % 3 == 1) {
-            // Take along dim if input is not a scalar
-            if (input_tensor.dim() > 0) {
-                int64_t dim = 0;
-                if (offset + 1 < Size) {
-                    dim = static_cast<int64_t>(Data[offset + 1]) % std::max(static_cast<int64_t>(1), input_tensor.dim());
-                }
-                result = torch::take_along_dim(input_tensor, indices_tensor, dim);
-            } else {
-                result = torch::take(input_tensor, indices_tensor);
+        // Inner try-catch for expected exceptions (out of bounds, etc.)
+        try
+        {
+            // torch::take - Returns a new tensor with elements of input at given indices
+            // The input tensor is treated as if it were viewed as a 1-D tensor
+            torch::Tensor result = torch::take(input_tensor, indices_tensor);
+            
+            // Verify result shape matches indices shape
+            // torch::take returns tensor with same shape as indices
+            
+            // Perform operations on result to ensure it's computed
+            auto sum = result.sum();
+            
+            // Prevent compiler optimization
+            if (sum.item<float>() == -12345.6789f) {
+                std::cerr << "Unlikely sum value encountered";
             }
-        } else {
-            // Take with potentially out-of-bounds indices to test edge cases
-            result = torch::take(input_tensor, indices_tensor);
+            
+            // Test with contiguous input
+            if (offset < Size && Data[offset % Size] % 2 == 0) {
+                torch::Tensor contiguous_input = input_tensor.contiguous();
+                torch::Tensor result2 = torch::take(contiguous_input, indices_tensor);
+                auto sum2 = result2.sum();
+                (void)sum2;
+            }
+            
+            // Test with different tensor strides (transposed tensor)
+            if (input_tensor.dim() >= 2 && offset + 1 < Size && Data[(offset + 1) % Size] % 3 == 0) {
+                torch::Tensor transposed = input_tensor.transpose(0, 1);
+                torch::Tensor result3 = torch::take(transposed, indices_tensor);
+                auto sum3 = result3.sum();
+                (void)sum3;
+            }
         }
-        
-        // Perform some operation on the result to ensure it's used
-        auto sum = result.sum();
-        
-        // Prevent compiler from optimizing away the computation
-        if (sum.item<float>() == -12345.6789f) {
-            std::cerr << "Unlikely sum value encountered";
+        catch (const c10::Error &e)
+        {
+            // Expected errors (index out of bounds, etc.) - silently ignore
+        }
+        catch (const std::runtime_error &e)
+        {
+            // Expected runtime errors - silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

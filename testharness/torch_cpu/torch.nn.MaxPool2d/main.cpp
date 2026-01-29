@@ -1,90 +1,106 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least a few bytes for basic parameters
-        if (Size < 8) {
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Parse parameters first so we know what tensor shape we need
+        // Parse kernel size (1-7)
+        int64_t kernel_h = (Data[offset] % 7) + 1;
+        offset++;
+        int64_t kernel_w = (Data[offset] % 7) + 1;
+        offset++;
         
-        // Ensure we have at least 2D tensor for MaxPool2d
-        if (input_tensor.dim() < 2) {
-            // Reshape to at least 2D if needed
-            std::vector<int64_t> new_shape;
-            if (input_tensor.dim() == 0) {
-                // Scalar tensor, reshape to 1x1
-                new_shape = {1, 1};
-            } else if (input_tensor.dim() == 1) {
-                // 1D tensor, reshape to Nx1
-                new_shape = {input_tensor.size(0), 1};
-            }
-            input_tensor = input_tensor.reshape(new_shape);
-        }
+        // Parse stride (1-5)
+        int64_t stride_h = (Data[offset] % 5) + 1;
+        offset++;
+        int64_t stride_w = (Data[offset] % 5) + 1;
+        offset++;
         
-        // Extract parameters for MaxPool2d from the remaining data
-        if (offset + 8 > Size) {
-            return 0;
-        }
+        // Parse padding (0 to kernel_size/2 to ensure valid)
+        int64_t padding_h = Data[offset] % (kernel_h / 2 + 1);
+        offset++;
+        int64_t padding_w = Data[offset] % (kernel_w / 2 + 1);
+        offset++;
         
-        // Parse kernel size
-        int64_t kernel_size = 1;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&kernel_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            // Ensure kernel size is positive and reasonable
-            kernel_size = std::abs(kernel_size) % 7 + 1;
-        }
-        
-        // Parse stride
-        int64_t stride = 1;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&stride, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            // Ensure stride is positive and reasonable
-            stride = std::abs(stride) % 5 + 1;
-        }
-        
-        // Parse padding
-        int64_t padding = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            // Allow padding to be any value including negative
-            padding = padding % 5;
-        }
-        
-        // Parse dilation
-        int64_t dilation = 1;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dilation, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            // Ensure dilation is positive and reasonable
-            dilation = std::abs(dilation) % 3 + 1;
-        }
+        // Parse dilation (1-3)
+        int64_t dilation_h = (Data[offset] % 3) + 1;
+        offset++;
+        int64_t dilation_w = (Data[offset] % 3) + 1;
+        offset++;
         
         // Parse ceil_mode
-        bool ceil_mode = false;
-        if (offset < Size) {
-            ceil_mode = Data[offset++] & 0x1;
+        bool ceil_mode = Data[offset] & 0x1;
+        offset++;
+        
+        // Parse whether to use batched input (4D) or unbatched (3D)
+        bool use_batch = Data[offset] & 0x1;
+        offset++;
+        
+        // Calculate minimum spatial dimensions needed
+        // Output size = floor((input + 2*padding - dilation*(kernel-1) - 1) / stride + 1)
+        // For output >= 1: input >= dilation*(kernel-1) + 1 - 2*padding
+        int64_t min_h = dilation_h * (kernel_h - 1) + 1;
+        int64_t min_w = dilation_w * (kernel_w - 1) + 1;
+        
+        // Add some extra to ensure valid output
+        min_h = std::max(min_h, kernel_h);
+        min_w = std::max(min_w, kernel_w);
+        
+        // Parse batch size and channels
+        int64_t batch_size = (Data[offset] % 4) + 1;
+        offset++;
+        int64_t channels = (Data[offset] % 4) + 1;
+        offset++;
+        
+        // Parse height and width additions (to vary tensor size)
+        int64_t height_add = Data[offset] % 16;
+        offset++;
+        int64_t width_add = Data[offset] % 16;
+        offset++;
+        
+        int64_t height = min_h + height_add;
+        int64_t width = min_w + width_add;
+        
+        // Create input tensor with appropriate dimensions
+        torch::Tensor input_tensor;
+        if (use_batch) {
+            // 4D: (N, C, H, W)
+            input_tensor = torch::randn({batch_size, channels, height, width});
+        } else {
+            // 3D: (C, H, W)
+            input_tensor = torch::randn({channels, height, width});
         }
         
-        // Create MaxPool2d module
+        // Use remaining data to perturb tensor values if available
+        if (offset < Size) {
+            torch::Tensor noise = fuzzer_utils::createTensor(Data, Size, offset);
+            // Just use noise to influence the random state, don't mix directly
+            (void)noise;
+        }
+        
+        // Create MaxPool2d module with 2D kernel/stride/padding/dilation
         torch::nn::MaxPool2d max_pool(
-            torch::nn::MaxPool2dOptions(kernel_size)
-                .stride(stride)
-                .padding(padding)
-                .dilation(dilation)
+            torch::nn::MaxPool2dOptions({kernel_h, kernel_w})
+                .stride({stride_h, stride_w})
+                .padding({padding_h, padding_w})
+                .dilation({dilation_h, dilation_w})
                 .ceil_mode(ceil_mode));
         
         // Apply MaxPool2d to the input tensor
@@ -95,6 +111,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Access some elements to ensure computation happened
             auto sum = output.sum().item<float>();
             (void)sum;  // Prevent unused variable warning
+        }
+        
+        // Also test with return_indices=true
+        torch::nn::MaxPool2d max_pool_indices(
+            torch::nn::MaxPool2dOptions({kernel_h, kernel_w})
+                .stride({stride_h, stride_w})
+                .padding({padding_h, padding_w})
+                .dilation({dilation_h, dilation_w})
+                .ceil_mode(ceil_mode));
+        
+        auto [output_with_indices, indices] = torch::nn::functional::max_pool2d_with_indices(
+            input_tensor,
+            torch::nn::functional::MaxPool2dFuncOptions({kernel_h, kernel_w})
+                .stride({stride_h, stride_w})
+                .padding({padding_h, padding_w})
+                .dilation({dilation_h, dilation_w})
+                .ceil_mode(ceil_mode));
+        
+        // Verify indices are valid
+        if (indices.numel() > 0) {
+            auto max_idx = indices.max().item<int64_t>();
+            (void)max_idx;
         }
     }
     catch (const std::exception &e)

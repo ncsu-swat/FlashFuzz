@@ -1,118 +1,107 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
+    // This API requires CUDA with cuDNN support
+    if (!torch::cuda::is_available() || !torch::cuda::cudnn_is_available()) {
+        // Cannot test this API without CUDA+cuDNN
+        return 0;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Check if we have enough data to proceed
-        if (Size < 4) {
+        // Need enough data for parameters
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Parse convolution parameters from fuzzer data
+        int64_t batch_size = static_cast<int64_t>(Data[offset++]) % 4 + 1;
+        int64_t in_channels = static_cast<int64_t>(Data[offset++]) % 16 + 1;
+        int64_t out_channels = static_cast<int64_t>(Data[offset++]) % 16 + 1;
+        int64_t height = static_cast<int64_t>(Data[offset++]) % 32 + 4;
+        int64_t width = static_cast<int64_t>(Data[offset++]) % 32 + 4;
+        int64_t kernel_h = static_cast<int64_t>(Data[offset++]) % 5 + 1;
+        int64_t kernel_w = static_cast<int64_t>(Data[offset++]) % 5 + 1;
+        int64_t stride_h = static_cast<int64_t>(Data[offset++]) % 3 + 1;
+        int64_t stride_w = static_cast<int64_t>(Data[offset++]) % 3 + 1;
+        int64_t padding_h = static_cast<int64_t>(Data[offset++]) % 3;
+        int64_t padding_w = static_cast<int64_t>(Data[offset++]) % 3;
+        int64_t dilation_h = static_cast<int64_t>(Data[offset++]) % 2 + 1;
+        int64_t dilation_w = static_cast<int64_t>(Data[offset++]) % 2 + 1;
         
-        // Create weight tensor
-        torch::Tensor weight;
-        if (offset < Size) {
-            weight = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a compatible weight tensor
-            auto options = torch::TensorOptions().dtype(input.dtype());
-            weight = torch::ones({1, input.size(0), 1, 1}, options);
+        // Groups must divide both in_channels and out_channels
+        int64_t groups = static_cast<int64_t>(Data[offset++]) % 4 + 1;
+        // Adjust groups to be a common divisor
+        while (groups > 1 && (in_channels % groups != 0 || out_channels % groups != 0)) {
+            groups--;
         }
         
-        // Parse convolution parameters from remaining data
-        int64_t stride_h = 1, stride_w = 1;
-        int64_t padding_h = 0, padding_w = 0;
-        int64_t dilation_h = 1, dilation_w = 1;
-        int64_t groups = 1;
+        bool use_bias = (Data[offset++] % 2) == 1;
+        uint8_t dtype_selector = Data[offset++] % 2;
         
-        if (offset + 7 <= Size) {
-            stride_h = static_cast<int64_t>(Data[offset++]) % 4 + 1;
-            stride_w = static_cast<int64_t>(Data[offset++]) % 4 + 1;
-            padding_h = static_cast<int64_t>(Data[offset++]) % 3;
-            padding_w = static_cast<int64_t>(Data[offset++]) % 3;
-            dilation_h = static_cast<int64_t>(Data[offset++]) % 3 + 1;
-            dilation_w = static_cast<int64_t>(Data[offset++]) % 3 + 1;
-            groups = static_cast<int64_t>(Data[offset++]) % 4 + 1;
+        // Select dtype (cuDNN conv supports float and half)
+        auto dtype = (dtype_selector == 0) ? torch::kFloat32 : torch::kFloat16;
+        auto options = torch::TensorOptions().dtype(dtype).device(torch::kCUDA);
+        
+        // Create input tensor: (N, C_in, H, W)
+        torch::Tensor input = torch::randn({batch_size, in_channels, height, width}, options);
+        
+        // Create weight tensor: (C_out, C_in/groups, kH, kW)
+        torch::Tensor weight = torch::randn({out_channels, in_channels / groups, kernel_h, kernel_w}, options);
+        
+        // Optional bias tensor: (C_out,)
+        c10::optional<torch::Tensor> bias = c10::nullopt;
+        if (use_bias) {
+            bias = torch::randn({out_channels}, options);
         }
         
-        // Ensure tensors are on CUDA if available
-        if (torch::cuda::is_available()) {
-            input = input.cuda();
-            weight = weight.cuda();
-        }
-        
-        // Ensure input and weight have proper dimensions for convolution
-        if (input.dim() < 3) {
-            // Reshape to at least 3D tensor (N, C, D)
-            std::vector<int64_t> new_shape;
-            if (input.dim() == 0) {
-                new_shape = {1, 1, 1};
-            } else if (input.dim() == 1) {
-                new_shape = {1, 1, input.size(0)};
-            } else { // dim == 2
-                new_shape = {1, input.size(0), input.size(1)};
-            }
-            input = input.reshape(new_shape);
-        }
-        
-        if (weight.dim() < 4) {
-            // Reshape to 4D tensor (out_channels, in_channels/groups, kH, kW)
-            std::vector<int64_t> new_shape;
-            if (weight.dim() == 0) {
-                new_shape = {1, 1, 1, 1};
-            } else if (weight.dim() == 1) {
-                new_shape = {1, 1, 1, weight.size(0)};
-            } else if (weight.dim() == 2) {
-                new_shape = {1, 1, weight.size(0), weight.size(1)};
-            } else { // dim == 3
-                new_shape = {1, weight.size(0), weight.size(1), weight.size(2)};
-            }
-            weight = weight.reshape(new_shape);
-        }
-        
-        // Ensure weight's in_channels is compatible with input's channels and groups
-        int64_t in_channels = input.size(1);
-        if (weight.size(1) * groups != in_channels) {
-            // Adjust groups to be compatible
-            if (in_channels > 0) {
-                groups = std::gcd(in_channels, weight.size(1));
-                if (groups == 0) groups = 1;
-            } else {
-                groups = 1;
-            }
-        }
-        
-        // Create stride, padding, and dilation vectors
         std::vector<int64_t> stride = {stride_h, stride_w};
         std::vector<int64_t> padding = {padding_h, padding_w};
         std::vector<int64_t> dilation = {dilation_h, dilation_w};
         
-        // Apply cudnn_convolution_relu with bias parameter (set to nullopt)
+        // Validate that output size would be positive
+        int64_t out_h = (height + 2 * padding_h - dilation_h * (kernel_h - 1) - 1) / stride_h + 1;
+        int64_t out_w = (width + 2 * padding_w - dilation_w * (kernel_w - 1) - 1) / stride_w + 1;
+        
+        if (out_h <= 0 || out_w <= 0) {
+            // Invalid configuration, skip
+            return 0;
+        }
+        
+        // Call the API under test
         torch::Tensor output = torch::cudnn_convolution_relu(
-            input, weight, std::nullopt,
+            input, weight, bias,
             stride, padding, dilation, groups
         );
         
-        // Use the output to prevent optimization from removing the operation
+        // Use the output to prevent optimization
         if (output.defined()) {
             volatile float sum = output.sum().item<float>();
+            (void)sum;
         }
         
         return 0;
     }
+    catch (const c10::Error &e)
+    {
+        // PyTorch/c10 errors (shape mismatches, cuDNN errors, etc.)
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return -1;
+    }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

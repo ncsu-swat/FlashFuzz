@@ -1,125 +1,117 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create sparse matrix in hybrid format
-        torch::Tensor indices;
-        torch::Tensor values;
+        size_t offset = 0;
         
-        // Create indices tensor (2xN format for COO sparse matrix)
-        if (offset < Size) {
-            indices = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure indices has correct shape for sparse matrix (2 x nnz)
-            if (indices.dim() == 2 && indices.size(0) == 2) {
-                // Valid shape for indices
-            } else if (indices.dim() >= 1) {
-                // Reshape to make it valid for sparse indices
-                int64_t nnz = indices.numel() / 2;
-                if (nnz > 0) {
-                    indices = indices.reshape({2, nnz});
-                } else {
-                    indices = torch::zeros({2, 1}, indices.options());
-                }
+        // Extract dimensions from fuzzer data
+        int64_t sparse_rows = static_cast<int64_t>(Data[offset++] % 16) + 1;
+        int64_t sparse_cols = static_cast<int64_t>(Data[offset++] % 16) + 1;
+        int64_t dense_cols = static_cast<int64_t>(Data[offset++] % 16) + 1;
+        int64_t nnz = static_cast<int64_t>(Data[offset++] % 8) + 1;
+        
+        // Create indices for sparse COO tensor (2 x nnz)
+        // Row indices must be in [0, sparse_rows) and col indices in [0, sparse_cols)
+        std::vector<int64_t> row_indices(nnz);
+        std::vector<int64_t> col_indices(nnz);
+        
+        for (int64_t i = 0; i < nnz && offset < Size; i++) {
+            row_indices[i] = static_cast<int64_t>(Data[offset++] % sparse_rows);
+            if (offset < Size) {
+                col_indices[i] = static_cast<int64_t>(Data[offset++] % sparse_cols);
             } else {
-                // Create minimal valid indices tensor
-                indices = torch::zeros({2, 1}, indices.options().dtype(torch::kLong));
+                col_indices[i] = 0;
             }
-            
-            // Ensure indices are integers
-            if (indices.scalar_type() != torch::kLong) {
-                indices = indices.to(torch::kLong);
-            }
-        } else {
-            // Default indices if we don't have enough data
-            indices = torch::zeros({2, 1}, torch::kLong);
         }
+        
+        torch::Tensor indices = torch::stack({
+            torch::tensor(row_indices, torch::kLong),
+            torch::tensor(col_indices, torch::kLong)
+        });
         
         // Create values tensor
+        torch::Tensor values;
         if (offset < Size) {
             values = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure values has correct shape (nnz)
-            if (values.dim() == 1 && values.size(0) == indices.size(1)) {
-                // Valid shape for values
+            // Reshape to match nnz
+            if (values.numel() >= nnz) {
+                values = values.flatten().slice(0, 0, nnz);
             } else {
-                // Reshape to match indices
-                int64_t nnz = indices.size(1);
-                if (values.numel() >= nnz) {
-                    values = values.reshape({nnz});
-                } else {
-                    // If values has fewer elements than needed, create a new tensor
-                    values = torch::ones({nnz}, values.options());
-                }
+                values = torch::ones({nnz}, torch::kFloat);
+            }
+            // Ensure float type for values
+            if (!values.is_floating_point()) {
+                values = values.to(torch::kFloat);
             }
         } else {
-            // Default values if we don't have enough data
-            values = torch::ones({indices.size(1)}, torch::kFloat);
+            values = torch::randn({nnz}, torch::kFloat);
         }
         
-        // Create dense matrix
-        torch::Tensor mat2;
-        if (offset < Size) {
-            mat2 = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure mat2 has at least 2 dimensions for matrix multiplication
-            if (mat2.dim() < 2) {
-                mat2 = mat2.reshape({1, mat2.numel()});
-            }
-        } else {
-            // Default dense matrix if we don't have enough data
-            mat2 = torch::ones({1, 1}, torch::kFloat);
+        // Ensure values is 1D with size nnz
+        values = values.flatten();
+        if (values.size(0) != nnz) {
+            values = torch::randn({nnz}, torch::kFloat);
         }
         
-        // Get sparse matrix dimensions
-        int64_t sparse_dim = 0;
-        int64_t dense_dim = 0;
-        
-        if (offset + 2 <= Size) {
-            sparse_dim = static_cast<int64_t>(Data[offset++]) % 10 + 1;
-            dense_dim = static_cast<int64_t>(Data[offset++]) % 10 + 1;
-        } else {
-            sparse_dim = 2;
-            dense_dim = 1;
-        }
-        
-        // Create sparse tensor in hybrid format
-        torch::Tensor sparse_tensor = torch::sparse_coo_tensor(
-            indices, 
+        // Create sparse COO tensor
+        torch::Tensor sparse_mat = torch::sparse_coo_tensor(
+            indices,
             values,
-            {sparse_dim, dense_dim, mat2.size(0)},
+            {sparse_rows, sparse_cols},
             values.options()
-        );
+        ).coalesce();  // hspmm may require coalesced sparse tensor
         
-        // Convert to hybrid sparse matrix format
-        torch::Tensor hybrid_sparse = sparse_tensor._to_sparse_csr();
-        
-        // Apply hspmm operation
-        torch::Tensor result = torch::hspmm(hybrid_sparse, mat2);
-        
-        // Optionally test the result
-        if (!result.isfinite().all().item<bool>()) {
-            // This is not an error, just an observation
+        // Create dense matrix with compatible dimensions (sparse_cols x dense_cols)
+        torch::Tensor dense_mat;
+        if (offset < Size) {
+            dense_mat = fuzzer_utils::createTensor(Data, Size, offset);
+            // Ensure float type
+            if (!dense_mat.is_floating_point()) {
+                dense_mat = dense_mat.to(torch::kFloat);
+            }
+        } else {
+            dense_mat = torch::randn({sparse_cols, dense_cols}, torch::kFloat);
         }
+        
+        // Reshape dense_mat to be compatible: (sparse_cols, dense_cols)
+        if (dense_mat.dim() < 2) {
+            dense_mat = dense_mat.reshape({sparse_cols, -1});
+        }
+        
+        // Ensure dense_mat has sparse_cols rows
+        if (dense_mat.size(0) != sparse_cols) {
+            // Create compatible dense matrix
+            int64_t actual_cols = dense_mat.numel() / sparse_cols;
+            if (actual_cols < 1) actual_cols = 1;
+            dense_mat = torch::randn({sparse_cols, actual_cols}, torch::kFloat);
+        }
+        
+        // Apply hspmm: sparse @ dense
+        // hspmm expects sparse in COO format
+        torch::Tensor result = torch::hspmm(sparse_mat, dense_mat);
+        
+        // Verify result shape
+        (void)result.sizes();
         
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

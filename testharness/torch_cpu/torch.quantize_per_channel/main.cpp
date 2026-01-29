@@ -1,11 +1,14 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,42 +21,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create scales tensor (1D tensor of float values)
-        torch::Tensor scales;
-        if (offset < Size) {
-            scales = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure scales is 1D and has positive values
-            if (scales.dim() > 0) {
-                scales = scales.abs().reshape({scales.numel()});
-            } else {
-                scales = torch::ones({1});
-            }
-        } else {
-            scales = torch::ones({1});
+        // Skip empty or scalar tensors - quantize_per_channel needs at least 1D
+        if (input_tensor.dim() == 0 || input_tensor.numel() == 0) {
+            return 0;
         }
         
-        // Create zero_points tensor (1D tensor of int values)
-        torch::Tensor zero_points;
-        if (offset < Size) {
-            zero_points = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure zero_points is 1D and has integer values
-            if (zero_points.dim() > 0) {
-                zero_points = zero_points.reshape({zero_points.numel()}).to(torch::kInt);
-            } else {
-                zero_points = torch::zeros({1}, torch::kInt);
-            }
-        } else {
-            zero_points = torch::zeros({1}, torch::kInt);
-        }
+        // Convert input to float (required for quantization)
+        input_tensor = input_tensor.to(torch::kFloat);
         
-        // Get axis parameter (must be in range [-input_tensor.dim(), input_tensor.dim()-1])
+        // Get axis parameter (must be valid for the tensor dimensions)
         int64_t axis = 0;
-        if (offset < Size && input_tensor.dim() > 0) {
+        if (offset < Size) {
             uint8_t axis_byte = Data[offset++];
-            axis = static_cast<int64_t>(axis_byte) % (2 * input_tensor.dim()) - input_tensor.dim();
+            axis = static_cast<int64_t>(axis_byte % input_tensor.dim());
         }
         
-        // Get dtype
+        // Get the size along the quantization axis
+        int64_t axis_size = input_tensor.size(axis);
+        if (axis_size == 0) {
+            return 0;
+        }
+        
+        // Get dtype for quantization
         torch::ScalarType dtype = torch::kQUInt8;
         if (offset < Size) {
             uint8_t dtype_byte = Data[offset++];
@@ -64,33 +53,35 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Ensure scales and zero_points have the right size for the specified axis
-        if (input_tensor.dim() > 0) {
-            int64_t axis_size = input_tensor.size(axis < 0 ? axis + input_tensor.dim() : axis);
-            
-            if (scales.numel() != axis_size) {
-                scales = scales.numel() > 0 ? 
-                    scales.index({torch::indexing::Slice(0, scales.numel())}).repeat(axis_size / scales.numel() + 1).index({torch::indexing::Slice(0, axis_size)}) :
-                    torch::ones({axis_size});
+        // Create scales tensor - must be 1D float with size matching axis_size
+        // Scales must be positive
+        torch::Tensor scales = torch::empty({axis_size}, torch::kFloat);
+        for (int64_t i = 0; i < axis_size; i++) {
+            float scale_val = 0.01f; // default
+            if (offset < Size) {
+                // Generate scale in range (0, 10]
+                scale_val = (static_cast<float>(Data[offset++]) / 255.0f) * 9.99f + 0.01f;
             }
-            
-            if (zero_points.numel() != axis_size) {
-                zero_points = zero_points.numel() > 0 ?
-                    zero_points.index({torch::indexing::Slice(0, zero_points.numel())}).repeat(axis_size / zero_points.numel() + 1).index({torch::indexing::Slice(0, axis_size)}) :
-                    torch::zeros({axis_size}, torch::kInt);
-            }
+            scales[i] = scale_val;
         }
         
-        // Apply quantize_per_channel
-        torch::Tensor quantized;
-        
-        // Convert input to float if needed
-        if (input_tensor.scalar_type() != torch::kFloat) {
-            input_tensor = input_tensor.to(torch::kFloat);
+        // Create zero_points tensor - must be 1D int64 with size matching axis_size
+        // For kQUInt8: range [0, 255], for kQInt8: range [-128, 127]
+        torch::Tensor zero_points = torch::empty({axis_size}, torch::kLong);
+        for (int64_t i = 0; i < axis_size; i++) {
+            int64_t zp_val = 0;
+            if (offset < Size) {
+                if (dtype == torch::kQUInt8) {
+                    zp_val = static_cast<int64_t>(Data[offset++]); // [0, 255]
+                } else {
+                    zp_val = static_cast<int64_t>(Data[offset++]) - 128; // [-128, 127]
+                }
+            }
+            zero_points[i] = zp_val;
         }
         
         // Call quantize_per_channel
-        quantized = torch::quantize_per_channel(
+        torch::Tensor quantized = torch::quantize_per_channel(
             input_tensor,
             scales,
             zero_points,
@@ -98,15 +89,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             dtype
         );
         
-        // Test dequantization as well
+        // Test dequantization to exercise more code paths
         torch::Tensor dequantized = quantized.dequantize();
         
-        return 0; // keep the input
+        // Verify the result has expected properties
+        (void)quantized.q_per_channel_scales();
+        (void)quantized.q_per_channel_zero_points();
+        (void)quantized.q_per_channel_axis();
+        
+        return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

@@ -1,125 +1,164 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create index tensor with appropriate dtype (long)
+        // Skip if input is too small or has no dimensions
+        if (input.numel() == 0 || input.dim() == 0) {
+            return 0;
+        }
+        
+        // Get a dimension to scatter along (must be valid)
+        int64_t dim = 0;
+        if (offset < Size) {
+            dim = static_cast<int64_t>(Data[offset++]) % input.dim();
+        }
+        
+        // Get the size along the scatter dimension
+        int64_t dim_size = input.size(dim);
+        if (dim_size == 0) {
+            return 0;
+        }
+        
+        // Create index tensor with same shape as input but with valid indices
+        // Index values must be in range [0, dim_size) for the scatter dimension
         torch::Tensor index;
         if (offset < Size) {
             index = fuzzer_utils::createTensor(Data, Size, offset);
-            // Convert index to long dtype as required by scatter
-            index = index.to(torch::kLong);
-        } else {
-            // If we don't have enough data, create a simple index tensor
-            if (input.dim() > 0) {
-                index = torch::zeros_like(input, torch::kLong);
-            } else {
-                // For scalar input, create a simple index
-                index = torch::zeros({1}, torch::kLong);
+            // Ensure index has same number of dimensions as input
+            while (index.dim() < input.dim()) {
+                index = index.unsqueeze(0);
             }
+            while (index.dim() > input.dim()) {
+                index = index.squeeze(0);
+                if (index.dim() == 0) {
+                    index = index.unsqueeze(0);
+                    break;
+                }
+            }
+            // Convert to long and clamp to valid range
+            index = index.to(torch::kLong).abs();
+            index = index.remainder(dim_size);
+        } else {
+            index = torch::zeros_like(input, torch::kLong);
         }
         
-        // Create src tensor
+        // Create src tensor - must broadcast to index shape
         torch::Tensor src;
         if (offset < Size) {
             src = fuzzer_utils::createTensor(Data, Size, offset);
+            // Try to make src compatible with index shape
+            src = src.to(input.dtype());
         } else {
-            // If we don't have enough data, create a simple src tensor
             src = torch::ones_like(input);
         }
         
-        // Get a dimension to scatter along
-        int64_t dim = 0;
-        if (input.dim() > 0 && offset < Size) {
-            // Use some bytes from the input to determine the dimension
-            dim = static_cast<int64_t>(Data[offset++]) % std::max(static_cast<int64_t>(1), input.dim());
+        // Get operation selector
+        uint8_t op_selector = 0;
+        if (offset < Size) {
+            op_selector = Data[offset++];
         }
         
-        // Try different scatter operations
+        // Try scatter (out-of-place)
+        try {
+            torch::Tensor result = input.scatter(dim, index, src);
+        } catch (const std::exception&) {
+            // Expected for some invalid input combinations
+        }
+        
+        // Try scatter with scalar value
+        try {
+            double value = 1.0;
+            if (offset + sizeof(float) <= Size) {
+                float fval;
+                std::memcpy(&fval, Data + offset, sizeof(float));
+                offset += sizeof(float);
+                // Avoid NaN/Inf
+                if (std::isfinite(fval)) {
+                    value = static_cast<double>(fval);
+                }
+            }
+            torch::Tensor result = input.scatter(dim, index, value);
+        } catch (const std::exception&) {
+            // Expected for some invalid input combinations
+        }
+        
+        // Try scatter_ (in-place)
+        try {
+            torch::Tensor input_copy = input.clone();
+            input_copy.scatter_(dim, index, src);
+        } catch (const std::exception&) {
+            // Expected for some invalid input combinations
+        }
+        
+        // Try scatter_ with scalar value (in-place)
+        try {
+            double value = 2.0;
+            if (offset + sizeof(float) <= Size) {
+                float fval;
+                std::memcpy(&fval, Data + offset, sizeof(float));
+                offset += sizeof(float);
+                if (std::isfinite(fval)) {
+                    value = static_cast<double>(fval);
+                }
+            }
+            torch::Tensor input_copy = input.clone();
+            input_copy.scatter_(dim, index, value);
+        } catch (const std::exception&) {
+            // Expected for some invalid input combinations
+        }
+        
+        // Try different reduction modes
         if (offset < Size) {
-            uint8_t op_selector = Data[offset++];
+            uint8_t reduce_selector = Data[offset++] % 3;
             
-            // Try scatter
-            try {
-                torch::Tensor result = input.scatter(dim, index, src);
-            } catch (const std::exception&) {
-                // Catch and continue - we expect some invalid inputs
-            }
-            
-            // Try scatter with scalar value
-            try {
-                double value = 1.0;
-                if (offset + sizeof(double) <= Size) {
-                    std::memcpy(&value, Data + offset, sizeof(double));
-                    offset += sizeof(double);
-                }
-                torch::Tensor result = input.scatter(dim, index, value);
-            } catch (const std::exception&) {
-                // Catch and continue
-            }
-            
-            // Try scatter_ (in-place)
+            // Test "add" reduction
             try {
                 torch::Tensor input_copy = input.clone();
-                input_copy.scatter_(dim, index, src);
+                input_copy.scatter_(dim, index, src, "add");
             } catch (const std::exception&) {
-                // Catch and continue
+                // Expected for some invalid input combinations
             }
             
-            // Try scatter_ with scalar value (in-place)
+            // Test "multiply" reduction  
             try {
-                double value = 1.0;
-                if (offset + sizeof(double) <= Size) {
-                    std::memcpy(&value, Data + offset, sizeof(double));
-                    offset += sizeof(double);
-                }
                 torch::Tensor input_copy = input.clone();
-                input_copy.scatter_(dim, index, value);
+                input_copy.scatter_(dim, index, src, "multiply");
             } catch (const std::exception&) {
-                // Catch and continue
+                // Expected for some invalid input combinations
             }
-            
-            // Try different reduction modes if we have more data
-            if (offset < Size) {
-                uint8_t reduce_selector = Data[offset++] % 3;
-                std::string reduce_mode;
-                
-                switch (reduce_selector) {
-                    case 0: reduce_mode = "add"; break;
-                    case 1: reduce_mode = "multiply"; break;
-                    default: reduce_mode = ""; break;
-                }
-                
-                if (!reduce_mode.empty()) {
-                    try {
-                        torch::Tensor input_copy = input.clone();
-                        input_copy.scatter_(dim, index, src, reduce_mode);
-                    } catch (const std::exception&) {
-                        // Catch and continue
-                    }
-                }
-            }
+        }
+        
+        // Also test torch::scatter function (not just method)
+        try {
+            torch::Tensor result = torch::scatter(input, dim, index, src);
+        } catch (const std::exception&) {
+            // Expected for some invalid input combinations
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

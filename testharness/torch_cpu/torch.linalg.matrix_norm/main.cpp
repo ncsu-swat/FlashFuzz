@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <ATen/ops/linalg_matrix_norm.h>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,12 +21,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor - use float for norm computation
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        // Convert to float if not already a floating point type
+        if (!input.is_floating_point() && !input.is_complex()) {
+            input = input.to(torch::kFloat32);
+        }
         
         // Ensure tensor has at least 2 dimensions for matrix_norm
         if (input.dim() < 2) {
-            // Add dimensions if needed
             if (input.dim() == 0) {
                 input = input.unsqueeze(0).unsqueeze(0);
             } else if (input.dim() == 1) {
@@ -30,48 +40,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Get remaining bytes for norm parameters
         if (offset >= Size) {
-            offset = 0; // Reset if we've consumed all data
+            offset = 0;
         }
         
-        // Parse norm type (1, 2, inf, -inf, 'fro', 'nuc')
+        // Parse norm type selector
         uint8_t norm_selector = (offset < Size) ? Data[offset++] : 0;
-        std::vector<std::string> norm_types = {"fro", "nuc"};
-        std::vector<double> norm_values = {1.0, 2.0, INFINITY, -INFINITY};
         
-        // Choose norm type based on selector
-        c10::optional<torch::Scalar> norm;
-        std::string norm_str;
-        if (norm_selector % 2 == 0) {
-            // Use string norm type
-            norm_str = norm_types[norm_selector % norm_types.size()];
-            norm = c10::nullopt; // Will use string version
-        } else {
-            // Use numeric norm type
-            double norm_val = norm_values[(norm_selector / 2) % norm_values.size()];
-            norm = torch::Scalar(norm_val);
-        }
-        
-        // Parse dim parameter
+        // Parse dim parameter - must be a 2-tuple for matrix_norm
         std::vector<int64_t> dim;
         if (offset < Size) {
             uint8_t dim_selector = Data[offset++];
             if (dim_selector % 3 == 0) {
-                // Use (-2, -1) dims
                 dim = {-2, -1};
             } else if (dim_selector % 3 == 1) {
-                // Use last two dimensions
                 int64_t last_dim = input.dim() - 1;
                 int64_t second_last_dim = std::max(0L, last_dim - 1);
                 dim = {second_last_dim, last_dim};
             } else {
-                // Use first two dimensions
                 dim = {0, std::min(1L, static_cast<int64_t>(input.dim() - 1))};
             }
         } else {
-            // Default to last two dimensions
-            int64_t last_dim = input.dim() - 1;
-            int64_t second_last_dim = std::max(0L, last_dim - 1);
-            dim = {second_last_dim, last_dim};
+            dim = {-2, -1};
         }
         
         // Parse keepdim parameter
@@ -84,69 +73,63 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         c10::optional<torch::ScalarType> dtype = c10::nullopt;
         if (offset < Size) {
             uint8_t dtype_selector = Data[offset++];
-            if (dtype_selector % 3 != 0) { // 2/3 chance to use a dtype
-                dtype = fuzzer_utils::parseDataType(dtype_selector);
+            if (dtype_selector % 4 == 1) {
+                dtype = torch::kFloat32;
+            } else if (dtype_selector % 4 == 2) {
+                dtype = torch::kFloat64;
             }
+            // else leave as nullopt
         }
         
-        // Apply matrix_norm operation
         torch::Tensor result;
         
-        // Try different combinations of parameters
-        if (offset < Size) {
-            uint8_t param_selector = Data[offset++];
-            
-            switch (param_selector % 4) {
+        // Call different variants based on norm_selector
+        // Use at::linalg_matrix_norm which is the C++ ATen function
+        try {
+            switch (norm_selector % 6) {
                 case 0:
-                    // Basic call with norm only
-                    if (norm.has_value()) {
-                        result = torch::matrix_norm(input, norm.value());
-                    } else {
-                        result = torch::matrix_norm(input, norm_str);
-                    }
+                    // Frobenius norm (string version)
+                    result = at::linalg_matrix_norm(input, "fro", dim, keepdim, dtype);
                     break;
                 case 1:
-                    // With norm and dim
-                    if (norm.has_value()) {
-                        result = torch::matrix_norm(input, norm.value(), dim);
-                    } else {
-                        result = torch::matrix_norm(input, norm_str, dim);
-                    }
+                    // Nuclear norm (string version)
+                    result = at::linalg_matrix_norm(input, "nuc", dim, keepdim, dtype);
                     break;
                 case 2:
-                    // With norm, dim, and keepdim
-                    if (norm.has_value()) {
-                        result = torch::matrix_norm(input, norm.value(), dim, keepdim);
-                    } else {
-                        result = torch::matrix_norm(input, norm_str, dim, keepdim);
-                    }
+                    // 1-norm (numeric)
+                    result = at::linalg_matrix_norm(input, 1.0, dim, keepdim, dtype);
                     break;
                 case 3:
-                    // With all parameters
-                    if (norm.has_value()) {
-                        result = torch::matrix_norm(input, norm.value(), dim, keepdim, dtype);
-                    } else {
-                        result = torch::matrix_norm(input, norm_str, dim, keepdim, dtype);
-                    }
+                    // 2-norm (numeric)
+                    result = at::linalg_matrix_norm(input, 2.0, dim, keepdim, dtype);
+                    break;
+                case 4:
+                    // Inf-norm (numeric)
+                    result = at::linalg_matrix_norm(input, INFINITY, dim, keepdim, dtype);
+                    break;
+                case 5:
+                    // -Inf-norm (numeric)
+                    result = at::linalg_matrix_norm(input, -INFINITY, dim, keepdim, dtype);
                     break;
             }
-        } else {
-            // Default call if we've consumed all data
-            if (norm.has_value()) {
-                result = torch::matrix_norm(input, norm.value());
-            } else {
-                result = torch::matrix_norm(input, norm_str);
-            }
+        } catch (const c10::Error&) {
+            // Expected failures for invalid inputs (e.g., shape mismatches)
+            return 0;
+        } catch (const std::runtime_error&) {
+            // Expected failures
+            return 0;
         }
         
-        // Verify result is not empty
-        if (result.numel() == 0) {
-            throw std::runtime_error("Result tensor is empty");
+        // Basic validation
+        if (result.defined() && result.numel() > 0) {
+            // Access the result to ensure computation completed
+            (void)result.sum().item<float>();
         }
     }
     catch (const std::exception &e)
     {
-        return 0; // keep the input
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

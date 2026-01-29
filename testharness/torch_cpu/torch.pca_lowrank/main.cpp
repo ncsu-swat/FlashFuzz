@@ -1,76 +1,127 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least a few bytes for basic tensor creation
-        if (Size < 4) {
+        // Need enough bytes for tensor creation and parameters
+        if (Size < 8) {
             return 0;
         }
+
+        size_t offset = 0;
+
+        // Extract matrix dimensions from fuzzer data
+        // PCA lowrank requires a 2D input tensor (matrix)
+        uint8_t rows_byte = Data[offset++];
+        uint8_t cols_byte = Data[offset++];
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for pca_lowrank if there's more data
-        int64_t q = 6; // Default value
-        bool center = false;
-        bool compute_uv = true;
-        
-        if (offset + 3 <= Size) {
-            // Extract q parameter (number of principal components)
-            uint8_t q_byte = Data[offset++];
-            q = static_cast<int64_t>(q_byte) % 10 + 1; // Keep q reasonable (1-10)
-            
-            // Extract boolean parameters
-            center = Data[offset++] & 0x1;
-            compute_uv = Data[offset++] & 0x1;
+        // Ensure reasonable dimensions (at least 2x2, at most 64x64 for performance)
+        int64_t rows = (rows_byte % 63) + 2;  // 2-64
+        int64_t cols = (cols_byte % 63) + 2;  // 2-64
+
+        // Extract parameters
+        uint8_t q_byte = Data[offset++];
+        int64_t min_dim = std::min(rows, cols);
+        int64_t q = (q_byte % (min_dim - 1)) + 1;  // q must be in [1, min(rows, cols)-1]
+
+        bool center = Data[offset++] & 0x1;
+
+        // Create a 2D tensor for PCA
+        torch::Tensor input;
+        if (offset < Size) {
+            // Use remaining data to seed tensor values
+            size_t remaining = Size - offset;
+            std::vector<float> values(rows * cols);
+            for (int64_t i = 0; i < rows * cols; i++) {
+                values[i] = static_cast<float>(Data[offset + (i % remaining)]) / 255.0f - 0.5f;
+            }
+            input = torch::from_blob(values.data(), {rows, cols}, torch::kFloat32).clone();
+        } else {
+            input = torch::randn({rows, cols});
         }
-        
-        // Call pca_lowrank
+
+        // Ensure input is float type and requires grad for better coverage
+        input = input.to(torch::kFloat32);
+
+        // Call torch::pca_lowrank
         try {
-            auto result = torch::linalg_pca_lowrank(input, q, center, compute_uv);
-            
+            auto result = torch::pca_lowrank(input, q, center);
+
             // Unpack the result (U, S, V)
             auto U = std::get<0>(result);
             auto S = std::get<1>(result);
             auto V = std::get<2>(result);
-            
-            // Perform some basic operations on the results to ensure they're used
-            if (compute_uv) {
-                auto reconstructed = U.matmul(torch::diag(S)).matmul(V.transpose(0, 1));
-                auto diff = torch::norm(reconstructed - input);
-            } else {
-                auto norm_S = torch::norm(S);
-            }
+
+            // Basic sanity checks on output shapes
+            auto u_sum = U.sum();
+            auto s_sum = S.sum();
+            auto v_sum = V.sum();
+
+            // Try reconstruction to exercise more code paths
+            auto reconstructed = torch::matmul(U, torch::matmul(torch::diag(S), V.t()));
+            auto reconstruction_error = torch::norm(reconstructed - input);
+
         } catch (const c10::Error& e) {
-            // Catch PyTorch-specific errors but don't discard the input
-            return 0;
+            // Expected failures due to invalid inputs - silently ignore
+        } catch (const std::runtime_error& e) {
+            // Expected failures - silently ignore
         }
-        
-        // Try with different parameters if there's enough data
-        if (offset + 1 <= Size) {
-            bool new_center = Data[offset++] & 0x1;
-            
+
+        // Try with different q values if we have more data
+        if (offset + 1 < Size) {
+            uint8_t q2_byte = Data[offset++];
+            int64_t q2 = (q2_byte % (min_dim - 1)) + 1;
+            bool center2 = (offset < Size) ? (Data[offset++] & 0x1) : !center;
+
             try {
-                // Call with different parameters
-                auto result2 = torch::linalg_pca_lowrank(input, q, new_center, !compute_uv);
+                auto result2 = torch::pca_lowrank(input, q2, center2);
+                auto U2 = std::get<0>(result2);
+                auto S2 = std::get<1>(result2);
             } catch (const c10::Error& e) {
-                // Catch PyTorch-specific errors but don't discard the input
-                return 0;
+                // Expected failures - silently ignore
+            } catch (const std::runtime_error& e) {
+                // Expected failures - silently ignore
+            }
+        }
+
+        // Test with batched input for additional coverage
+        if (offset + 1 < Size) {
+            uint8_t batch_byte = Data[offset++];
+            int64_t batch_size = (batch_byte % 3) + 1;  // 1-3 batches
+            
+            // Create smaller batched input
+            int64_t small_rows = std::min(rows, (int64_t)16);
+            int64_t small_cols = std::min(cols, (int64_t)16);
+            int64_t small_q = std::min(q, std::min(small_rows, small_cols) - 1);
+            if (small_q < 1) small_q = 1;
+            
+            torch::Tensor batched_input = torch::randn({batch_size, small_rows, small_cols});
+
+            try {
+                auto batched_result = torch::pca_lowrank(batched_input, small_q, center);
+                auto U_batch = std::get<0>(batched_result);
+            } catch (const c10::Error& e) {
+                // Expected failures - silently ignore
+            } catch (const std::runtime_error& e) {
+                // Expected failures - silently ignore
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstdint>        // For uint64_t
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -41,30 +47,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Try with broadcasting if tensors have compatible shapes
-        if (offset < Size && offset + 1 <= Size) {
+        if (offset + 2 <= Size) {
             uint8_t use_broadcasting = Data[offset++];
+            uint8_t dim_selector = Data[offset++];
             
-            if (use_broadcasting % 2 == 0) {
+            if (use_broadcasting % 2 == 0 && input1.dim() > 0) {
                 // Create a tensor with fewer dimensions for broadcasting
                 std::vector<int64_t> broadcast_shape;
-                if (!input1.sizes().empty()) {
-                    // Take a subset of dimensions for broadcasting
-                    size_t dims_to_keep = (Data[offset % Size] % input1.dim()) + 1;
-                    for (size_t i = 0; i < dims_to_keep; i++) {
-                        broadcast_shape.push_back(input1.size(i));
-                    }
-                    
-                    // Create a tensor with the broadcast shape
-                    torch::Tensor broadcast_tensor = torch::ones(broadcast_shape, input1.options());
-                    
-                    // Apply maximum with broadcasting
+                // Take a subset of dimensions for broadcasting
+                int64_t dims_to_keep = (dim_selector % input1.dim()) + 1;
+                for (int64_t i = 0; i < dims_to_keep; i++) {
+                    broadcast_shape.push_back(input1.size(i));
+                }
+                
+                // Create a tensor with the broadcast shape
+                torch::Tensor broadcast_tensor = torch::ones(broadcast_shape, input1.options());
+                
+                // Apply maximum with broadcasting
+                try {
                     torch::Tensor broadcast_result = torch::maximum(input1, broadcast_tensor);
+                } catch (...) {
+                    // Broadcasting may fail for incompatible shapes
                 }
             }
         }
         
         // Try with empty tensors
         if (offset < Size && Data[offset] % 3 == 0) {
+            offset++;
             torch::Tensor empty_tensor = torch::empty({0}, input1.options());
             try {
                 torch::Tensor empty_result = torch::maximum(input1, empty_tensor);
@@ -80,7 +90,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Try with tensors of different dtypes
-        if (offset + 1 < Size) {
+        if (offset + 1 <= Size) {
             uint8_t dtype_selector = Data[offset++];
             auto dtype = fuzzer_utils::parseDataType(dtype_selector);
             
@@ -111,7 +121,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

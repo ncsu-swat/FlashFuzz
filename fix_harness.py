@@ -196,6 +196,18 @@ catch (const std::exception &e)
 ```
 - Inner try-catch blocks (for expected failures like shape mismatches) should NOT log, just catch silently
 - Return 0 for successful execution, return -1 for exceptions
+
+CRITICAL - Progress tracking:
+- Add a static counter at the beginning of the function to track iterations
+- Print progress every 10000 iterations to verify the API is being exercised
+- Use this exact pattern at the START of LLVMFuzzerTestOneInput:
+```cpp
+static uint64_t iteration_count = 0;
+iteration_count++;
+if (iteration_count % 10000 == 0) {
+    std::cout << "Iterations: " << iteration_count << std::endl;
+}
+```
 """
 
     def _run_claude(self, prompt: str) -> str:

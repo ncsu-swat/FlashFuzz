@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -20,7 +25,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Ensure input has 5 dimensions (batch_size, channels, depth, height, width)
         if (input.dim() != 5) {
-            // Reshape to 5D if needed
             int64_t total_elements = input.numel();
             if (total_elements > 0) {
                 int64_t batch_size = 1;
@@ -49,13 +53,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     else break;
                 }
                 
-                // Reshape tensor
-                input = input.reshape({batch_size, channels, depth, height, width});
+                int64_t needed = batch_size * channels * depth * height * width;
+                input = input.flatten().narrow(0, 0, needed).reshape({batch_size, channels, depth, height, width});
             } else {
-                // Empty tensor case
-                input = torch::zeros({1, 1, 1, 1, 1}, input.options());
+                input = torch::randn({1, 1, 2, 2, 2});
             }
         }
+        
+        // Ensure minimum spatial dimensions for convolution
+        if (input.size(2) < 1 || input.size(3) < 1 || input.size(4) < 1) {
+            input = torch::randn({1, 1, 2, 2, 2});
+        }
+        
+        // Ensure float type for convolution
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Get input channels from the tensor
+        int64_t in_channels = input.size(1);
         
         // Extract parameters for ConvTranspose3d
         int64_t out_channels = 1;
@@ -70,14 +86,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Parse parameters from input data if available
         if (offset + 8 <= Size) {
             out_channels = (Data[offset++] % 4) + 1;
-            kernel_size = (Data[offset++] % 5) + 1;
-            stride = (Data[offset++] % 3) + 1;
-            padding = Data[offset++] % 3;
-            output_padding = Data[offset++] % 2;
-            groups = (Data[offset++] % input.size(1)) + 1;
-            if (groups > out_channels) groups = out_channels;
+            kernel_size = (Data[offset++] % 3) + 1;  // Smaller kernel to avoid size issues
+            stride = (Data[offset++] % 2) + 1;
+            padding = Data[offset++] % 2;
+            output_padding = Data[offset++] % stride;  // output_padding must be < stride
+            groups = (Data[offset++] % 2) + 1;
             bias = Data[offset++] % 2;
             dilation = (Data[offset++] % 2) + 1;
+        }
+        
+        // Ensure input channels divisible by groups
+        if (in_channels % groups != 0) {
+            groups = 1;
         }
         
         // Ensure out_channels is divisible by groups
@@ -85,9 +105,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             out_channels = groups;
         }
         
-        // Create ConvTranspose3d module
+        // output_padding must be smaller than stride or dilation
+        if (output_padding >= stride && output_padding >= dilation) {
+            output_padding = 0;
+        }
+        
+        // Create ConvTranspose3d module (non-lazy version)
+        // Note: LazyConvTranspose3d is not available in C++ frontend,
+        // so we use ConvTranspose3d with known in_channels
         torch::nn::ConvTranspose3d conv_transpose(
-            torch::nn::ConvTranspose3dOptions(input.size(1), out_channels, kernel_size)
+            torch::nn::ConvTranspose3dOptions(in_channels, out_channels, kernel_size)
                 .stride(stride)
                 .padding(padding)
                 .output_padding(output_padding)
@@ -99,15 +126,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply the operation
         torch::Tensor output = conv_transpose->forward(input);
         
-        // Force computation to materialize the tensor
+        // Force computation
         output = output.clone();
+        
+        // Verify output is valid
+        if (output.numel() > 0) {
+            volatile float check = output.sum().item<float>();
+            (void)check;
+        }
         
         return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

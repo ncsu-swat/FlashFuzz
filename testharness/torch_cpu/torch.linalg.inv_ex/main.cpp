@@ -1,94 +1,124 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create a tensor
         if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor
+        // Determine matrix size from input data
+        uint8_t dim_byte = Data[offset++];
+        int64_t n = (dim_byte % 8) + 1;  // Matrix size 1x1 to 8x8
+        
+        // Determine batch dimensions
+        uint8_t batch_byte = Data[offset++];
+        int64_t batch = (batch_byte % 4) + 1;  // Batch size 1 to 4
+        
+        // Create input tensor with appropriate shape for inv_ex
         torch::Tensor A = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Make sure we have a square matrix for inv_ex
-        // If tensor is 0D or 1D, reshape to 2x2
-        if (A.dim() < 2) {
-            A = A.reshape({2, 2});
-        } else {
-            // For tensors with dim >= 2, make the last two dimensions equal
-            // to ensure a square matrix for each batch element
-            auto sizes = A.sizes().vec();
-            int64_t square_dim = std::max(sizes[sizes.size() - 1], sizes[sizes.size() - 2]);
-            sizes[sizes.size() - 1] = square_dim;
-            sizes[sizes.size() - 2] = square_dim;
-            A = A.reshape(sizes);
+        // Reshape to a valid square matrix (batch x n x n)
+        int64_t total_elements = A.numel();
+        int64_t needed_elements = batch * n * n;
+        
+        if (total_elements < needed_elements) {
+            // Pad with random values if we don't have enough elements
+            A = torch::cat({A.flatten(), torch::randn({needed_elements - total_elements}, A.options())});
         }
         
-        // Try to make the tensor invertible by adding a scaled identity matrix
-        // This helps explore more code paths rather than always failing with singular matrices
-        if (offset + 1 < Size) {
-            uint8_t scale_factor = Data[offset++];
-            auto identity = torch::eye(A.size(-1), A.options());
-            
-            // Expand identity to match A's batch dimensions if needed
-            if (A.dim() > 2) {
-                std::vector<int64_t> expanded_sizes(A.dim(), 1);
-                expanded_sizes[A.dim() - 2] = A.size(-2);
-                expanded_sizes[A.dim() - 1] = A.size(-1);
-                identity = identity.expand(A.sizes());
-            }
-            
-            // Add scaled identity to improve conditioning
-            A = A + (scale_factor / 10.0) * identity;
+        // Take only needed elements and reshape to square matrix
+        A = A.flatten().slice(0, 0, needed_elements).reshape({batch, n, n});
+        
+        // Convert to float type suitable for linalg operations
+        if (!A.is_floating_point()) {
+            A = A.to(torch::kFloat);
         }
         
-        // Apply torch.linalg.inv_ex operation
-        auto result = torch::inverse(A);
+        // Test torch::linalg_inv_ex - returns (inverse, info)
+        // check_errors=false allows us to get info tensor instead of throwing
+        auto result = torch::linalg_inv_ex(A, /*check_errors=*/false);
+        torch::Tensor inverse = std::get<0>(result);
+        torch::Tensor info = std::get<1>(result);
         
-        // Use the result to prevent optimization
-        auto check_sum = result.sum();
-        if (check_sum.item<double>() == -12345.6789) {
-            // This will never happen, just to prevent compiler from optimizing away
+        // Use results to prevent optimization
+        auto inv_sum = inverse.sum();
+        auto info_sum = info.sum();
+        if (inv_sum.item<float>() == -12345.6789f) {
             std::cerr << "Unreachable" << std::endl;
         }
         
-        // Test with different dtypes if we have more data
-        if (offset + 1 < Size) {
-            uint8_t dtype_selector = Data[offset++];
-            dtype_selector = dtype_selector % 2; // Just use 2 different dtypes
-            
-            torch::ScalarType target_dtype;
-            if (dtype_selector == 0) {
-                target_dtype = torch::kFloat;
-            } else {
-                target_dtype = torch::kDouble;
-            }
-            
-            // Convert tensor to the selected dtype
-            auto A_converted = A.to(target_dtype);
-            
-            // Apply inverse on the converted tensor
-            auto result2 = torch::inverse(A_converted);
-            
-            // Use the results
-            auto check_sum2 = result2.sum();
-            if (check_sum2.item<double>() == -12345.6789) {
+        // Test with check_errors=true (may throw for singular matrices)
+        try {
+            auto result_checked = torch::linalg_inv_ex(A, /*check_errors=*/true);
+            torch::Tensor inverse_checked = std::get<0>(result_checked);
+            auto sum_checked = inverse_checked.sum();
+            if (sum_checked.item<float>() == -12345.6789f) {
                 std::cerr << "Unreachable" << std::endl;
+            }
+        } catch (const std::exception &) {
+            // Expected for singular matrices - silently ignore
+        }
+        
+        // Test with double precision
+        if (offset < Size) {
+            auto A_double = A.to(torch::kDouble);
+            auto result_double = torch::linalg_inv_ex(A_double, /*check_errors=*/false);
+            torch::Tensor inverse_double = std::get<0>(result_double);
+            torch::Tensor info_double = std::get<1>(result_double);
+            
+            auto sum_double = inverse_double.sum();
+            if (sum_double.item<double>() == -12345.6789) {
+                std::cerr << "Unreachable" << std::endl;
+            }
+        }
+        
+        // Test with well-conditioned matrix (add scaled identity)
+        if (offset + 1 < Size) {
+            uint8_t scale_byte = Data[offset++];
+            float scale = (scale_byte / 255.0f) * 10.0f + 0.1f;
+            
+            auto identity = torch::eye(n, A.options());
+            identity = identity.unsqueeze(0).expand({batch, n, n});
+            auto A_conditioned = A + scale * identity;
+            
+            auto result_cond = torch::linalg_inv_ex(A_conditioned, /*check_errors=*/false);
+            torch::Tensor inverse_cond = std::get<0>(result_cond);
+            auto sum_cond = inverse_cond.sum();
+            if (sum_cond.item<float>() == -12345.6789f) {
+                std::cerr << "Unreachable" << std::endl;
+            }
+        }
+        
+        // Test with complex tensors if supported
+        if (offset + 1 < Size && Data[offset++] % 2 == 0) {
+            try {
+                auto A_complex = torch::complex(A, torch::zeros_like(A));
+                auto result_complex = torch::linalg_inv_ex(A_complex, /*check_errors=*/false);
+                torch::Tensor inverse_complex = std::get<0>(result_complex);
+                auto sum_complex = inverse_complex.sum();
+                // Just accessing to prevent optimization
+                (void)sum_complex;
+            } catch (const std::exception &) {
+                // Complex may not be supported in all configurations
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

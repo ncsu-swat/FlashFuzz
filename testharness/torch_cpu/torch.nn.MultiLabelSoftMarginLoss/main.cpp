@@ -1,34 +1,44 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create tensors
-        if (Size < 4) {
+        // Need at least some data to create tensors and parameters
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor with requires_grad for backward pass testing
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create target tensor (should be same shape as input)
-        torch::Tensor target;
-        if (offset < Size) {
-            target = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a target with the same shape as input
-            target = torch::zeros_like(input);
+        // Ensure input is float type for loss computation
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
         }
         
-        // Ensure target contains only 0s and 1s as required by MultiLabelSoftMarginLoss
-        target = target.clamp(0, 1);
+        // Ensure input is at least 2D (batch_size, num_classes)
+        if (input.dim() < 2) {
+            input = input.unsqueeze(0);
+        }
+        if (input.dim() < 2) {
+            input = input.unsqueeze(1);
+        }
+        
+        // Enable gradient computation
+        input = input.clone().detach().requires_grad_(true);
+        
+        // Create target tensor with the same shape as input
+        torch::Tensor target = torch::rand_like(input).round();  // Binary 0/1 values
         
         // Parse reduction mode from the input data
         torch::nn::MultiLabelSoftMarginLossOptions options;
@@ -49,21 +59,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Parse weight tensor if we have more data
+        // Parse weight tensor option
         if (offset < Size) {
             bool use_weight = Data[offset++] % 2;
-            if (use_weight) {
-                torch::Tensor weight;
-                if (offset < Size) {
-                    weight = fuzzer_utils::createTensor(Data, Size, offset);
-                    
-                    // Ensure weight is 1D and has the right size (number of classes)
-                    if (input.dim() > 1 && weight.dim() == 1) {
-                        int64_t num_classes = input.size(1);
-                        if (weight.size(0) == num_classes) {
-                            options.weight(weight);
-                        }
-                    }
+            if (use_weight && input.dim() >= 2) {
+                int64_t num_classes = input.size(-1);
+                if (num_classes > 0 && num_classes <= 1024) {
+                    torch::Tensor weight = torch::rand({num_classes}, torch::kFloat32).abs() + 0.1f;
+                    options.weight(weight);
                 }
             }
         }
@@ -72,29 +75,51 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::MultiLabelSoftMarginLoss loss_fn(options);
         
         // Apply the loss function
-        torch::Tensor output = loss_fn(input, target);
-        
-        // Ensure the output is valid
-        if (output.numel() > 0) {
-            float loss_value = output.item<float>();
-            (void)loss_value; // Prevent unused variable warning
+        torch::Tensor output;
+        try {
+            output = loss_fn(input, target);
+        } catch (const c10::Error&) {
+            // Shape mismatch or other expected errors
+            return 0;
         }
         
-        // Test backward pass if possible
-        if (input.requires_grad() && output.numel() > 0 && 
-            output.scalar_type() != torch::kBool && 
-            output.scalar_type() != torch::kByte && 
-            output.scalar_type() != torch::kInt8 && 
-            output.scalar_type() != torch::kInt16 && 
-            output.scalar_type() != torch::kInt32 && 
-            output.scalar_type() != torch::kInt64) {
-            output.backward();
+        // Verify output is valid
+        if (output.numel() == 0) {
+            return 0;
+        }
+        
+        // Access output to ensure computation happened
+        if (output.dim() == 0) {
+            // Scalar output (mean or sum reduction)
+            volatile float loss_value = output.item<float>();
+            (void)loss_value;
+        } else {
+            // Non-scalar output (none reduction)
+            volatile float first_val = output.flatten()[0].item<float>();
+            (void)first_val;
+        }
+        
+        // Test backward pass
+        try {
+            torch::Tensor loss_for_backward = output;
+            if (output.dim() > 0) {
+                loss_for_backward = output.sum();
+            }
+            loss_for_backward.backward();
+            
+            // Access gradient to ensure backward completed
+            if (input.grad().defined()) {
+                volatile float grad_sum = input.grad().sum().item<float>();
+                (void)grad_sum;
+            }
+        } catch (const c10::Error&) {
+            // Backward pass can fail for various reasons, not a bug
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

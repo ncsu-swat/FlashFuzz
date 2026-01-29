@@ -1,10 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstring>        // For memcpy
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -86,12 +92,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Try with requires_grad option by creating tensors with the option
+        // Only floating point tensors support requires_grad
         if (offset < Size) {
             try {
                 bool requires_grad = Data[offset] % 2 == 0;
                 std::vector<torch::Tensor> grad_tensors;
                 for (const auto& tensor : tensors) {
-                    grad_tensors.push_back(tensor.requires_grad_(requires_grad));
+                    // Convert to float and set requires_grad
+                    torch::Tensor float_tensor = tensor.to(torch::kFloat32);
+                    if (requires_grad) {
+                        float_tensor = float_tensor.requires_grad_(true);
+                    }
+                    grad_tensors.push_back(float_tensor);
                 }
                 torch::Tensor result = torch::cat(grad_tensors, dim);
             } catch (const c10::Error& e) {
@@ -102,7 +114,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 bool requires_grad = Data[offset] % 2 == 0;
                 std::vector<torch::Tensor> grad_tensors;
                 for (const auto& tensor : tensors) {
-                    grad_tensors.push_back(tensor.requires_grad_(requires_grad));
+                    // Convert to float and set requires_grad
+                    torch::Tensor float_tensor = tensor.to(torch::kFloat32);
+                    if (requires_grad) {
+                        float_tensor = float_tensor.requires_grad_(true);
+                    }
+                    grad_tensors.push_back(float_tensor);
                 }
                 torch::Tensor result = torch::concatenate(grad_tensors, dim);
             } catch (const c10::Error& e) {
@@ -113,7 +130,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

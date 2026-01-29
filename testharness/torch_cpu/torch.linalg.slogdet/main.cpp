@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,89 +21,98 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create a square matrix for slogdet
+        // Create a tensor from fuzzer data
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // slogdet requires a square matrix (n x n)
-        // If tensor is not 2D, reshape it to a square matrix if possible
-        if (input.dim() != 2 || input.size(0) != input.size(1)) {
-            int64_t total_elements = input.numel();
-            int64_t matrix_size = static_cast<int64_t>(std::sqrt(total_elements));
-            
-            // Ensure we have enough elements for at least a 1x1 matrix
-            if (matrix_size > 0) {
-                // Reshape to square matrix
-                input = input.reshape({matrix_size, matrix_size});
-            } else {
-                // Create a minimal 1x1 matrix if we don't have enough elements
-                input = torch::ones({1, 1}, input.options());
-            }
+        // slogdet requires a square matrix (n x n) or batch of square matrices
+        // Reshape to a valid square matrix
+        int64_t total_elements = input.numel();
+        if (total_elements < 1) {
+            return 0;
         }
         
-        // Apply slogdet operation
+        int64_t matrix_size = static_cast<int64_t>(std::sqrt(static_cast<double>(total_elements)));
+        if (matrix_size < 1) {
+            matrix_size = 1;
+        }
+        
+        // Flatten and take only the elements we need for a square matrix
+        input = input.flatten().slice(0, 0, matrix_size * matrix_size).reshape({matrix_size, matrix_size});
+        
+        // Ensure float type for linalg operations
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Apply slogdet operation (torch::slogdet is available in C++ frontend)
         auto result = torch::slogdet(input);
         
         // Unpack the result (sign, logabsdet)
         auto sign = std::get<0>(result);
         auto logabsdet = std::get<1>(result);
         
-        // Try to use the results to ensure they're not optimized away
+        // Use results to prevent optimization
+        volatile float sign_val = sign.item<float>();
+        volatile float logabsdet_val = logabsdet.item<float>();
+        (void)sign_val;
+        (void)logabsdet_val;
+        
+        // Additional test cases based on fuzzer data
         if (offset < Size) {
-            // Create a simple operation using the results
-            auto combined = sign * torch::exp(logabsdet);
+            uint8_t op_selector = Data[offset++];
             
-            // Perform another operation to test edge cases
-            if (offset + 1 < Size) {
-                uint8_t op_selector = Data[offset++];
-                
-                // Different operations based on the selector
-                switch (op_selector % 4) {
-                    case 0:
-                        // Test inverse if determinant is non-zero
-                        if (!torch::any(sign == 0).item<bool>()) {
-                            try {
-                                auto inv = torch::inverse(input);
-                                auto inv_det = torch::slogdet(inv);
-                            } catch (...) {
-                                // Ignore errors from inverse calculation
-                            }
-                        }
-                        break;
-                    case 1:
-                        // Test with transposed matrix
-                        try {
-                            auto transposed = input.transpose(0, 1);
-                            auto trans_det = torch::slogdet(transposed);
-                        } catch (...) {
-                            // Ignore errors
-                        }
-                        break;
-                    case 2:
-                        // Test with scaled matrix
-                        try {
-                            auto scaled = input * 2.0;
-                            auto scaled_det = torch::slogdet(scaled);
-                        } catch (...) {
-                            // Ignore errors
-                        }
-                        break;
-                    case 3:
-                        // Test with matrix power if square
-                        try {
-                            auto power = torch::matrix_power(input, 2);
-                            auto power_det = torch::slogdet(power);
-                        } catch (...) {
-                            // Ignore errors
-                        }
-                        break;
-                }
+            switch (op_selector % 5) {
+                case 0:
+                    // Test with transposed matrix (should give same result)
+                    {
+                        auto transposed = input.transpose(0, 1).contiguous();
+                        auto trans_result = torch::slogdet(transposed);
+                    }
+                    break;
+                case 1:
+                    // Test with scaled matrix
+                    {
+                        float scale = (offset < Size) ? (Data[offset++] / 128.0f + 0.1f) : 2.0f;
+                        auto scaled = input * scale;
+                        auto scaled_result = torch::slogdet(scaled);
+                    }
+                    break;
+                case 2:
+                    // Test with batched input (add batch dimension)
+                    {
+                        auto batched = input.unsqueeze(0).expand({2, matrix_size, matrix_size}).contiguous();
+                        auto batch_result = torch::slogdet(batched);
+                    }
+                    break;
+                case 3:
+                    // Test with complex input
+                    try {
+                        auto complex_input = torch::complex(input, torch::zeros_like(input));
+                        auto complex_result = torch::slogdet(complex_input);
+                    } catch (...) {
+                        // Complex may not be supported in all builds
+                    }
+                    break;
+                case 4:
+                    // Test with double precision
+                    {
+                        auto double_input = input.to(torch::kFloat64);
+                        auto double_result = torch::slogdet(double_input);
+                    }
+                    break;
             }
+        }
+        
+        // Test edge cases: identity matrix and zero matrix
+        if (offset < Size && Data[offset] % 10 == 0) {
+            auto identity = torch::eye(matrix_size, input.options());
+            auto identity_result = torch::slogdet(identity);
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

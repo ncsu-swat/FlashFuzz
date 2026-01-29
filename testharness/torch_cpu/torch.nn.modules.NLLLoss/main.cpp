@@ -1,105 +1,118 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor (log probabilities)
+        size_t offset = 0;
+        
+        // Extract configuration bytes first
+        uint8_t batch_byte = Data[offset++];
+        uint8_t classes_byte = Data[offset++];
+        uint8_t reduction_byte = Data[offset++];
+        uint8_t weight_byte = Data[offset++];
+        uint8_t ignore_byte = Data[offset++];
+        uint8_t use_weight_byte = Data[offset++];
+        
+        // Derive dimensions
+        int64_t batch_size = (batch_byte % 16) + 1;  // 1-16
+        int64_t num_classes = (classes_byte % 10) + 2; // 2-11
+        
+        // Create input tensor (N, C) - log probabilities
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create target tensor (class indices)
-        torch::Tensor target;
+        // Reshape and prepare input for NLLLoss
+        // NLLLoss expects input of shape (N, C) with log probabilities
+        int64_t total_elements = input.numel();
+        if (total_elements < batch_size * num_classes) {
+            // Expand if needed
+            input = input.flatten();
+            input = torch::cat({input, torch::zeros(batch_size * num_classes - total_elements)});
+        }
+        input = input.flatten().slice(0, 0, batch_size * num_classes);
+        input = input.reshape({batch_size, num_classes}).to(torch::kFloat);
+        input.requires_grad_(true);
+        
+        // Apply log_softmax to get valid log probabilities
+        input = torch::log_softmax(input, /*dim=*/1);
+        
+        // Create target tensor (class indices) of shape (N,)
+        torch::Tensor target = torch::zeros({batch_size}, torch::kLong);
         if (offset < Size) {
-            target = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure target has integer type for class indices
-            if (target.scalar_type() != torch::kLong) {
-                target = target.to(torch::kLong);
-            }
-            
-            // Clamp target values to valid class indices based on input's last dimension
-            if (input.dim() > 0 && input.size(-1) > 0) {
-                int64_t num_classes = input.size(-1);
-                target = torch::clamp(target, 0, num_classes - 1);
-            }
-        } else {
-            // Create a default target if we don't have enough data
-            if (input.dim() >= 2) {
-                auto batch_size = input.size(0);
-                target = torch::zeros({batch_size}, torch::kLong);
-            } else {
-                target = torch::zeros({1}, torch::kLong);
+            // Use remaining data to generate target indices
+            for (int64_t i = 0; i < batch_size && offset < Size; i++) {
+                target[i] = static_cast<int64_t>(Data[offset++]) % num_classes;
             }
         }
         
-        // Extract parameters for NLLLoss from remaining data
-        bool reduction_mean = true;
-        float weight_value = 1.0f;
-        int64_t ignore_index = -100;
-        
-        if (offset + 3 <= Size) {
-            // Use a byte to determine reduction type
-            uint8_t reduction_byte = Data[offset++];
-            reduction_mean = (reduction_byte % 3 != 2); // 0,1 -> true (mean/sum), 2 -> false (none)
-            
-            // Use a byte to determine weight value
-            if (offset < Size) {
-                uint8_t weight_byte = Data[offset++];
-                weight_value = static_cast<float>(weight_byte) / 255.0f * 10.0f;
-            }
-            
-            // Use a byte to determine ignore_index
-            if (offset < Size) {
-                uint8_t ignore_byte = Data[offset++];
-                ignore_index = static_cast<int64_t>(ignore_byte) - 100;
-            }
+        // Determine reduction type
+        torch::nn::NLLLossOptions::reduction_t reduction;
+        switch (reduction_byte % 3) {
+            case 0: reduction = torch::kMean; break;
+            case 1: reduction = torch::kSum; break;
+            case 2: reduction = torch::kNone; break;
         }
         
-        // Create weight tensor if needed
-        torch::Tensor weight;
-        if (input.dim() > 0 && input.size(-1) > 0) {
-            int64_t num_classes = input.size(-1);
-            weight = torch::ones({num_classes}, torch::kFloat) * weight_value;
-        } else {
-            weight = torch::ones({1}, torch::kFloat) * weight_value;
-        }
-        
-        // Create NLLLoss module with different configurations
+        // Create options
         torch::nn::NLLLossOptions options;
+        options.reduction(reduction);
         
-        // Set reduction
-        if (reduction_mean) {
-            options = options.reduction(torch::kMean);
-        } else {
-            options = options.reduction(torch::kNone);
+        // Optionally set weight
+        if (use_weight_byte % 2 == 1) {
+            float weight_scale = static_cast<float>(weight_byte) / 255.0f * 2.0f + 0.1f;
+            torch::Tensor weight = torch::ones({num_classes}, torch::kFloat) * weight_scale;
+            options.weight(weight);
         }
         
-        // Set weight and ignore_index
-        options = options.weight(weight).ignore_index(ignore_index);
+        // Set ignore_index (may or may not match any target)
+        int64_t ignore_index = (static_cast<int64_t>(ignore_byte) % (num_classes + 10)) - 5;
+        options.ignore_index(ignore_index);
         
+        // Create NLLLoss module
         torch::nn::NLLLoss nll_loss(options);
         
-        // Apply NLLLoss
+        // Forward pass
         torch::Tensor output = nll_loss->forward(input, target);
         
-        // Try backward pass if possible
-        if (output.requires_grad()) {
-            output.backward();
+        // Backward pass
+        try {
+            if (output.requires_grad() && output.numel() == 1) {
+                output.backward();
+            } else if (output.requires_grad() && output.numel() > 1) {
+                // For reduction=none, output has shape (N,)
+                output.sum().backward();
+            }
+        } catch (...) {
+            // Ignore backward errors silently
+        }
+        
+        // Also test functional interface
+        try {
+            torch::Tensor input2 = torch::randn({batch_size, num_classes}, torch::kFloat);
+            input2 = torch::log_softmax(input2, 1);
+            torch::Tensor output2 = torch::nn::functional::nll_loss(
+                input2, target,
+                torch::nn::functional::NLLLossFuncOptions().reduction(reduction)
+            );
+        } catch (...) {
+            // Ignore functional API errors silently
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

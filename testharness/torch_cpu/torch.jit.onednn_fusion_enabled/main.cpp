@@ -1,72 +1,61 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <torch/csrc/jit/passes/onednn_graph_fuser.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
+        // Test isEnabled() - this always works
+        bool current_state = torch::jit::RegisterLlgaFuseGraph::isEnabled();
         
-        // Need at least 1 byte to determine if we should enable or disable fusion
-        if (Size < 1) {
-            return 0;
-        }
-        
-        // Extract a byte to determine if we should enable or disable fusion
-        bool enable_fusion = (Data[offset++] % 2 == 0);
-        
-        // Call the onednn_fusion_enabled function
-        torch::jit::setOneDNNFusionEnabled(enable_fusion);
-        
-        // Check if the setting was applied correctly
-        bool current_setting = torch::jit::oneDNNFusionEnabled();
-        
-        // If we have more data, create a simple JIT module to test the fusion
-        if (Size > offset + 2) {
-            // Create a simple tensor to use in our JIT module
-            torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Create a simple JIT module that could potentially use fusion
-            std::string script_code = R"(
-                def forward(self, x):
-                    return x + x
-            )";
+        // If we have data, try to toggle the fusion setting
+        // Note: setEnabled() requires MKLDNN builds, so it will throw
+        // an exception in non-MKLDNN builds - this is expected behavior
+        if (Size >= 1) {
+            bool enable_fusion = (Data[0] % 2 == 0);
             
             try {
-                auto module = torch::jit::compile(script_code);
-                std::vector<torch::jit::IValue> inputs;
-                inputs.push_back(input);
+                // This will throw if MKLDNN is not built - that's expected
+                torch::jit::RegisterLlgaFuseGraph::setEnabled(enable_fusion);
                 
-                // Execute the module
-                auto output = module->run_method("forward", inputs);
+                // If we get here, MKLDNN is available, verify the setting
+                bool new_state = torch::jit::RegisterLlgaFuseGraph::isEnabled();
                 
-                // Try to get the tensor result
-                if (output.isTensor()) {
-                    torch::Tensor result = output.toTensor();
+                // Toggle back and forth if we have more data
+                for (size_t i = 1; i < Size && i < 10; i++) {
+                    bool toggle = (Data[i] % 2 == 0);
+                    torch::jit::RegisterLlgaFuseGraph::setEnabled(toggle);
+                    torch::jit::RegisterLlgaFuseGraph::isEnabled();
                 }
+                
+                // Restore original state
+                torch::jit::RegisterLlgaFuseGraph::setEnabled(current_state);
             } catch (const c10::Error& e) {
-                // JIT errors are expected and not a problem for the fuzzer
+                // Expected when MKLDNN is not available - not an error
+                // Just continue testing isEnabled()
             }
         }
         
-        // Toggle the setting back and forth a few times if we have more data
-        if (Size > offset) {
-            for (size_t i = 0; i < std::min(Size - offset, static_cast<size_t>(5)); i++) {
-                bool new_setting = ((Data[offset + i] % 2) == 0);
-                torch::jit::setOneDNNFusionEnabled(new_setting);
-            }
+        // Call isEnabled() multiple times based on input data
+        // to increase coverage of the query path
+        for (size_t i = 0; i < Size && i < 20; i++) {
+            volatile bool state = torch::jit::RegisterLlgaFuseGraph::isEnabled();
+            (void)state;
         }
-        
-        // Restore the original setting
-        torch::jit::setOneDNNFusionEnabled(enable_fusion);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

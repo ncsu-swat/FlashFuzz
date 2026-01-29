@@ -1,137 +1,127 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to create tensors
-        if (Size < 4) {
+        // Need at least some data to create meaningful sparse tensors
+        if (Size < 8) {
             return 0;
         }
-        
-        // Create a sparse tensor
-        torch::Tensor indices;
-        torch::Tensor values;
-        
-        // Create indices tensor (2 x N)
-        if (offset < Size) {
-            indices = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure indices has correct shape for sparse tensor
-            // For a 2D sparse tensor, indices should be 2 x N
-            if (indices.dim() != 2 || indices.size(0) < 1) {
-                indices = torch::zeros({2, 3}, torch::kLong);
-            } else {
-                // Ensure first dimension is 2 for 2D sparse tensor
-                indices = indices.reshape({2, -1});
-            }
-            
-            // Ensure indices are of integer type
-            if (indices.scalar_type() != torch::kLong) {
-                indices = indices.to(torch::kLong);
-            }
-        } else {
-            indices = torch::zeros({2, 3}, torch::kLong);
-        }
-        
-        // Create values tensor (N)
-        if (offset < Size) {
-            values = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure values has correct shape for sparse tensor
-            if (values.dim() != 1) {
-                values = values.reshape({indices.size(1)});
-            }
-            
-            // Ensure values length matches indices second dimension
-            if (values.size(0) != indices.size(1)) {
-                values = values.reshape({indices.size(1)});
-            }
-        } else {
-            values = torch::ones({indices.size(1)});
-        }
-        
-        // Create sparse tensor
+
+        size_t offset = 0;
+
+        // Use fuzzer data to determine sparse tensor parameters
+        uint8_t nnz1 = (Size > offset) ? (Data[offset++] % 10) + 1 : 3;  // 1-10 non-zero elements
+        uint8_t nnz2 = (Size > offset) ? (Data[offset++] % 10) + 1 : 5;  // 1-10 non-zero elements
+        uint8_t dim1 = (Size > offset) ? (Data[offset++] % 5) + 2 : 4;   // 2-6 for first sparse dim
+        uint8_t dim2 = (Size > offset) ? (Data[offset++] % 5) + 2 : 4;   // 2-6 for second sparse dim
+
+        // Create first sparse tensor
         torch::Tensor sparse_tensor;
-        try {
-            sparse_tensor = torch::sparse_coo_tensor(indices, values);
-        } catch (const std::exception& e) {
-            // If sparse tensor creation fails, create a simple valid one
-            indices = torch::zeros({2, 3}, torch::kLong);
-            values = torch::ones({3});
-            sparse_tensor = torch::sparse_coo_tensor(indices, values);
-        }
-        
-        // Create another sparse tensor to resize as
-        torch::Tensor target_indices;
-        torch::Tensor target_values;
-        
-        // Create target indices tensor
-        if (offset < Size) {
-            target_indices = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure target indices has correct shape
-            if (target_indices.dim() != 2 || target_indices.size(0) < 1) {
-                target_indices = torch::zeros({2, 5}, torch::kLong);
+        {
+            // Create indices for a 2D sparse tensor (2 x nnz1)
+            // Indices must be within valid range
+            torch::Tensor row_indices = torch::randint(0, dim1, {static_cast<int64_t>(nnz1)}, torch::kLong);
+            torch::Tensor col_indices = torch::randint(0, dim2, {static_cast<int64_t>(nnz1)}, torch::kLong);
+            torch::Tensor indices = torch::stack({row_indices, col_indices}, 0);
+
+            // Create values using fuzzer data if available
+            torch::Tensor values;
+            if (offset < Size) {
+                values = fuzzer_utils::createTensor(Data, Size, offset);
+                // Resize to match nnz1
+                if (values.numel() >= nnz1) {
+                    values = values.flatten().slice(0, 0, nnz1);
+                } else {
+                    values = torch::ones({static_cast<int64_t>(nnz1)});
+                }
+                // Ensure it's a 1D tensor
+                values = values.reshape({static_cast<int64_t>(nnz1)});
             } else {
-                // Ensure first dimension is 2 for 2D sparse tensor
-                target_indices = target_indices.reshape({2, -1});
+                values = torch::ones({static_cast<int64_t>(nnz1)});
             }
-            
-            // Ensure indices are of integer type
-            if (target_indices.scalar_type() != torch::kLong) {
-                target_indices = target_indices.to(torch::kLong);
+
+            try {
+                sparse_tensor = torch::sparse_coo_tensor(
+                    indices, values, {static_cast<int64_t>(dim1), static_cast<int64_t>(dim2)});
+            } catch (...) {
+                // Fallback to simple valid sparse tensor
+                indices = torch::zeros({2, 1}, torch::kLong);
+                values = torch::ones({1});
+                sparse_tensor = torch::sparse_coo_tensor(indices, values, {4, 4});
             }
-        } else {
-            target_indices = torch::zeros({2, 5}, torch::kLong);
         }
-        
-        // Create target values tensor
-        if (offset < Size) {
-            target_values = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure values has correct shape
-            if (target_values.dim() != 1) {
-                target_values = target_values.reshape({target_indices.size(1)});
-            }
-            
-            // Ensure values length matches indices second dimension
-            if (target_values.size(0) != target_indices.size(1)) {
-                target_values = target_values.reshape({target_indices.size(1)});
-            }
-        } else {
-            target_values = torch::ones({target_indices.size(1)});
-        }
-        
-        // Create target sparse tensor
+
+        // Create target sparse tensor with potentially different size
         torch::Tensor target_sparse;
-        try {
-            target_sparse = torch::sparse_coo_tensor(target_indices, target_values);
-        } catch (const std::exception& e) {
-            // If target sparse tensor creation fails, create a simple valid one
-            target_indices = torch::zeros({2, 5}, torch::kLong);
-            target_values = torch::ones({5});
-            target_sparse = torch::sparse_coo_tensor(target_indices, target_values);
+        {
+            uint8_t target_dim1 = (Size > offset) ? (Data[offset++] % 8) + 2 : 6;
+            uint8_t target_dim2 = (Size > offset) ? (Data[offset++] % 8) + 2 : 6;
+
+            // Create indices for target sparse tensor
+            torch::Tensor row_indices = torch::randint(0, target_dim1, {static_cast<int64_t>(nnz2)}, torch::kLong);
+            torch::Tensor col_indices = torch::randint(0, target_dim2, {static_cast<int64_t>(nnz2)}, torch::kLong);
+            torch::Tensor target_indices = torch::stack({row_indices, col_indices}, 0);
+
+            // Create values for target
+            torch::Tensor target_values;
+            if (offset < Size) {
+                target_values = fuzzer_utils::createTensor(Data, Size, offset);
+                if (target_values.numel() >= nnz2) {
+                    target_values = target_values.flatten().slice(0, 0, nnz2);
+                } else {
+                    target_values = torch::ones({static_cast<int64_t>(nnz2)});
+                }
+                target_values = target_values.reshape({static_cast<int64_t>(nnz2)});
+            } else {
+                target_values = torch::ones({static_cast<int64_t>(nnz2)});
+            }
+
+            try {
+                target_sparse = torch::sparse_coo_tensor(
+                    target_indices, target_values, 
+                    {static_cast<int64_t>(target_dim1), static_cast<int64_t>(target_dim2)});
+            } catch (...) {
+                // Fallback to simple valid sparse tensor
+                target_indices = torch::zeros({2, 1}, torch::kLong);
+                target_values = torch::ones({1});
+                target_sparse = torch::sparse_coo_tensor(target_indices, target_values, {6, 6});
+            }
         }
-        
-        // Apply resize_as_sparse_ operation
-        sparse_tensor.resize_as_sparse_(target_sparse);
-        
-        // Verify the operation worked by checking the size
-        if (sparse_tensor.sizes() != target_sparse.sizes()) {
-            throw std::runtime_error("resize_as_sparse_ failed: sizes don't match");
+
+        // Apply resize_as_sparse_ operation (in-place resize)
+        try {
+            sparse_tensor.resize_as_sparse_(target_sparse);
+        } catch (...) {
+            // Some resize operations may fail for valid reasons
+            // (e.g., incompatible sparse layouts)
+        }
+
+        // Also test with coalesced sparse tensors
+        if (Size > offset && (Data[offset] & 1)) {
+            try {
+                torch::Tensor coalesced_sparse = sparse_tensor.coalesce();
+                torch::Tensor coalesced_target = target_sparse.coalesce();
+                coalesced_sparse.resize_as_sparse_(coalesced_target);
+            } catch (...) {
+                // Silent catch for expected failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

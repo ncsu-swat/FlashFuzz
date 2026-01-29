@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <sstream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,37 +20,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for Linear module
-        int64_t in_features = 0;
-        int64_t out_features = 0;
+        // Extract parameters for Linear module first
+        int64_t in_features = 1;
+        int64_t out_features = 1;
         bool bias = true;
         
-        // Get in_features from the input tensor
-        if (input_tensor.dim() >= 1) {
-            in_features = input_tensor.size(-1);
-        } else {
-            // For scalar tensors, use a default value
-            in_features = 1;
+        // Get in_features from fuzzer data
+        if (offset + sizeof(uint16_t) <= Size) {
+            uint16_t raw_in;
+            std::memcpy(&raw_in, Data + offset, sizeof(uint16_t));
+            offset += sizeof(uint16_t);
+            in_features = (raw_in % 64) + 1;  // 1 to 64
         }
         
-        // Get out_features from the remaining data
-        if (offset + sizeof(int64_t) <= Size) {
-            int64_t raw_out_features;
-            std::memcpy(&raw_out_features, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure out_features is reasonable but allow edge cases
-            out_features = std::abs(raw_out_features) % 128 + 1;
-        } else {
-            out_features = 1; // Default value
+        // Get out_features from fuzzer data
+        if (offset + sizeof(uint16_t) <= Size) {
+            uint16_t raw_out;
+            std::memcpy(&raw_out, Data + offset, sizeof(uint16_t));
+            offset += sizeof(uint16_t);
+            out_features = (raw_out % 64) + 1;  // 1 to 64
         }
         
         // Get bias parameter
         if (offset < Size) {
-            bias = Data[offset++] & 0x1; // Use lowest bit to determine bias
+            bias = Data[offset++] & 0x1;
+        }
+        
+        // Get batch size from fuzzer data
+        int64_t batch_size = 1;
+        if (offset < Size) {
+            batch_size = (Data[offset++] % 16) + 1;  // 1 to 16
         }
         
         // Create the Linear module using LinearOptions
@@ -53,46 +57,110 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         options.bias(bias);
         torch::nn::Linear linear_module(options);
         
-        // Reshape input tensor if needed to match expected input shape
-        if (input_tensor.dim() == 0) {
-            // Scalar tensor needs to be reshaped to have at least one dimension
-            input_tensor = input_tensor.reshape({1, in_features});
-        } else if (input_tensor.dim() == 1) {
-            // 1D tensor needs to be reshaped to have batch dimension
-            input_tensor = input_tensor.reshape({1, input_tensor.size(0)});
-        } else {
-            // For tensors with dim >= 2, ensure the last dimension matches in_features
-            std::vector<int64_t> new_shape = input_tensor.sizes().vec();
-            new_shape[new_shape.size() - 1] = in_features;
-            input_tensor = input_tensor.reshape(new_shape);
+        // Create input tensor with correct shape for the linear layer
+        torch::Tensor input_tensor = torch::randn({batch_size, in_features});
+        
+        // Use remaining fuzzer data to perturb tensor values if available
+        if (offset < Size) {
+            size_t remaining = Size - offset;
+            size_t tensor_elements = input_tensor.numel();
+            size_t bytes_to_use = std::min(remaining, tensor_elements * sizeof(float));
+            
+            auto accessor = input_tensor.accessor<float, 2>();
+            size_t idx = 0;
+            for (int64_t i = 0; i < batch_size && idx < bytes_to_use; i++) {
+                for (int64_t j = 0; j < in_features && idx < bytes_to_use; j++) {
+                    // Use fuzzer byte to scale the value
+                    float scale = static_cast<float>(Data[offset + idx]) / 128.0f - 1.0f;
+                    accessor[i][j] *= scale;
+                    idx++;
+                }
+            }
         }
         
-        // Apply the Linear module
+        // Apply the Linear module - forward pass
         torch::Tensor output = linear_module->forward(input_tensor);
         
-        // Optionally test some properties of the output
-        auto output_size = output.sizes();
+        // Verify output shape
+        assert(output.size(0) == batch_size);
+        assert(output.size(-1) == out_features);
         
-        // Test backward pass with a simple gradient
-        if (input_tensor.requires_grad() && input_tensor.dtype() == torch::kFloat32) {
-            output.sum().backward();
+        // Test with requires_grad for backward pass
+        torch::Tensor input_grad = torch::randn({batch_size, in_features}, torch::requires_grad());
+        torch::Tensor output_grad = linear_module->forward(input_grad);
+        output_grad.sum().backward();
+        
+        // Test parameters access
+        auto params = linear_module->parameters();
+        assert(params.size() == (bias ? 2 : 1));
+        
+        // Test named_parameters
+        auto named_params = linear_module->named_parameters();
+        
+        // Test weight and bias access
+        torch::Tensor weight = linear_module->weight;
+        assert(weight.size(0) == out_features);
+        assert(weight.size(1) == in_features);
+        
+        if (bias) {
+            torch::Tensor bias_tensor = linear_module->bias;
+            assert(bias_tensor.size(0) == out_features);
         }
         
-        // Test other operations on the Linear module
-        auto params = linear_module->parameters();
+        // Test serialization/deserialization with actual data
+        std::stringstream ss;
+        {
+            torch::serialize::OutputArchive output_archive;
+            linear_module->save(output_archive);
+            output_archive.save_to(ss);
+        }
         
-        // Test serialization/deserialization
-        torch::serialize::OutputArchive output_archive;
-        linear_module->save(output_archive);
+        {
+            torch::nn::Linear loaded_module(options);
+            torch::serialize::InputArchive input_archive;
+            input_archive.load_from(ss);
+            loaded_module->load(input_archive);
+            
+            // Verify loaded module works
+            torch::Tensor loaded_output = loaded_module->forward(input_tensor);
+            assert(loaded_output.sizes() == output.sizes());
+        }
         
-        torch::nn::Linear loaded_module(options);
-        torch::serialize::InputArchive input_archive;
-        loaded_module->load(input_archive);
+        // Test eval/train modes
+        linear_module->eval();
+        torch::Tensor eval_output = linear_module->forward(input_tensor);
+        
+        linear_module->train();
+        torch::Tensor train_output = linear_module->forward(input_tensor);
+        
+        // Test with different input dimensions (2D and 3D inputs)
+        if (batch_size > 1) {
+            // Test 3D input: (batch, seq_len, in_features)
+            int64_t seq_len = (batch_size / 2) + 1;
+            torch::Tensor input_3d = torch::randn({batch_size / 2 + 1, seq_len, in_features});
+            torch::Tensor output_3d = linear_module->forward(input_3d);
+            assert(output_3d.size(-1) == out_features);
+        }
+        
+        // Test zero_grad on module
+        linear_module->zero_grad();
+        
+        // Test to() method for dtype conversion
+        try {
+            linear_module->to(torch::kFloat64);
+            torch::Tensor input_f64 = input_tensor.to(torch::kFloat64);
+            torch::Tensor output_f64 = linear_module->forward(input_f64);
+        } catch (...) {
+            // Silently ignore dtype conversion issues
+        }
+        
+        // Reset to float32
+        linear_module->to(torch::kFloat32);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

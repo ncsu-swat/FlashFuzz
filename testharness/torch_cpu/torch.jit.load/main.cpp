@@ -1,66 +1,73 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <fstream>        // For file operations
-#include <vector>         // For vector operations
-#include <torch/script.h> // For torch::jit::load
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <sstream>
+#include <vector>
+#include <torch/script.h>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        if (Size < 4) {
+        // Need at least some bytes to form a potentially valid model
+        if (Size < 8) {
             return 0;
         }
 
-        size_t offset = 0;
-
-        // Create a temporary file to store the model
-        std::string tempFilename = "temp_model.pt";
-        std::ofstream tempFile(tempFilename, std::ios::binary);
-        if (!tempFile) {
-            return 0;
-        }
-
-        // Write the data to the temporary file
-        tempFile.write(reinterpret_cast<const char*>(Data), Size);
-        tempFile.close();
+        // Create a stringstream from the input data to avoid file I/O
+        std::string data_str(reinterpret_cast<const char*>(Data), Size);
+        std::istringstream input_stream(data_str);
 
         try {
-            // Try to load the model
-            auto module = torch::jit::load(tempFilename);
+            // Try to load the model from the stream
+            auto module = torch::jit::load(input_stream);
 
             // If the model loads successfully, try to run it with some inputs
-            if (offset < Size) {
-                // Create a tensor to use as input for the loaded model
-                torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Try to get the method names from the module
-                auto methodNames = module.get_methods();
-                
-                // If there are methods, try to run the first one
-                if (!methodNames.empty()) {
-                    try {
-                        std::vector<torch::jit::IValue> inputs;
-                        inputs.push_back(input);
-                        auto output = module.forward(inputs);
-                    } catch (...) {
-                        // Ignore exceptions from running the model
-                    }
+            size_t offset = 0;
+            
+            // Create a tensor to use as input for the loaded model
+            torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+            
+            // Try to get the method names from the module
+            auto methods = module.get_methods();
+            
+            // If there are methods, try to run forward
+            if (!methods.empty()) {
+                try {
+                    std::vector<torch::jit::IValue> inputs;
+                    inputs.push_back(input);
+                    auto output = module.forward(inputs);
+                } catch (...) {
+                    // Ignore exceptions from running the model
+                    // Shape mismatches, type errors, etc. are expected
                 }
             }
+
+            // Also try calling named methods
+            for (const auto& method : methods) {
+                try {
+                    std::vector<torch::jit::IValue> inputs;
+                    inputs.push_back(input);
+                    method.function()(inputs);
+                } catch (...) {
+                    // Ignore exceptions - expected for invalid inputs
+                }
+            }
+
         } catch (...) {
             // Ignore exceptions from loading the model
+            // Most fuzz inputs won't be valid TorchScript models
         }
-
-        // Clean up the temporary file
-        std::remove(tempFilename.c_str());
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

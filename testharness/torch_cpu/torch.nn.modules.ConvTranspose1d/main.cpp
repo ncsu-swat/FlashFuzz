@@ -1,108 +1,77 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <iostream>       // For cerr, cout
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Ensure input is float type for convolution
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
         // Ensure input has at least 3 dimensions (batch_size, channels, length)
         if (input.dim() < 3) {
-            input = input.reshape({1, 1, input.numel()});
+            int64_t numel = input.numel();
+            if (numel == 0) {
+                numel = 1;
+            }
+            input = input.reshape({1, 1, numel});
         }
-        
-        // Extract parameters for ConvTranspose1d from the remaining data
-        int64_t in_channels = 0;
-        int64_t out_channels = 0;
-        int64_t kernel_size = 0;
-        int64_t stride = 1;
-        int64_t padding = 0;
-        int64_t output_padding = 0;
-        int64_t dilation = 1;
-        int64_t groups = 1;
-        bool bias = true;
         
         // Get in_channels from input tensor
-        in_channels = input.size(1);
-        
-        // Parse remaining parameters from data
-        if (offset + 8 <= Size) {
-            std::memcpy(&out_channels, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure out_channels is positive
-            out_channels = std::abs(out_channels) % 16 + 1;
-        } else {
-            out_channels = 1;
+        int64_t in_channels = input.size(1);
+        if (in_channels <= 0) {
+            in_channels = 1;
         }
         
-        if (offset + 8 <= Size) {
-            std::memcpy(&kernel_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure kernel_size is positive
-            kernel_size = std::abs(kernel_size) % 7 + 1;
-        } else {
-            kernel_size = 3;
-        }
-        
-        if (offset + 8 <= Size) {
-            std::memcpy(&stride, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure stride is positive
-            stride = std::abs(stride) % 4 + 1;
-        }
-        
-        if (offset + 8 <= Size) {
-            std::memcpy(&padding, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Allow padding to be any value
-            padding = padding % 5;
-        }
-        
-        if (offset + 8 <= Size) {
-            std::memcpy(&output_padding, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure output_padding is non-negative and less than stride
-            output_padding = std::abs(output_padding) % stride;
-        }
-        
-        if (offset + 8 <= Size) {
-            std::memcpy(&dilation, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure dilation is positive
-            dilation = std::abs(dilation) % 3 + 1;
-        }
-        
-        if (offset + 8 <= Size) {
-            std::memcpy(&groups, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure groups is positive and a divisor of in_channels
-            groups = std::abs(groups) % in_channels + 1;
-            if (in_channels % groups != 0) {
-                groups = 1;  // Default to 1 if not a divisor
+        // Parse parameters from data with safe bounds
+        auto readByte = [&]() -> uint8_t {
+            if (offset < Size) {
+                return Data[offset++];
             }
-        }
+            return 0;
+        };
         
-        if (offset < Size) {
-            bias = Data[offset] & 1;  // Use lowest bit to determine bias
+        // Extract parameters for ConvTranspose1d
+        int64_t out_channels = (readByte() % 16) + 1;  // 1-16
+        int64_t kernel_size = (readByte() % 7) + 1;    // 1-7
+        int64_t stride = (readByte() % 4) + 1;         // 1-4
+        int64_t padding = readByte() % 5;              // 0-4
+        int64_t dilation = (readByte() % 3) + 1;       // 1-3
+        bool bias = readByte() & 1;
+        
+        // output_padding must be less than max(stride, dilation)
+        int64_t max_output_padding = std::max(stride, dilation);
+        int64_t output_padding = readByte() % max_output_padding;
+        
+        // Handle groups - must divide both in_channels and out_channels
+        int64_t groups = 1;
+        uint8_t groups_byte = readByte();
+        // Try to find a valid groups value
+        for (int64_t g = (groups_byte % in_channels) + 1; g >= 1; g--) {
+            if (in_channels % g == 0 && out_channels % g == 0) {
+                groups = g;
+                break;
+            }
         }
         
         // Create ConvTranspose1d module
@@ -120,23 +89,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor output = conv_transpose->forward(input);
         
         // Try different input types
-        if (offset + 1 < Size) {
-            torch::ScalarType dtype = fuzzer_utils::parseDataType(Data[offset]);
-            if (dtype != input.scalar_type()) {
-                try {
+        if (offset < Size) {
+            torch::ScalarType dtype = fuzzer_utils::parseDataType(Data[offset++]);
+            try {
+                if (dtype == torch::kFloat32 || dtype == torch::kFloat64 || dtype == torch::kFloat16) {
                     torch::Tensor input_cast = input.to(dtype);
                     torch::Tensor output_cast = conv_transpose->forward(input_cast);
-                } catch (const std::exception &) {
-                    // Ignore exceptions from type conversion
                 }
+            } catch (const std::exception &) {
+                // Ignore exceptions from type conversion - expected for some dtypes
             }
         }
         
         // Try with different batch sizes
-        if (input.size(0) > 1 && input.size(0) % 2 == 0) {
+        if (input.size(0) > 1) {
             try {
-                torch::Tensor half_batch = input.slice(0, 0, input.size(0) / 2);
-                torch::Tensor output_half = conv_transpose->forward(half_batch);
+                torch::Tensor slice_batch = input.slice(0, 0, 1);
+                torch::Tensor output_slice = conv_transpose->forward(slice_batch);
+            } catch (const std::exception &) {
+                // Ignore exceptions
+            }
+        }
+        
+        // Try eval mode
+        try {
+            conv_transpose->eval();
+            torch::Tensor output_eval = conv_transpose->forward(input);
+        } catch (const std::exception &) {
+            // Ignore exceptions
+        }
+        
+        // Test with no_grad
+        {
+            torch::NoGradGuard no_grad;
+            try {
+                torch::Tensor output_no_grad = conv_transpose->forward(input);
             } catch (const std::exception &) {
                 // Ignore exceptions
             }
@@ -145,7 +132,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

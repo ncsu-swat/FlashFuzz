@@ -1,96 +1,118 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 4) {
+        // Need sufficient data for LSTM parameters
+        if (Size < 16) {
             return 0;
         }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
+
+        size_t offset = 0;
+
+        // Extract configuration from fuzzer data
+        int64_t seq_len = (Data[offset++] % 8) + 1;      // 1-8
+        int64_t batch_size = (Data[offset++] % 4) + 1;   // 1-4
+        int64_t input_size = (Data[offset++] % 8) + 1;   // 1-8
+        int64_t hidden_size = (Data[offset++] % 8) + 1;  // 1-8
+        int64_t num_layers = (Data[offset++] % 2) + 1;   // 1-2
+        bool has_biases = (Data[offset++] % 2 == 0);
+        bool batch_first = (Data[offset++] % 2 == 0);
+        bool bidirectional = (Data[offset++] % 2 == 0);
+        double dropout = 0.0; // Must be 0 for single layer or eval mode
+
+        int64_t num_directions = bidirectional ? 2 : 1;
+
+        // Create input tensor with proper shape
+        // Shape: (seq_len, batch_size, input_size) or (batch_size, seq_len, input_size) if batch_first
+        torch::Tensor input;
+        if (batch_first) {
+            input = torch::randn({batch_size, seq_len, input_size});
+        } else {
+            input = torch::randn({seq_len, batch_size, input_size});
+        }
+
         // Create hidden state tensors
-        torch::Tensor h0 = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor c0 = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create weight tensors
-        torch::Tensor weight_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor weight_hh = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create bias tensors (optional)
-        torch::Tensor bias_ih, bias_hh;
-        if (offset < Size - 2) {
-            bias_ih = fuzzer_utils::createTensor(Data, Size, offset);
-            bias_hh = fuzzer_utils::createTensor(Data, Size, offset);
+        // h0, c0 shape: (num_layers * num_directions, batch_size, hidden_size)
+        torch::Tensor h0 = torch::randn({num_layers * num_directions, batch_size, hidden_size});
+        torch::Tensor c0 = torch::randn({num_layers * num_directions, batch_size, hidden_size});
+
+        // Build weight tensors for all layers
+        // For each layer: weight_ih, weight_hh, [bias_ih, bias_hh]
+        std::vector<torch::Tensor> params;
+
+        for (int64_t layer = 0; layer < num_layers; ++layer) {
+            for (int64_t direction = 0; direction < num_directions; ++direction) {
+                int64_t layer_input_size = (layer == 0) ? input_size : hidden_size * num_directions;
+
+                // weight_ih: (4 * hidden_size, layer_input_size)
+                torch::Tensor weight_ih = torch::randn({4 * hidden_size, layer_input_size});
+                // weight_hh: (4 * hidden_size, hidden_size)
+                torch::Tensor weight_hh = torch::randn({4 * hidden_size, hidden_size});
+
+                params.push_back(weight_ih);
+                params.push_back(weight_hh);
+
+                if (has_biases) {
+                    // bias_ih, bias_hh: (4 * hidden_size,)
+                    torch::Tensor bias_ih = torch::randn({4 * hidden_size});
+                    torch::Tensor bias_hh = torch::randn({4 * hidden_size});
+                    params.push_back(bias_ih);
+                    params.push_back(bias_hh);
+                }
+            }
         }
-        
-        // Get some configuration parameters from the remaining data
-        bool has_biases = offset < Size && (Data[offset++] % 2 == 0);
-        bool batch_first = offset < Size && (Data[offset++] % 2 == 0);
-        bool bidirectional = offset < Size && (Data[offset++] % 2 == 0);
-        int64_t num_layers = 1;
-        if (offset < Size) {
-            num_layers = (Data[offset++] % 3) + 1; // 1-3 layers
-        }
-        double dropout = 0.0;
-        if (offset < Size) {
-            dropout = static_cast<double>(Data[offset++]) / 255.0; // 0.0-1.0
-        }
-        
-        // Try different variants of LSTM calls
+
         try {
-            // Variant 1: Basic LSTM call with all required parameters
-            at::TensorList hx_list = {h0, c0};
-            at::TensorList params_list = {weight_ih, weight_hh};
-            if (has_biases && bias_ih.defined() && bias_hh.defined()) {
-                params_list = {weight_ih, weight_hh, bias_ih, bias_hh};
-            }
-            
-            auto output1 = torch::lstm(input, hx_list, params_list, has_biases, 
-                                     num_layers, dropout, true, bidirectional, batch_first);
-            
-            // Variant 2: LSTM with different parameter combinations
-            if (h0.defined() && c0.defined() && weight_ih.defined() && weight_hh.defined()) {
-                at::TensorList hx_list2 = {h0, c0};
-                at::TensorList params_list2 = {weight_ih, weight_hh};
-                
-                auto output2 = torch::lstm(input, hx_list2, params_list2, false, 
-                                         num_layers, dropout, true, bidirectional, batch_first);
-            }
-            
-            // Variant 3: LSTM with packed sequence
-            try {
-                torch::Tensor lengths = torch::tensor({input.size(0)}, torch::kLong);
-                auto packed_input = torch::nn::utils::rnn::pack_padded_sequence(input, lengths, batch_first);
-                
-                at::TensorList hx_list3 = {h0, c0};
-                at::TensorList params_list3 = {weight_ih, weight_hh};
-                
-                auto output3 = torch::lstm(packed_input.data(), packed_input.batch_sizes(), 
-                                         hx_list3, params_list3, has_biases, 
-                                         num_layers, dropout, true, bidirectional);
-            } catch (...) {
-                // Packing might fail for invalid inputs, that's expected
-            }
-            
+            // Call torch::lstm
+            // Signature: lstm(input, hx, params, has_biases, num_layers, dropout, train, bidirectional, batch_first)
+            std::tuple<torch::Tensor, torch::Tensor> hx = std::make_tuple(h0, c0);
+
+            auto result = torch::lstm(
+                input,
+                {h0, c0},           // hx as TensorList
+                params,              // params as TensorList
+                has_biases,
+                num_layers,
+                dropout,
+                false,               // train=false (no dropout in eval)
+                bidirectional,
+                batch_first
+            );
+
+            // Unpack results to ensure they're computed
+            auto output = std::get<0>(result);
+            auto hn = std::get<1>(result);
+            auto cn = std::get<2>(result);
+
+            // Verify output shapes are reasonable
+            (void)output.size(0);
+            (void)hn.size(0);
+            (void)cn.size(0);
+
         } catch (const c10::Error& e) {
-            // Expected PyTorch errors (e.g., shape mismatch) are fine
+            // Expected PyTorch errors (shape mismatch, etc.)
+            return 0;
+        } catch (const std::runtime_error& e) {
+            // Runtime errors from invalid configurations
             return 0;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

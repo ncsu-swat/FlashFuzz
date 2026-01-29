@@ -1,64 +1,86 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        // Get the current number of threads (save for restoration)
+        int original_threads = torch::get_num_threads();
+        
+        if (Size < 1) {
+            // Even with no data, exercise the basic get function
+            int current = torch::get_num_threads();
+            (void)current;
+            return 0;
+        }
+        
         size_t offset = 0;
         
-        // Get the current number of threads
-        int num_threads = torch::get_num_threads();
+        // Test setting various thread counts
+        // Use fuzzer data to determine thread count, limited to valid range 1-128
+        int new_thread_count = static_cast<int>(Data[offset] % 128) + 1;
+        offset++;
         
-        // Try setting the number of threads to different values
-        if (Size > 0) {
-            int new_thread_count = static_cast<int>(Data[offset]) % 16 + 1;  // Limit to reasonable range 1-16
-            torch::set_num_threads(new_thread_count);
+        torch::set_num_threads(new_thread_count);
+        int updated_threads = torch::get_num_threads();
+        (void)updated_threads;
+        
+        // Create a tensor and perform operations that may utilize threads
+        if (Size > offset + 4) {
+            torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Verify the setting worked
-            int updated_threads = torch::get_num_threads();
-            
-            // Create a tensor and perform an operation to see if thread count affects behavior
-            if (Size > offset + 1) {
-                offset++;
-                torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Perform some operation that might use multiple threads
-                torch::Tensor result = tensor.clone();
-                
-                // Try a few more thread-related operations
-                if (Size > offset + 1) {
-                    int another_thread_count = static_cast<int>(Data[offset]) % 32 + 1;
-                    torch::set_num_threads(another_thread_count);
-                    
-                    // Get the number of threads again
-                    int final_threads = torch::get_num_threads();
-                    
-                    // Try with 0 threads (edge case)
-                    torch::set_num_threads(0);
-                    int zero_threads = torch::get_num_threads();
-                    
-                    // Try with negative threads (edge case)
-                    if (Size > offset + 1) {
-                        offset++;
-                        int negative_threads = -static_cast<int>(Data[offset]);
-                        torch::set_num_threads(negative_threads);
-                        int after_negative = torch::get_num_threads();
-                    }
-                }
+            // Operations that benefit from multi-threading
+            try {
+                torch::Tensor result1 = tensor.clone();
+                torch::Tensor result2 = tensor + tensor;
+                torch::Tensor result3 = torch::matmul(tensor.view({-1, 1}), tensor.view({1, -1}));
+                (void)result1;
+                (void)result2;
+                (void)result3;
+            } catch (...) {
+                // Shape mismatches are expected, ignore silently
             }
-            
-            // Restore original thread count
-            torch::set_num_threads(num_threads);
         }
+        
+        // Test changing thread count mid-operation
+        if (Size > offset) {
+            int another_count = static_cast<int>(Data[offset] % 64) + 1;
+            offset++;
+            torch::set_num_threads(another_count);
+            
+            int check = torch::get_num_threads();
+            (void)check;
+        }
+        
+        // Test with thread count of 1 (single-threaded mode)
+        torch::set_num_threads(1);
+        int single_thread = torch::get_num_threads();
+        (void)single_thread;
+        
+        // Test with a larger thread count
+        if (Size > offset) {
+            int large_count = static_cast<int>(Data[offset]) + 1;  // 1-256 range
+            torch::set_num_threads(large_count);
+            int large_result = torch::get_num_threads();
+            (void)large_result;
+        }
+        
+        // Restore original thread count to avoid affecting other tests
+        torch::set_num_threads(original_threads);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    
+    return 0;
 }

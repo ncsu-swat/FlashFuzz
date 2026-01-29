@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -25,48 +30,55 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             window_length = static_cast<int64_t>(Data[offset++]);
         }
         
+        // Constrain window_length to reasonable range to avoid OOM
+        // Negative values will throw, which is expected behavior
+        // Large positive values capped to avoid memory issues
+        if (window_length > 1000000) {
+            window_length = window_length % 1000000;
+        }
+        
         // Parse periodic flag (if we have data left)
         bool periodic = false;
         if (offset < Size) {
             periodic = static_cast<bool>(Data[offset++] & 0x01);
         }
         
-        // Parse layout (if we have data left)
-        torch::Layout layout = torch::kStrided;
+        // Parse dtype (if we have data left) - only floating point types make sense
+        torch::ScalarType dtype = torch::kFloat;
         if (offset < Size) {
-            uint8_t layout_byte = Data[offset++];
-            if (layout_byte % 2 == 1) {
-                layout = torch::kSparse;
+            uint8_t dtype_byte = Data[offset++] % 4;
+            switch (dtype_byte) {
+                case 0:
+                    dtype = torch::kFloat;
+                    break;
+                case 1:
+                    dtype = torch::kDouble;
+                    break;
+                case 2:
+                    dtype = torch::kHalf;
+                    break;
+                case 3:
+                    dtype = torch::kBFloat16;
+                    break;
             }
         }
         
-        // Parse device (if we have data left)
-        torch::Device device = torch::kCPU;
-        if (offset < Size) {
-            // We'll just use CPU for now, but could add GPU support
-            // uint8_t device_byte = Data[offset++];
-            offset++;
-        }
-        
-        // Parse dtype (if we have data left)
-        torch::ScalarType dtype = torch::kFloat;
-        if (offset < Size) {
-            dtype = fuzzer_utils::parseDataType(Data[offset++]);
-        }
-        
-        // Create options
+        // Create options - strided layout only, CPU device
         auto options = torch::TensorOptions()
-            .layout(layout)
-            .device(device)
+            .layout(torch::kStrided)
+            .device(torch::kCPU)
             .dtype(dtype);
         
         // Call blackman_window with different combinations of parameters
         torch::Tensor result;
         
         // Try different variants of the function
+        uint8_t variant = 0;
         if (offset < Size) {
-            uint8_t variant = Data[offset++] % 4;
-            
+            variant = Data[offset++] % 4;
+        }
+        
+        try {
             switch (variant) {
                 case 0:
                     // Basic call with just window_length
@@ -88,27 +100,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     result = torch::blackman_window(window_length, options);
                     break;
             }
-        } else {
-            // Default to basic call if no variant byte
-            result = torch::blackman_window(window_length);
+        } catch (const c10::Error&) {
+            // Expected for invalid inputs (e.g., negative window_length)
+            return 0;
         }
         
         // Perform some operations on the result to ensure it's used
-        if (result.defined()) {
-            auto sum = result.sum();
-            auto max_val = result.max();
-            auto min_val = result.min();
+        if (result.defined() && result.numel() > 0) {
+            // Convert to float for operations if needed (Half/BFloat16 don't support all ops)
+            auto result_float = result.to(torch::kFloat);
+            
+            auto sum = result_float.sum();
+            auto max_val = result_float.max();
+            auto min_val = result_float.min();
             
             // Force evaluation
-            sum.item<double>();
-            max_val.item<double>();
-            min_val.item<double>();
+            sum.item<float>();
+            max_val.item<float>();
+            min_val.item<float>();
+            
+            // Additional operations to increase coverage
+            auto mean_val = result_float.mean();
+            mean_val.item<float>();
+            
+            // Check shape is correct
+            if (window_length > 0) {
+                assert(result.size(0) == window_length);
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

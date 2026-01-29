@@ -1,6 +1,6 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 #include <torch/torch.h>
 
 class SimpleModule : public torch::nn::Module {
@@ -58,7 +58,12 @@ public:
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -75,30 +80,27 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             case 0: {
                 auto simple_module = std::make_shared<SimpleModule>();
                 
-                if (offset < Size) {
-                    try {
+                // Create input tensor with shape [batch_size, 10]
+                try {
+                    if (offset < Size) {
                         input = fuzzer_utils::createTensor(Data, Size, offset);
-                        
-                        if (input.dim() == 0) {
-                            input = input.reshape({1, 10});
-                        } else if (input.dim() == 1) {
-                            if (input.size(0) != 10) {
-                                input = input.reshape({1, -1});
-                                if (input.size(1) != 10) {
-                                    input = torch::randn({batch_size, 10});
-                                }
+                        // Flatten and reshape to required dimensions
+                        input = input.flatten();
+                        int64_t total = input.numel();
+                        if (total >= 10) {
+                            int64_t batches = total / 10;
+                            if (batches > 0) {
+                                input = input.narrow(0, 0, batches * 10).reshape({batches, 10});
                             } else {
-                                input = input.reshape({1, 10});
-                            }
-                        } else {
-                            if (input.size(-1) != 10) {
                                 input = torch::randn({batch_size, 10});
                             }
+                        } else {
+                            input = torch::randn({batch_size, 10});
                         }
-                    } catch (...) {
+                    } else {
                         input = torch::randn({batch_size, 10});
                     }
-                } else {
+                } catch (...) {
                     input = torch::randn({batch_size, 10});
                 }
                 
@@ -121,26 +123,50 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                             auto output3 = simple_module->forward(input);
                         }
                     }
+                    
+                    // Test parameter access
+                    auto params = simple_module->parameters();
+                    auto named_params = simple_module->named_parameters();
+                    
+                    // Test module cloning
+                    auto cloned = simple_module->clone();
+                    
+                    // Test state_dict related methods
+                    simple_module->zero_grad();
                 }
                 break;
             }
             case 1: {
                 auto conv_module = std::make_shared<ConvModule>();
                 
-                if (offset < Size) {
-                    try {
+                // Create input tensor with shape [batch_size, 3, H, W]
+                int64_t height = 32, width = 32;
+                if (offset + 1 < Size) {
+                    height = (Data[offset++] % 32) + 8;  // 8-39
+                    width = (Data[offset++] % 32) + 8;   // 8-39
+                }
+                
+                try {
+                    if (offset < Size) {
                         input = fuzzer_utils::createTensor(Data, Size, offset);
-                        
-                        if (input.dim() < 4) {
-                            input = torch::randn({batch_size, 3, 32, 32});
-                        } else if (input.size(1) != 3) {
-                            input = input.reshape({-1, 3, input.size(2), input.size(3)});
+                        input = input.flatten();
+                        int64_t total = input.numel();
+                        int64_t required = 3 * height * width;
+                        if (total >= required) {
+                            int64_t batches = total / required;
+                            if (batches > 0) {
+                                input = input.narrow(0, 0, batches * required).reshape({batches, 3, height, width});
+                            } else {
+                                input = torch::randn({batch_size, 3, height, width});
+                            }
+                        } else {
+                            input = torch::randn({batch_size, 3, height, width});
                         }
-                    } catch (...) {
-                        input = torch::randn({batch_size, 3, 32, 32});
+                    } else {
+                        input = torch::randn({batch_size, 3, height, width});
                     }
-                } else {
-                    input = torch::randn({batch_size, 3, 32, 32});
+                } catch (...) {
+                    input = torch::randn({batch_size, 3, height, width});
                 }
                 
                 {
@@ -157,26 +183,48 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         
                         auto output2 = conv_module->forward(input);
                     }
+                    
+                    // Test buffers (BatchNorm has running_mean, running_var)
+                    auto buffers = conv_module->buffers();
+                    auto named_buffers = conv_module->named_buffers();
+                    
+                    // Test children and modules
+                    auto children = conv_module->children();
+                    auto modules = conv_module->modules();
+                    auto named_modules = conv_module->named_modules();
                 }
                 break;
             }
             case 2: {
                 auto rnn_module = std::make_shared<RecurrentModule>();
                 
+                // Create input tensor with shape [seq_len, batch_size, 10]
+                int64_t seq_len = 5;
                 if (offset < Size) {
-                    try {
+                    seq_len = (Data[offset++] % 10) + 1;  // 1-10
+                }
+                
+                try {
+                    if (offset < Size) {
                         input = fuzzer_utils::createTensor(Data, Size, offset);
-                        
-                        if (input.dim() < 3) {
-                            input = torch::randn({5, batch_size, 10});
-                        } else if (input.size(2) != 10) {
-                            input = input.reshape({input.size(0), input.size(1), 10});
+                        input = input.flatten();
+                        int64_t total = input.numel();
+                        int64_t required = seq_len * 10;
+                        if (total >= required) {
+                            int64_t batches = total / required;
+                            if (batches > 0) {
+                                input = input.narrow(0, 0, batches * required).reshape({seq_len, batches, 10});
+                            } else {
+                                input = torch::randn({seq_len, batch_size, 10});
+                            }
+                        } else {
+                            input = torch::randn({seq_len, batch_size, 10});
                         }
-                    } catch (...) {
-                        input = torch::randn({5, batch_size, 10});
+                    } else {
+                        input = torch::randn({seq_len, batch_size, 10});
                     }
-                } else {
-                    input = torch::randn({5, batch_size, 10});
+                } catch (...) {
+                    input = torch::randn({seq_len, batch_size, 10});
                 }
                 
                 {
@@ -193,6 +241,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         
                         auto output2 = rnn_module->forward(input);
                     }
+                    
+                    // Test apply function
+                    rnn_module->apply([](torch::nn::Module& m) {
+                        // Just iterate through modules
+                    });
+                    
+                    // Test is_training
+                    bool is_training = rnn_module->is_training();
                 }
                 break;
             }
@@ -201,7 +257,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

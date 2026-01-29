@@ -1,97 +1,83 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 10) {
+
+        // Need sufficient data
+        if (Size < 16) {
             return 0;
         }
+
+        // Extract parameters from fuzz data
+        double momentum = static_cast<double>(Data[offset++] % 100) / 100.0; // 0.0 to 0.99
+        double eps = 1e-5 + static_cast<double>(Data[offset++] % 100) / 10000.0;
         
-        // Create input tensors
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor mean = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor var = fuzzer_utils::createTensor(Data, Size, offset);
+        // Get count value (at least 1)
+        int64_t count = static_cast<int64_t>(Data[offset++]) + 1;
+
+        // Determine number of channels (1-64)
+        int64_t num_channels = (Data[offset++] % 64) + 1;
         
-        // Create additional parameters
-        double momentum = 0.1;
-        double eps = 1e-5;
+        // Determine batch size and spatial dimensions for input
+        int64_t batch_size = (Data[offset++] % 8) + 1;
+        int64_t height = (Data[offset++] % 8) + 1;
+        int64_t width = (Data[offset++] % 8) + 1;
+
+        // Create input tensor with shape [N, C, H, W]
+        torch::Tensor input = torch::randn({batch_size, num_channels, height, width});
         
-        // Create count value - should be an int64_t
-        int64_t count;
-        if (offset + 1 < Size) {
-            // Use a byte from the input to determine count value
-            uint8_t count_value = Data[offset++];
-            count = static_cast<int64_t>(count_value);
-        } else {
-            // Default count value if not enough data
-            count = 1;
-        }
+        // Create mean and invstd tensors - these represent per-channel statistics
+        // Shape should be [C] for gathered statistics
+        torch::Tensor mean = torch::randn({num_channels});
+        torch::Tensor invstd = torch::rand({num_channels}).add(0.1); // Positive values for inverse std
         
-        // Create running_mean and running_var tensors
-        torch::Tensor running_mean;
-        torch::Tensor running_var;
-        
-        // If input has at least 2 dimensions, use the second dimension for running stats
-        if (input.dim() >= 2) {
-            int64_t channels = input.size(1);
-            running_mean = torch::zeros({channels}, input.options());
-            running_var = torch::ones({channels}, input.options());
-        } else {
-            // Default for scalar or 1D input
-            running_mean = torch::zeros({1}, input.options());
-            running_var = torch::ones({1}, input.options());
-        }
-        
-        // Try to match dimensions between tensors
-        if (mean.dim() == 1 && var.dim() == 1) {
-            int64_t mean_size = mean.size(0);
-            int64_t var_size = var.size(0);
-            
-            // Resize running stats if needed
-            if (running_mean.size(0) != mean_size) {
-                running_mean = torch::zeros({mean_size}, input.options());
-            }
-            if (running_var.size(0) != var_size) {
-                running_var = torch::ones({var_size}, input.options());
-            }
-        }
-        
-        // Apply batch_norm_gather_stats
+        // Create running_mean and running_var tensors with shape [C]
+        torch::Tensor running_mean = torch::zeros({num_channels});
+        torch::Tensor running_var = torch::ones({num_channels});
+
+        // Call batch_norm_gather_stats
+        // This function gathers batch normalization statistics
         auto result = torch::batch_norm_gather_stats(
             input,
             mean,
-            var,
+            invstd,
             running_mean,
             running_var,
             momentum,
             eps,
             count
         );
-        
-        // Unpack the result (mean, var)
+
+        // Unpack the result tuple (gathered mean, gathered invstd)
         auto mean_out = std::get<0>(result);
-        auto var_out = std::get<1>(result);
-        
+        auto invstd_out = std::get<1>(result);
+
         // Use the results to prevent optimization
-        if (mean_out.numel() > 0 && var_out.numel() > 0) {
-            auto sum = mean_out.sum() + var_out.sum();
-            if (sum.item<float>() == -1.0f) {
-                return 1; // This branch is unlikely to be taken
-            }
+        if (mean_out.defined() && mean_out.numel() > 0) {
+            volatile float sum_val = mean_out.sum().item<float>();
+            (void)sum_val;
+        }
+        if (invstd_out.defined() && invstd_out.numel() > 0) {
+            volatile float sum_val = invstd_out.sum().item<float>();
+            (void)sum_val;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

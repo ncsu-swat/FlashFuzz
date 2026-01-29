@@ -1,99 +1,124 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <ATen/Context.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least 1 byte for the deterministic flag
-        if (Size < 1) {
+        if (Size < 2) {
             return 0;
         }
         
-        // Extract a boolean flag from the first byte
-        bool use_deterministic = Data[0] & 0x1;
+        // Extract flags from data
+        bool use_deterministic = Data[offset] & 0x1;
+        bool warn_only = Data[offset] & 0x2;
         offset++;
         
-        // Set deterministic algorithms flag
-        at::globalContext().setDeterministicAlgorithms(use_deterministic);
+        // Test setting deterministic algorithms with different modes
+        // This is the C++ equivalent of torch.use_deterministic_algorithms()
+        at::globalContext().setDeterministicAlgorithms(use_deterministic, warn_only);
         
-        // Create a tensor to test operations with deterministic algorithms
+        // Verify the setting was applied
+        bool is_deterministic = at::globalContext().deterministicAlgorithms();
+        bool is_warn_only = at::globalContext().deterministicAlgorithmsWarnOnly();
+        
+        // Create tensors to exercise operations that might be affected
         if (offset < Size) {
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Perform some operations that might be affected by deterministic algorithms
-            if (tensor.dim() > 0) {
-                // Test operations that might be affected by deterministic algorithms
+            if (tensor.numel() > 0) {
+                // Test operations that have deterministic variants
                 try {
-                    // Test convolution (affected by deterministic algorithms)
-                    if (tensor.dim() == 4 && tensor.size(1) > 0) {
-                        int64_t in_channels = tensor.size(1);
-                        torch::nn::Conv2d conv(torch::nn::Conv2dOptions(in_channels, in_channels, 3).padding(1));
-                        auto result = conv(tensor);
-                    }
-                    
-                    // Test max pooling (affected by deterministic algorithms)
-                    if (tensor.dim() >= 2) {
-                        auto result = torch::max_pool2d(tensor, 2);
-                    }
-                    
-                    // Test CUDA operations if tensor is on CUDA
-                    if (tensor.device().is_cuda()) {
-                        auto result = torch::cudnn_convolution(
-                            tensor, tensor, {1, 1}, {1, 1}, {1, 1}, 1, false, false, false);
+                    // Index operations can be affected by deterministic mode
+                    if (tensor.dim() >= 1 && tensor.size(0) > 0) {
+                        auto indices = torch::randint(0, tensor.size(0), {std::min<int64_t>(5, tensor.size(0))});
+                        auto selected = tensor.index_select(0, indices);
                     }
                 } catch (const c10::Error& e) {
-                    // Expected exceptions when deterministic algorithms are enabled
-                    // but operations don't support it, or when shapes are incompatible
+                    // Expected - some ops throw when deterministic is enabled
                 }
-            }
-            
-            // Test other operations that might be affected by deterministic algorithms
-            try {
-                // Test operations on random number generation
-                auto random_tensor = torch::rand({2, 3});
                 
-                // Test operations that have non-deterministic implementations
-                if (tensor.dim() > 0 && tensor.numel() > 0) {
-                    auto indices = torch::nonzero(tensor);
+                try {
+                    // Scatter operations are affected by deterministic mode
+                    if (tensor.dim() >= 1) {
+                        auto src = torch::ones_like(tensor);
+                        auto idx = torch::zeros({tensor.size(0)}, torch::kLong);
+                        auto result = torch::scatter(tensor, 0, idx.unsqueeze(-1).expand_as(tensor), src);
+                    }
+                } catch (const c10::Error& e) {
+                    // Expected
                 }
-            } catch (const c10::Error& e) {
-                // Expected exceptions when deterministic algorithms are enabled
-                // but operations don't support it
+                
+                try {
+                    // Sort operations
+                    if (tensor.dim() >= 1) {
+                        auto [sorted, indices] = torch::sort(tensor, -1);
+                    }
+                } catch (const c10::Error& e) {
+                    // Expected
+                }
+                
+                try {
+                    // Cumsum can be affected
+                    if (tensor.dim() >= 1) {
+                        auto result = torch::cumsum(tensor, 0);
+                    }
+                } catch (const c10::Error& e) {
+                    // Expected
+                }
             }
         }
         
-        // Toggle the deterministic flag and test again
-        at::globalContext().setDeterministicAlgorithms(!use_deterministic);
+        // Toggle the setting
+        at::globalContext().setDeterministicAlgorithms(!use_deterministic, !warn_only);
         
-        // Create another tensor with the remaining data
+        // Test with toggled settings
         if (offset < Size) {
             torch::Tensor tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Perform some operations with the toggled deterministic flag
-            if (tensor2.dim() > 0) {
+            if (tensor2.numel() > 0 && tensor2.dim() >= 1) {
                 try {
-                    if (tensor2.dim() >= 2) {
-                        auto result = torch::max_pool2d(tensor2, 2);
+                    // Test gather operation
+                    auto idx = torch::zeros({tensor2.size(0)}, torch::kLong);
+                    for (int i = 1; i < tensor2.dim(); i++) {
+                        idx = idx.unsqueeze(-1);
                     }
+                    idx = idx.expand_as(tensor2);
+                    auto result = torch::gather(tensor2, 0, idx);
                 } catch (const c10::Error& e) {
-                    // Expected exceptions
+                    // Expected
+                }
+                
+                try {
+                    // Test index_add
+                    auto target = torch::zeros_like(tensor2);
+                    auto idx = torch::zeros({tensor2.size(0)}, torch::kLong);
+                    target.index_add_(0, idx, tensor2);
+                } catch (const c10::Error& e) {
+                    // Expected
                 }
             }
         }
         
-        // Reset to the original setting to avoid affecting other tests
-        at::globalContext().setDeterministicAlgorithms(use_deterministic);
+        // Always reset to non-deterministic mode at the end to avoid 
+        // affecting subsequent test runs
+        at::globalContext().setDeterministicAlgorithms(false, false);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        // Reset before returning to ensure clean state
+        at::globalContext().setDeterministicAlgorithms(false, false);
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

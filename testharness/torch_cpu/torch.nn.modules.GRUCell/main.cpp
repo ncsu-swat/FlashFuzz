@@ -1,132 +1,130 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Create hidden state tensor
-        torch::Tensor hx;
-        if (offset < Size) {
-            hx = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a default hidden state
-            if (input.dim() > 0 && input.size(0) > 0) {
-                int64_t batch_size = input.size(0);
-                int64_t hidden_size = 10; // Default hidden size
-                
-                // Try to extract hidden size from remaining data if available
-                if (offset + 1 < Size) {
-                    hidden_size = (Data[offset] % 20) + 1; // 1 to 20
-                    offset++;
-                }
-                
-                hx = torch::zeros({batch_size, hidden_size});
-            } else {
-                // Default hidden state for empty input
-                hx = torch::zeros({1, 10});
-            }
-        }
+        // Extract GRUCell parameters from fuzzer data first
+        int64_t input_size = (Data[offset++] % 32) + 1;   // 1 to 32
+        int64_t hidden_size = (Data[offset++] % 32) + 1;  // 1 to 32
+        int64_t batch_size = (Data[offset++] % 8) + 1;    // 1 to 8
+        bool bias = Data[offset++] & 1;
         
-        // Extract parameters for GRUCell
-        int64_t input_size = 0;
-        int64_t hidden_size = 0;
-        bool bias = true;
-        
-        // Determine input_size from input tensor if possible
-        if (input.dim() >= 2) {
-            input_size = input.size(1);
-        } else if (input.dim() == 1) {
-            input_size = input.size(0);
-        } else {
-            // Default input size
-            input_size = 10;
-        }
-        
-        // Determine hidden_size from hx tensor if possible
-        if (hx.dim() >= 2) {
-            hidden_size = hx.size(1);
-        } else if (hx.dim() == 1) {
-            hidden_size = hx.size(0);
-        } else {
-            // Default hidden size
-            hidden_size = 10;
-        }
-        
-        // Determine bias parameter
-        if (offset < Size) {
-            bias = Data[offset++] & 1; // Use lowest bit to determine bias
-        }
-        
-        // Create GRUCell
+        // Create GRUCell with determined parameters
         torch::nn::GRUCell gru_cell(
             torch::nn::GRUCellOptions(input_size, hidden_size).bias(bias)
         );
         
-        // Reshape input tensor if needed to match expected dimensions [batch_size, input_size]
-        if (input.dim() == 0) {
-            // Scalar input - reshape to [1, 1]
-            input = input.reshape({1, 1});
-        } else if (input.dim() == 1) {
-            // 1D input - reshape to [1, input_size]
-            input = input.reshape({1, input.size(0)});
-        } else if (input.dim() > 2) {
-            // Higher dimensional input - flatten to 2D
-            int64_t batch_size = input.size(0);
-            input = input.reshape({batch_size, -1});
+        // Create input tensor with correct shape [batch_size, input_size]
+        torch::Tensor input;
+        if (offset < Size) {
+            input = fuzzer_utils::createTensor(Data, Size, offset);
+            // Reshape to required dimensions
+            int64_t total_elements = input.numel();
+            if (total_elements == 0) {
+                input = torch::randn({batch_size, input_size});
+            } else if (total_elements < batch_size * input_size) {
+                // Repeat to get enough elements
+                int64_t repeat_factor = (batch_size * input_size + total_elements - 1) / total_elements;
+                input = input.flatten().repeat({repeat_factor}).slice(0, 0, batch_size * input_size);
+                input = input.reshape({batch_size, input_size});
+            } else {
+                input = input.flatten().slice(0, 0, batch_size * input_size).reshape({batch_size, input_size});
+            }
+        } else {
+            input = torch::randn({batch_size, input_size});
         }
         
-        // Reshape hidden state if needed to match expected dimensions [batch_size, hidden_size]
-        if (hx.dim() == 0) {
-            // Scalar hidden state - reshape to [1, 1]
-            hx = hx.reshape({1, 1});
-        } else if (hx.dim() == 1) {
-            // 1D hidden state - reshape to [1, hidden_size]
-            hx = hx.reshape({1, hx.size(0)});
-        } else if (hx.dim() > 2) {
-            // Higher dimensional hidden state - flatten to 2D
-            int64_t batch_size = hx.size(0);
-            hx = hx.reshape({batch_size, -1});
+        // Ensure input is float type
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
         }
         
-        // Make sure batch sizes match between input and hidden state
-        if (input.size(0) != hx.size(0)) {
-            // Adjust hidden state batch size to match input
-            int64_t batch_size = input.size(0);
-            hx = hx.repeat({batch_size, 1});
-            hx = hx.slice(0, 0, batch_size);
+        // Create hidden state tensor with correct shape [batch_size, hidden_size]
+        torch::Tensor hx;
+        if (offset < Size) {
+            hx = fuzzer_utils::createTensor(Data, Size, offset);
+            int64_t total_elements = hx.numel();
+            if (total_elements == 0) {
+                hx = torch::zeros({batch_size, hidden_size});
+            } else if (total_elements < batch_size * hidden_size) {
+                int64_t repeat_factor = (batch_size * hidden_size + total_elements - 1) / total_elements;
+                hx = hx.flatten().repeat({repeat_factor}).slice(0, 0, batch_size * hidden_size);
+                hx = hx.reshape({batch_size, hidden_size});
+            } else {
+                hx = hx.flatten().slice(0, 0, batch_size * hidden_size).reshape({batch_size, hidden_size});
+            }
+        } else {
+            hx = torch::zeros({batch_size, hidden_size});
         }
         
-        // Apply GRUCell operation
-        torch::Tensor output = gru_cell(input, hx);
+        // Ensure hx is float type and matches input dtype
+        if (hx.dtype() != input.dtype()) {
+            hx = hx.to(input.dtype());
+        }
         
-        // Perform some operations on the output to ensure it's used
+        // Test forward pass with hidden state
+        torch::Tensor output;
+        try {
+            output = gru_cell->forward(input, hx);
+        } catch (...) {
+            // Shape mismatch or similar - silently ignore
+            return 0;
+        }
+        
+        // Test forward pass without explicit hidden state (uses zeros)
+        torch::Tensor output_no_hx;
+        try {
+            output_no_hx = gru_cell->forward(input);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Verify output shape is [batch_size, hidden_size]
+        if (output.dim() != 2 || output.size(0) != batch_size || output.size(1) != hidden_size) {
+            std::cerr << "Unexpected output shape" << std::endl;
+            return -1;
+        }
+        
+        // Exercise output to ensure computation happened
         auto sum = output.sum();
         auto mean = output.mean();
-        auto max_val = output.max();
         
-        // Prevent compiler from optimizing away the operations
-        if (sum.item<float>() == -1.0f && mean.item<float>() == -1.0f && max_val.item<float>() == -1.0f) {
-            return 1; // This condition is unlikely to be true
+        // Use volatile to prevent optimization
+        volatile float s = sum.item<float>();
+        volatile float m = mean.item<float>();
+        (void)s;
+        (void)m;
+        
+        // Test chaining - feed output as next hidden state
+        try {
+            torch::Tensor input2 = torch::randn({batch_size, input_size});
+            torch::Tensor output2 = gru_cell->forward(input2, output);
+            volatile float s2 = output2.sum().item<float>();
+            (void)s2;
+        } catch (...) {
+            // Silently ignore chaining errors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

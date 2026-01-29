@@ -8,7 +8,13 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -49,6 +55,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 uint8_t move_flag = Data[offset++];
                 if (move_flag % 2 == 0) {
                     c10::Storage storage_moved = std::move(storage_copy);
+                    (void)storage_moved;
                 }
             }
             
@@ -115,9 +122,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 explicit_bytes,
                 c10::GetAllocator(c10::kCPU),
                 /*resizable=*/true);
+            (void)explicit_storage;
             
             // Test empty storage creation
             c10::Storage empty_storage;
+            (void)empty_storage;
             
             // Test storage from data pointer
             if (explicit_size > 0) {
@@ -128,6 +137,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     c10::GetAllocator(c10::kCPU),
                     /*resizable=*/true);
                 (void)data_vec;
+                (void)data_storage;
             }
         }
         

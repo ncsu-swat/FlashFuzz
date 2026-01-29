@@ -1,128 +1,151 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Create target tensor (class indices)
-        torch::Tensor target;
-        if (offset < Size) {
-            target = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure target has integer type for class indices
-            if (target.scalar_type() != torch::kLong) {
-                target = target.to(torch::kLong);
-            }
-            
-            // Ensure target has proper shape (should be 1D with same batch size as input)
-            if (input.dim() > 0 && target.dim() > 0) {
-                int64_t batch_size = input.size(0);
-                target = target.reshape({batch_size});
-            }
-        } else {
-            // If we don't have enough data for a second tensor, create a simple target
-            if (input.dim() > 0) {
-                int64_t batch_size = input.size(0);
-                target = torch::zeros({batch_size}, torch::kLong);
-            } else {
-                target = torch::zeros({1}, torch::kLong);
-            }
-        }
+        // Extract configuration parameters first
+        uint8_t batch_size_byte = Data[offset++];
+        uint8_t num_classes_byte = Data[offset++];
+        uint8_t p_byte = Data[offset++];
+        uint8_t margin_byte = Data[offset++];
+        uint8_t reduction_byte = Data[offset++];
+        uint8_t use_weight_byte = Data[offset++];
         
-        // Extract configuration parameters from remaining data
-        double weight_val = 1.0;
-        int64_t p_val = 1;
-        double margin_val = 1.0;
+        // Derive meaningful values
+        int64_t batch_size = (batch_size_byte % 16) + 1;  // 1-16
+        int64_t num_classes = (num_classes_byte % 10) + 2;  // 2-11 classes
+        int64_t p_val = (p_byte % 2) + 1;  // 1 or 2
+        double margin_val = static_cast<double>(margin_byte) / 255.0 * 5.0 + 0.1;  // 0.1-5.1
+        bool use_weight = (use_weight_byte % 2 == 0);
         
-        if (offset + 2 < Size) {
-            // Use some bytes to determine p value (1 or 2)
-            p_val = (Data[offset++] % 2) + 1;
-            
-            // Use some bytes for margin
-            uint8_t margin_byte = Data[offset++];
-            margin_val = static_cast<double>(margin_byte) / 255.0 * 10.0;
-            
-            // Use some bytes for weight
-            if (offset < Size) {
-                uint8_t weight_byte = Data[offset++];
-                weight_val = static_cast<double>(weight_byte) / 255.0 * 10.0;
-            }
-        }
-        
-        // Create weight tensor (optional)
-        torch::Tensor weight;
-        bool use_weight = false;
-        
-        if (offset < Size && (Data[offset++] % 2 == 0)) {
-            use_weight = true;
-            if (offset < Size) {
-                weight = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Ensure weight has proper type
-                if (weight.scalar_type() != torch::kFloat && 
-                    weight.scalar_type() != torch::kDouble) {
-                    weight = weight.to(torch::kFloat);
-                }
-            } else {
-                // Create a default weight tensor
-                if (input.dim() > 1) {
-                    int64_t num_classes = input.size(1);
-                    weight = torch::ones({num_classes}, torch::kFloat) * weight_val;
-                } else {
-                    weight = torch::ones({1}, torch::kFloat) * weight_val;
-                }
-            }
-        }
-        
-        // Create reduction mode
-        torch::nn::MultiMarginLossOptions::reduction_t reduction_mode = torch::kMean;
-        if (offset < Size) {
-            uint8_t reduction_byte = Data[offset++];
-            if (reduction_byte % 3 == 0) {
+        // Determine reduction mode
+        torch::nn::MultiMarginLossOptions::reduction_t reduction_mode;
+        switch (reduction_byte % 3) {
+            case 0:
                 reduction_mode = torch::kNone;
-            } else if (reduction_byte % 3 == 1) {
+                break;
+            case 1:
                 reduction_mode = torch::kMean;
-            } else {
+                break;
+            default:
                 reduction_mode = torch::kSum;
+                break;
+        }
+        
+        // Create input tensor of shape (N, C) with requires_grad for backward pass
+        torch::Tensor input = torch::randn({batch_size, num_classes}, 
+            torch::TensorOptions().dtype(torch::kFloat).requires_grad(true));
+        
+        // Modify input based on fuzzer data if available
+        if (offset < Size) {
+            torch::Tensor fuzz_input = fuzzer_utils::createTensor(Data, Size, offset);
+            if (fuzz_input.numel() > 0) {
+                fuzz_input = fuzz_input.to(torch::kFloat).flatten();
+                int64_t copy_size = std::min(fuzz_input.numel(), input.numel());
+                input.flatten().slice(0, 0, copy_size).copy_(
+                    fuzz_input.slice(0, 0, copy_size).detach());
+                // Re-enable gradients after modification
+                input = input.detach().requires_grad_(true);
             }
         }
         
-        // Create MultiMarginLoss module with various configurations
-        torch::nn::MultiMarginLossOptions options;
-        options.p(p_val).margin(margin_val).reduction(reduction_mode);
+        // Create target tensor with valid class indices [0, num_classes-1]
+        torch::Tensor target = torch::zeros({batch_size}, torch::kLong);
+        for (int64_t i = 0; i < batch_size && (offset + i) < Size; i++) {
+            target[i] = static_cast<int64_t>(Data[offset + i] % num_classes);
+        }
+        if (offset < Size) {
+            offset += batch_size;
+        }
         
+        // Create MultiMarginLoss options
+        torch::nn::MultiMarginLossOptions options;
+        options.p(p_val);
+        options.margin(margin_val);
+        options.reduction(reduction_mode);
+        
+        // Create and set weight tensor if enabled
         if (use_weight) {
+            torch::Tensor weight = torch::ones({num_classes}, torch::kFloat);
+            // Vary weights based on fuzzer data
+            for (int64_t i = 0; i < num_classes && (offset + i) < Size; i++) {
+                weight[i] = static_cast<float>(Data[offset + i]) / 255.0f * 2.0f + 0.1f;
+            }
             options.weight(weight);
         }
         
+        // Create the loss module
         torch::nn::MultiMarginLoss loss_fn(options);
         
-        // Convert input to float if needed
-        if (input.scalar_type() != torch::kFloat && 
-            input.scalar_type() != torch::kDouble) {
-            input = input.to(torch::kFloat);
+        // Compute loss
+        torch::Tensor output;
+        try {
+            output = loss_fn(input, target);
+        } catch (const c10::Error&) {
+            // Shape or value errors are expected for some inputs
+            return 0;
         }
         
-        // Apply the loss function
-        torch::Tensor output = loss_fn(input, target);
+        // Perform backward pass to test gradient computation
+        if (output.numel() > 0) {
+            if (output.dim() == 0) {
+                // Scalar output (mean or sum reduction)
+                output.backward();
+            } else {
+                // Non-scalar output (no reduction)
+                torch::Tensor grad_output = torch::ones_like(output);
+                output.backward(grad_output);
+            }
+            
+            // Access gradients to ensure they were computed
+            if (input.grad().defined()) {
+                volatile float grad_sum = input.grad().sum().item<float>();
+                (void)grad_sum;
+            }
+        }
         
-        // Perform backward pass to test gradients
-        if (output.numel() > 0 && output.requires_grad()) {
-            output.backward();
+        // Test with different input configurations
+        if (offset + 4 < Size) {
+            // Test with 2D input requiring gradient
+            int64_t new_batch = (Data[offset++] % 8) + 1;
+            int64_t new_classes = (Data[offset++] % 8) + 2;
+            
+            torch::Tensor input2 = torch::randn({new_batch, new_classes},
+                torch::TensorOptions().dtype(torch::kFloat).requires_grad(true));
+            torch::Tensor target2 = torch::zeros({new_batch}, torch::kLong);
+            for (int64_t i = 0; i < new_batch && (offset + i) < Size; i++) {
+                target2[i] = static_cast<int64_t>(Data[offset + i] % new_classes);
+            }
+            
+            // Create new loss function without weight (different num_classes)
+            torch::nn::MultiMarginLossOptions opts2;
+            opts2.p(p_val);
+            opts2.margin(margin_val);
+            opts2.reduction(torch::kMean);
+            torch::nn::MultiMarginLoss loss_fn2(opts2);
+            
+            try {
+                torch::Tensor out2 = loss_fn2(input2, target2);
+                out2.backward();
+            } catch (const c10::Error&) {
+                // Expected for invalid configurations
+            }
         }
         
         return 0;
@@ -130,7 +153,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

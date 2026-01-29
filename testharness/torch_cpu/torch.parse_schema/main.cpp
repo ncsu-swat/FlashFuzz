@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -35,7 +41,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto schema_returns = parsed_schema.returns();
             auto schema_is_vararg = parsed_schema.is_vararg();
             auto schema_is_varret = parsed_schema.is_varret();
+            (void)schema_name;
+            (void)schema_overload_name;
+            (void)schema_arguments;
+            (void)schema_returns;
+            (void)schema_is_vararg;
+            (void)schema_is_varret;
         } catch (const c10::Error& e) {
+            // Expected exceptions from invalid schemas
+        } catch (const std::runtime_error& e) {
             // Expected exceptions from invalid schemas
         }
         
@@ -66,8 +80,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 auto schema_overload_name = parsed_schema.overload_name();
                 auto schema_arguments = parsed_schema.arguments();
                 auto schema_returns = parsed_schema.returns();
+                (void)schema_name;
+                (void)schema_overload_name;
+                (void)schema_arguments;
+                (void)schema_returns;
             } catch (const c10::Error& e) {
                 // This shouldn't happen with valid schemas, but handle it anyway
+            } catch (const std::runtime_error& e) {
+                // Handle runtime errors
             }
         }
         
@@ -86,8 +106,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 "aten::add(Tensor self, Tensor other, *, =1) -> Tensor", // Missing parameter name
                 "aten::add(Tensor self, Tensor other, *, Scalar alpha=1, ) -> Tensor", // Trailing comma
                 "aten::add(Tensor! self, Tensor other) -> Tensor", // Invalid type modifier
-                "aten::add(Tensor(a) self, Tensor other) -> Tensor", // Invalid type annotation
-                "aten::add(Tensor self, Tensor other) -> Tensor(a)", // Invalid return type annotation
+                "aten::add(Tensor(a) self, Tensor other) -> Tensor", // Alias annotation
+                "aten::add(Tensor self, Tensor other) -> Tensor(a)", // Return alias annotation
                 "aten::add(Tensor self, Tensor other) -> Tensor, ", // Trailing comma in return list
                 "aten::add(Tensor self, Tensor other) -> (Tensor,)", // Single return in tuple
                 "aten::add(Tensor self, Tensor other) -> (Tensor, )", // Trailing comma in return tuple
@@ -106,7 +126,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 // If we get here, the schema was actually valid
                 auto schema_name = parsed_schema.name();
                 auto schema_arguments = parsed_schema.arguments();
+                (void)schema_name;
+                (void)schema_arguments;
             } catch (const c10::Error& e) {
+                // Expected for malformed schemas
+            } catch (const std::runtime_error& e) {
                 // Expected for malformed schemas
             }
         }
@@ -193,7 +217,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 auto schema_overload_name = parsed_schema.overload_name();
                 auto schema_arguments = parsed_schema.arguments();
                 auto schema_returns = parsed_schema.returns();
+                (void)schema_name;
+                (void)schema_overload_name;
+                (void)schema_arguments;
+                (void)schema_returns;
             } catch (const c10::Error& e) {
+                // May happen with invalid schemas
+            } catch (const std::runtime_error& e) {
                 // May happen with invalid schemas
             }
         }
@@ -201,7 +231,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

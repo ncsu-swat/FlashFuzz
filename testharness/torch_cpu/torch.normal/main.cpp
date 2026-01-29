@@ -1,17 +1,21 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
@@ -19,22 +23,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor mean = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Create std tensor with remaining data
-        torch::Tensor std;
+        torch::Tensor std_tensor;
         if (offset < Size) {
-            std = fuzzer_utils::createTensor(Data, Size, offset);
+            std_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         } else {
             // If we don't have enough data for a second tensor, create a scalar
-            std = torch::tensor(1.0);
+            std_tensor = torch::tensor(1.0);
         }
         
-        // Test different variants of torch::normal
+        // Ensure std is positive (required for normal distribution)
+        std_tensor = torch::abs(std_tensor) + 0.001f;
         
         // Variant 1: normal with mean tensor and std tensor
-        if (mean.defined() && std.defined()) {
+        if (mean.defined() && std_tensor.defined()) {
             try {
-                torch::Tensor result1 = torch::normal(mean, std, torch::nullopt);
+                torch::Tensor result1 = torch::normal(mean, std_tensor, c10::nullopt);
+                (void)result1;
             } catch (...) {
-                // Catch and continue to test other variants
+                // Shape mismatch or other expected errors
             }
         }
         
@@ -44,107 +50,159 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&std_val, Data + offset, sizeof(float));
             offset += sizeof(float);
             
+            // Make std positive
+            std_val = std::fabs(std_val) + 0.001f;
+            
             try {
-                torch::Tensor result2 = torch::normal(mean, std_val, torch::nullopt);
+                torch::Tensor result2 = torch::normal(mean, static_cast<double>(std_val), c10::nullopt);
+                (void)result2;
             } catch (...) {
-                // Catch and continue
+                // Expected errors
             }
         }
         
         // Variant 3: normal with mean scalar and std tensor
-        if (std.defined() && offset + sizeof(float) <= Size) {
+        if (std_tensor.defined() && offset + sizeof(float) <= Size) {
             float mean_val;
             std::memcpy(&mean_val, Data + offset, sizeof(float));
             offset += sizeof(float);
             
+            // Ensure std is positive
+            torch::Tensor pos_std = torch::abs(std_tensor) + 0.001f;
+            
             try {
-                torch::Tensor result3 = torch::normal(mean_val, std, torch::nullopt);
+                torch::Tensor result3 = torch::normal(static_cast<double>(mean_val), pos_std, c10::nullopt);
+                (void)result3;
             } catch (...) {
-                // Catch and continue
+                // Expected errors
             }
         }
         
-        // Variant 4: normal with mean scalar and std scalar
-        if (offset + 2*sizeof(float) <= Size) {
+        // Variant 4: normal with mean scalar, std scalar, and size
+        if (offset + 2 * sizeof(float) <= Size) {
             float mean_val, std_val;
             std::memcpy(&mean_val, Data + offset, sizeof(float));
             offset += sizeof(float);
             std::memcpy(&std_val, Data + offset, sizeof(float));
             offset += sizeof(float);
             
-            try {
-                torch::Tensor result4 = torch::normal(mean_val, std_val, mean.sizes());
-            } catch (...) {
-                // Catch and continue
-            }
-        }
-        
-        // Variant 5: normal with size parameter
-        if (offset + 2*sizeof(float) <= Size) {
-            float mean_val, std_val;
-            std::memcpy(&mean_val, Data + offset, sizeof(float));
-            offset += sizeof(float);
-            std::memcpy(&std_val, Data + offset, sizeof(float));
-            offset += sizeof(float);
+            // Make std positive
+            std_val = std::fabs(std_val) + 0.001f;
             
-            // Create a size vector from remaining bytes
+            // Create a reasonable size vector
             std::vector<int64_t> size_vec;
             if (offset < Size) {
-                uint8_t dims = Data[offset++] % 5; // Up to 4 dimensions
-                for (uint8_t i = 0; i < dims && offset + sizeof(int64_t) <= Size; i++) {
-                    int64_t dim_size;
-                    std::memcpy(&dim_size, Data + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    // Allow any dimension size including negative to test error handling
+                uint8_t dims = (Data[offset++] % 4) + 1; // 1 to 4 dimensions
+                for (uint8_t i = 0; i < dims && offset < Size; i++) {
+                    // Use small positive sizes to avoid memory issues
+                    int64_t dim_size = (Data[offset++] % 16) + 1; // 1 to 16
                     size_vec.push_back(dim_size);
                 }
             }
             
+            if (size_vec.empty()) {
+                size_vec = {4, 4}; // Default size
+            }
+            
             try {
-                if (!size_vec.empty()) {
-                    torch::Tensor result5 = torch::normal(mean_val, std_val, size_vec);
-                }
+                torch::Tensor result4 = torch::normal(
+                    static_cast<double>(mean_val), 
+                    static_cast<double>(std_val), 
+                    size_vec);
+                (void)result4;
             } catch (...) {
-                // Catch and continue
+                // Expected errors
             }
         }
         
-        // Variant 6: normal with generator
-        if (offset + 2*sizeof(float) <= Size) {
+        // Variant 5: normal with generator
+        if (offset + 2 * sizeof(float) + sizeof(uint64_t) <= Size) {
             float mean_val, std_val;
             std::memcpy(&mean_val, Data + offset, sizeof(float));
             offset += sizeof(float);
             std::memcpy(&std_val, Data + offset, sizeof(float));
             offset += sizeof(float);
             
+            // Make std positive
+            std_val = std::fabs(std_val) + 0.001f;
+            
+            uint64_t seed;
+            std::memcpy(&seed, Data + offset, sizeof(uint64_t));
+            offset += sizeof(uint64_t);
+            
             try {
-                auto gen = torch::make_generator<torch::CPUGeneratorImpl>();
-                if (offset + sizeof(uint64_t) <= Size) {
-                    uint64_t seed;
-                    std::memcpy(&seed, Data + offset, sizeof(uint64_t));
-                    gen.set_current_seed(seed);
-                }
+                auto gen = torch::Generator();
+                gen.set_current_seed(seed);
                 
-                torch::Tensor result6 = torch::normal(mean_val, std_val, {3, 3}, gen);
+                torch::Tensor result5 = torch::normal(
+                    static_cast<double>(mean_val), 
+                    static_cast<double>(std_val), 
+                    {3, 3}, 
+                    gen);
+                (void)result5;
             } catch (...) {
-                // Catch and continue
+                // Expected errors
             }
         }
         
-        // Variant 7: out variant
-        if (mean.defined() && std.defined()) {
+        // Variant 6: normal_out with tensor inputs
+        if (mean.defined() && std_tensor.defined()) {
+            try {
+                // Ensure std is positive
+                torch::Tensor pos_std = torch::abs(std_tensor) + 0.001f;
+                
+                // Determine output shape via broadcasting
+                auto out_sizes = mean.sizes().vec();
+                torch::Tensor out = torch::empty(out_sizes, mean.options());
+                torch::normal_out(out, mean, pos_std, c10::nullopt);
+                (void)out;
+            } catch (...) {
+                // Shape mismatch or other expected errors
+            }
+        }
+        
+        // Variant 7: normal_out with scalar std (use 4-arg version to avoid ambiguity)
+        if (mean.defined() && offset + sizeof(float) <= Size) {
+            float std_val;
+            std::memcpy(&std_val, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            
+            // Make std positive
+            std_val = std::fabs(std_val) + 0.001f;
+            
             try {
                 torch::Tensor out = torch::empty_like(mean);
-                torch::normal_out(out, mean, std);
+                // Use the overload: normal_out(out, mean_tensor, std_double, generator)
+                torch::normal_out(out, mean, static_cast<double>(std_val), c10::nullopt);
+                (void)out;
             } catch (...) {
-                // Catch and continue
+                // Expected errors
+            }
+        }
+        
+        // Variant 8: normal_out with scalar mean
+        if (std_tensor.defined() && offset + sizeof(float) <= Size) {
+            float mean_val;
+            std::memcpy(&mean_val, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            
+            // Ensure std is positive
+            torch::Tensor pos_std = torch::abs(std_tensor) + 0.001f;
+            
+            try {
+                torch::Tensor out = torch::empty_like(pos_std);
+                // Use the overload: normal_out(out, mean_double, std_tensor, generator)
+                torch::normal_out(out, static_cast<double>(mean_val), pos_std, c10::nullopt);
+                (void)out;
+            } catch (...) {
+                // Expected errors
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

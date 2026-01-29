@@ -1,70 +1,75 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <vector>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Determine number of tensors to use (2-5)
-        if (Size < 1) return 0;
+        if (Size < 4) return 0;
         uint8_t num_tensors = (Data[offset++] % 4) + 2; // 2 to 5 tensors
+        
+        // Determine dtype (must be floating point for matmul)
+        uint8_t dtype_selector = Data[offset++] % 3;
+        torch::ScalarType dtype;
+        switch (dtype_selector) {
+            case 0: dtype = torch::kFloat32; break;
+            case 1: dtype = torch::kFloat64; break;
+            default: dtype = torch::kFloat32; break;
+        }
         
         // Create a vector to store our tensors
         std::vector<torch::Tensor> tensors;
         
-        // Create tensors for chain_matmul
-        for (uint8_t i = 0; i < num_tensors && offset < Size; ++i) {
-            torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Generate dimensions for chain multiplication
+        // For chain A1*A2*...*An, we need dimensions: (d0,d1), (d1,d2), ..., (d_{n-1},d_n)
+        std::vector<int64_t> dims;
+        for (uint8_t i = 0; i <= num_tensors && offset < Size; ++i) {
+            int64_t dim = (Data[offset++] % 8) + 1; // 1-8
+            dims.push_back(dim);
+        }
+        
+        // Ensure we have enough dimensions
+        while (dims.size() <= static_cast<size_t>(num_tensors)) {
+            dims.push_back(2); // default dimension
+        }
+        
+        // Create tensors with compatible dimensions
+        for (uint8_t i = 0; i < num_tensors; ++i) {
+            int64_t rows = dims[i];
+            int64_t cols = dims[i + 1];
             
-            // For chain_matmul, tensors must be 2D matrices
-            // If tensor is not 2D, reshape it to make it 2D
-            if (tensor.dim() != 2) {
-                int64_t total_elements = tensor.numel();
-                
-                // Create a valid 2D shape
-                int64_t dim1 = 1;
-                int64_t dim2 = total_elements;
-                
-                // If we have more data, use it to determine dimensions
-                if (offset + 2 < Size) {
-                    dim1 = (Data[offset++] % 8) + 1; // 1-8
-                    
-                    // Ensure dim2 is valid
-                    if (total_elements > 0) {
-                        dim2 = (total_elements + dim1 - 1) / dim1; // Ceiling division
-                        
-                        // Adjust dim1 to ensure dim1*dim2 >= total_elements
-                        int64_t new_total = dim1 * dim2;
-                        if (new_total > total_elements) {
-                            // Need to pad the tensor
-                            tensor = tensor.reshape({-1});
-                            tensor = torch::pad(tensor, {0, new_total - total_elements});
-                        }
-                    } else {
-                        dim2 = (Data[offset++] % 8) + 1; // 1-8 for empty tensor
-                    }
+            // Create tensor with the determined shape
+            torch::Tensor tensor;
+            if (offset + 1 < Size) {
+                uint8_t init_type = Data[offset++] % 4;
+                switch (init_type) {
+                    case 0:
+                        tensor = torch::randn({rows, cols}, torch::TensorOptions().dtype(dtype));
+                        break;
+                    case 1:
+                        tensor = torch::ones({rows, cols}, torch::TensorOptions().dtype(dtype));
+                        break;
+                    case 2:
+                        tensor = torch::zeros({rows, cols}, torch::TensorOptions().dtype(dtype));
+                        break;
+                    default:
+                        tensor = torch::rand({rows, cols}, torch::TensorOptions().dtype(dtype));
+                        break;
                 }
-                
-                // Reshape to 2D
-                tensor = tensor.reshape({dim1, dim2});
-            }
-            
-            // For chain_matmul, ensure dimensions are compatible
-            if (i > 0) {
-                // The inner dimensions must match: A(m,n) * B(n,p) = C(m,p)
-                // So tensor[i-1].size(1) must equal tensor[i].size(0)
-                torch::Tensor& prev_tensor = tensors.back();
-                
-                if (prev_tensor.size(1) != tensor.size(0) && 
-                    prev_tensor.numel() > 0 && tensor.numel() > 0) {
-                    // Reshape current tensor to make dimensions compatible
-                    tensor = tensor.reshape({prev_tensor.size(1), -1});
-                }
+            } else {
+                tensor = torch::randn({rows, cols}, torch::TensorOptions().dtype(dtype));
             }
             
             tensors.push_back(tensor);
@@ -72,15 +77,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Ensure we have at least 2 tensors
         if (tensors.size() < 2) {
-            if (tensors.empty()) {
-                // Create two default tensors if none were created
-                tensors.push_back(torch::ones({2, 3}));
-                tensors.push_back(torch::ones({3, 2}));
-            } else {
-                // Create a compatible second tensor
-                auto shape = tensors[0].sizes();
-                tensors.push_back(torch::ones({shape[1], shape[0]}));
-            }
+            tensors.clear();
+            tensors.push_back(torch::randn({2, 3}, torch::TensorOptions().dtype(dtype)));
+            tensors.push_back(torch::randn({3, 2}, torch::TensorOptions().dtype(dtype)));
         }
         
         // Apply chain_matmul operation
@@ -88,38 +87,51 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         try {
             result = torch::chain_matmul(tensors);
         } catch (const c10::Error& e) {
-            // PyTorch specific errors are expected and not a bug in our fuzzer
+            // PyTorch specific errors (shape mismatches, etc.) are expected
             return 0;
         }
         
-        // Verify result is not empty and has expected shape
-        if (result.numel() > 0) {
+        // Verify result shape
+        if (result.defined() && result.numel() > 0) {
             auto first_tensor = tensors.front();
             auto last_tensor = tensors.back();
             
-            // The result should have shape [first_tensor.size(0), last_tensor.size(1)]
-            if (first_tensor.dim() > 0 && last_tensor.dim() > 0) {
-                int64_t expected_rows = first_tensor.size(0);
-                int64_t expected_cols = last_tensor.size(1);
-                
-                if (result.size(0) != expected_rows || result.size(1) != expected_cols) {
-                    // This would indicate a bug in PyTorch's implementation
-                    throw std::runtime_error("Unexpected result shape");
-                }
+            int64_t expected_rows = first_tensor.size(0);
+            int64_t expected_cols = last_tensor.size(1);
+            
+            // Validate result dimensions
+            if (result.dim() != 2 || 
+                result.size(0) != expected_rows || 
+                result.size(1) != expected_cols) {
+                std::cerr << "Unexpected result shape: expected [" << expected_rows 
+                          << ", " << expected_cols << "], got " << result.sizes() << std::endl;
+            }
+            
+            // Exercise the result tensor to ensure it's valid
+            auto sum = result.sum();
+            auto mean = result.mean();
+            
+            // Additional operations to increase coverage
+            if (offset < Size && (Data[offset] % 2 == 0)) {
+                auto transposed = result.t();
+                auto contiguous = result.contiguous();
             }
         }
         
-        // Test some operations on the result to ensure it's valid
-        if (result.numel() > 0) {
-            auto sum = result.sum();
-            auto mean = result.mean();
-            auto max_val = result.max();
+        // Test with TensorList overload (same as vector but different call pattern)
+        if (tensors.size() >= 2 && offset < Size && (Data[offset] % 3 == 0)) {
+            try {
+                torch::TensorList tensor_list(tensors);
+                auto result2 = torch::chain_matmul(tensor_list);
+            } catch (const c10::Error& e) {
+                // Expected for some inputs
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

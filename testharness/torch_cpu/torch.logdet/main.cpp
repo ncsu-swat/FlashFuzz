@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For std::sqrt
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,7 +28,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (input.dim() < 2) {
             // If tensor is 0D or 1D, reshape it to a square matrix
             int64_t total_elements = input.numel();
-            int64_t side_length = static_cast<int64_t>(std::sqrt(total_elements));
+            int64_t side_length = static_cast<int64_t>(std::sqrt(static_cast<double>(total_elements)));
             
             // Ensure we have at least a 1x1 matrix
             side_length = std::max(side_length, static_cast<int64_t>(1));
@@ -46,14 +51,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             input = square_input;
         } else if (input.dim() > 2) {
-            // If tensor has more than 2 dimensions, take the first 2D slice
+            // If tensor has more than 2 dimensions, take the last two dimensions as batch
+            // logdet supports batched input of shape (..., n, n)
             std::vector<int64_t> sizes = input.sizes().vec();
-            int64_t dim0 = sizes[0];
-            int64_t dim1 = sizes[1];
+            int64_t dim0 = sizes[sizes.size() - 2];
+            int64_t dim1 = sizes[sizes.size() - 1];
             
-            // Make it square by taking the smaller dimension
+            // Make last two dims square by taking the smaller dimension
             int64_t square_dim = std::min(dim0, dim1);
-            input = input.slice(0, 0, square_dim).slice(1, 0, square_dim);
+            if (square_dim < 1) square_dim = 1;
+            input = input.narrow(-2, 0, square_dim).narrow(-1, 0, square_dim);
         } else {
             // Already 2D, make it square if needed
             int64_t dim0 = input.size(0);
@@ -61,27 +68,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             if (dim0 != dim1) {
                 int64_t square_dim = std::min(dim0, dim1);
+                if (square_dim < 1) square_dim = 1;
                 input = input.slice(0, 0, square_dim).slice(1, 0, square_dim);
             }
-        }
-        
-        // For complex tensors, ensure they're Hermitian positive-definite
-        // For real tensors, ensure they're symmetric positive-definite
-        // This is not strictly necessary for the fuzzer, but helps test more valid inputs
-        if (input.is_complex()) {
-            // Make Hermitian by averaging with conjugate transpose
-            input = 0.5 * (input + input.transpose(-2, -1).conj());
-            
-            // Add to identity to help make positive-definite
-            auto identity = torch::eye(input.size(0), input.options());
-            input = input + identity * (input.size(0) + 1);
-        } else {
-            // Make symmetric by averaging with transpose
-            input = 0.5 * (input + input.transpose(-2, -1));
-            
-            // Add to identity to help make positive-definite
-            auto identity = torch::eye(input.size(0), input.options());
-            input = input + identity * (input.size(0) + 1);
         }
         
         // Convert to float or double for numerical stability
@@ -89,19 +78,55 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             input = input.to(torch::kFloat);
         }
         
-        // Apply logdet operation
-        torch::Tensor result = torch::logdet(input);
+        // Test 1: Raw input (may be singular, testing edge cases)
+        try {
+            torch::Tensor result1 = torch::logdet(input);
+            // Access result to prevent optimization
+            volatile auto dummy1 = result1.data_ptr();
+            (void)dummy1;
+        } catch (...) {
+            // Expected for singular matrices
+        }
         
-        // Optional: Try to use the result to ensure it's not optimized away
-        if (result.numel() > 0) {
-            volatile float dummy = result.item<float>();
-            (void)dummy;
+        // Test 2: Make positive-definite for valid logdet computation
+        torch::Tensor pd_input;
+        if (input.is_complex()) {
+            // Make Hermitian by averaging with conjugate transpose
+            pd_input = 0.5 * (input + input.transpose(-2, -1).conj());
+            
+            // Add scaled identity to help make positive-definite
+            auto identity = torch::eye(input.size(-1), input.options());
+            pd_input = pd_input + identity * (static_cast<float>(input.size(-1)) + 1.0f);
+        } else {
+            // Make symmetric by averaging with transpose
+            pd_input = 0.5 * (input + input.transpose(-2, -1));
+            
+            // Add scaled identity to help make positive-definite
+            auto identity = torch::eye(input.size(-1), input.options());
+            pd_input = pd_input + identity * (static_cast<float>(input.size(-1)) + 1.0f);
+        }
+        
+        // Apply logdet operation on positive-definite matrix
+        torch::Tensor result = torch::logdet(pd_input);
+        
+        // Access result to ensure it's not optimized away
+        volatile auto dummy = result.data_ptr();
+        (void)dummy;
+        
+        // Test 3: Test with contiguous input
+        try {
+            torch::Tensor contig_input = pd_input.contiguous();
+            torch::Tensor result3 = torch::logdet(contig_input);
+            volatile auto dummy3 = result3.data_ptr();
+            (void)dummy3;
+        } catch (...) {
+            // Silently handle
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

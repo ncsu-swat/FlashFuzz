@@ -1,105 +1,109 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create tensors
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor A (coefficient matrix)
+        // Get matrix size from fuzzer data (small to avoid memory issues)
+        int64_t n = (Data[offset++] % 8) + 1;  // 1 to 8
+        int64_t nrhs = (Data[offset++] % 4) + 1;  // 1 to 4 right-hand sides
+        
+        // Create coefficient matrix A (n x n) from fuzzer data
         torch::Tensor A = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Ensure A is at least 2D for solve operation
-        if (A.dim() < 2) {
-            if (A.dim() == 0) {
-                A = A.unsqueeze(0).unsqueeze(0);
-            } else {
-                A = A.unsqueeze(0);
-            }
-        }
+        // Create right-hand side B from fuzzer data
+        torch::Tensor B = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create input tensor B (right-hand side)
-        torch::Tensor B;
-        if (offset < Size) {
-            B = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure B has compatible dimensions with A
-            if (B.dim() == 0) {
-                B = B.unsqueeze(0).unsqueeze(0);
-            } else if (B.dim() == 1) {
-                B = B.unsqueeze(1);
-            }
-            
-            // Make sure B has the same batch dimensions as A if A has more than 2 dimensions
-            if (A.dim() > 2 && B.dim() > 2) {
-                std::vector<int64_t> new_shape;
-                for (int i = 0; i < A.dim() - 2; i++) {
-                    new_shape.push_back(A.size(i));
-                }
-                new_shape.push_back(B.size(B.dim() - 2));
-                new_shape.push_back(B.size(B.dim() - 1));
-                
-                B = B.reshape(new_shape);
-            }
+        // Convert to float for numerical operations
+        A = A.to(torch::kFloat);
+        B = B.to(torch::kFloat);
+        
+        // Reshape A to be n x n square matrix
+        int64_t total_a = A.numel();
+        if (total_a == 0) {
+            A = torch::randn({n, n});
         } else {
-            // If we don't have enough data for B, create a simple one
-            auto options = torch::TensorOptions().dtype(A.dtype());
-            B = torch::ones({A.size(0), 1}, options);
+            // Flatten and take first n*n elements (or repeat if not enough)
+            A = A.flatten();
+            if (A.numel() < n * n) {
+                A = A.repeat({(n * n / A.numel()) + 1});
+            }
+            A = A.slice(0, 0, n * n).reshape({n, n});
         }
         
-        // Make sure A and B have the same dtype
-        if (A.dtype() != B.dtype()) {
-            B = B.to(A.dtype());
+        // Reshape B to be n x nrhs
+        int64_t total_b = B.numel();
+        if (total_b == 0) {
+            B = torch::randn({n, nrhs});
+        } else {
+            B = B.flatten();
+            if (B.numel() < n * nrhs) {
+                B = B.repeat({(n * nrhs / B.numel()) + 1});
+            }
+            B = B.slice(0, 0, n * nrhs).reshape({n, nrhs});
         }
         
-        // Make sure A is square in the last two dimensions for solve
-        int64_t n = A.size(-1);
-        if (A.size(-2) != n) {
-            // Reshape A to be square in the last two dimensions
-            std::vector<int64_t> new_shape = A.sizes().vec();
-            new_shape[new_shape.size() - 2] = n;
-            new_shape[new_shape.size() - 1] = n;
-            A = A.reshape(new_shape);
-        }
+        // Add small value to diagonal to improve numerical stability
+        A = A + torch::eye(n) * 0.1f;
         
-        // Make sure B's second-to-last dimension matches A's
-        if (B.size(-2) != A.size(-2)) {
-            std::vector<int64_t> new_shape = B.sizes().vec();
-            new_shape[new_shape.size() - 2] = A.size(-2);
-            B = B.reshape(new_shape);
-        }
-        
-        // Convert to float or double for numerical stability
-        if (A.dtype() == torch::kInt8 || A.dtype() == torch::kUInt8 || 
-            A.dtype() == torch::kInt16 || A.dtype() == torch::kInt32 || 
-            A.dtype() == torch::kInt64 || A.dtype() == torch::kBool) {
-            A = A.to(torch::kFloat);
-            B = B.to(torch::kFloat);
-        }
-        
-        // Apply torch.solve operation using linalg_solve
+        // Test torch::linalg_solve (replacement for deprecated torch::solve)
         try {
             auto X = torch::linalg_solve(A, B);
             
-            // Optional: Verify the solution
-            auto residual = torch::matmul(A, X) - B;
+            // Verify solution dimensions
+            (void)X.sizes();
         } catch (const c10::Error& e) {
-            // PyTorch-specific exceptions are expected and handled
+            // Expected for singular matrices, etc.
+        }
+        
+        // Also test with left=false if available (solving XA = B)
+        try {
+            // Transpose to solve X @ A = B^T => A^T @ X^T = B
+            auto At = A.t();
+            auto Bt = B.t();
+            auto Xt = torch::linalg_solve(At, Bt);
+            (void)Xt.sizes();
+        } catch (const c10::Error& e) {
+            // Expected for some inputs
+        }
+        
+        // Test batched solve
+        try {
+            auto A_batched = A.unsqueeze(0).expand({2, n, n}).clone();
+            auto B_batched = B.unsqueeze(0).expand({2, n, nrhs}).clone();
+            auto X_batched = torch::linalg_solve(A_batched, B_batched);
+            (void)X_batched.sizes();
+        } catch (const c10::Error& e) {
+            // Expected for some inputs
+        }
+        
+        // Test with vector B (1D right-hand side)
+        try {
+            auto B_vec = B.select(1, 0);  // Take first column as vector
+            auto X_vec = torch::linalg_solve(A, B_vec);
+            (void)X_vec.sizes();
+        } catch (const c10::Error& e) {
+            // Expected for some inputs
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

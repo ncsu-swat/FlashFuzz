@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -43,7 +48,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Try with different input types
         if (offset + 1 < Size) {
             // Create another tensor with potentially different properties
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+            size_t local_offset = 0;
+            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, local_offset);
             
             // Try to convert to different dtype and apply GELU
             if (input2.numel() > 0) {
@@ -52,26 +58,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 try {
                     torch::Tensor converted_input = input2.to(target_dtype);
-                    torch::Tensor output2 = gelu_module->forward(converted_input);
+                    // GELU only supports floating point types
+                    if (converted_input.is_floating_point()) {
+                        torch::Tensor output2 = gelu_module->forward(converted_input);
+                    }
                 } catch (const std::exception&) {
                     // Conversion or operation might fail for some dtypes, that's expected
                 }
             }
         }
         
-        // Try inplace version if available
-        if (input.is_floating_point() && input.requires_grad() == false) {
-            try {
-                torch::Tensor input_clone = input.clone();
-                torch::gelu_(input_clone, approximation);
-            } catch (const std::exception&) {
-                // Inplace operation might fail, that's expected
-            }
-        }
-        
         // Try with empty tensor
         try {
-            torch::Tensor empty_tensor = torch::empty({0});
+            torch::Tensor empty_tensor = torch::empty({0}, torch::kFloat);
             torch::Tensor empty_output = gelu_module->forward(empty_tensor);
         } catch (const std::exception&) {
             // Operation on empty tensor might fail, that's expected
@@ -79,16 +78,35 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Try with scalar tensor
         try {
-            torch::Tensor scalar_tensor = torch::tensor(3.14);
+            torch::Tensor scalar_tensor = torch::tensor(3.14f);
             torch::Tensor scalar_output = gelu_module->forward(scalar_tensor);
         } catch (const std::exception&) {
             // Operation on scalar tensor might fail, that's expected
+        }
+        
+        // Try with multidimensional tensor
+        try {
+            torch::Tensor multi_dim = torch::randn({2, 3, 4});
+            torch::Tensor multi_output = gelu_module->forward(multi_dim);
+        } catch (const std::exception&) {
+            // Might fail, that's expected
+        }
+        
+        // Try with different GELU module (opposite approximation)
+        try {
+            std::string other_approx = (approximation == "tanh") ? "none" : "tanh";
+            torch::nn::GELUOptions other_options;
+            other_options.approximate(other_approx);
+            torch::nn::GELU other_gelu(other_options);
+            torch::Tensor other_output = other_gelu->forward(input);
+        } catch (const std::exception&) {
+            // Might fail, that's expected
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

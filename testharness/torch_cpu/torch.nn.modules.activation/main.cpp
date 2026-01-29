@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For std::isnan, std::isinf
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -31,11 +36,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&alpha, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize alpha - avoid NaN, Inf, and extreme values
+            if (std::isnan(alpha) || std::isinf(alpha)) {
+                alpha = 0.01;
+            }
+            alpha = std::max(-100.0, std::min(100.0, alpha));
         }
         
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&beta, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize beta - avoid NaN, Inf, and extreme values
+            if (std::isnan(beta) || std::isinf(beta)) {
+                beta = 1.0;
+            }
+            beta = std::max(-100.0, std::min(100.0, beta));
         }
         
         if (offset + sizeof(int64_t) <= Size) {
@@ -55,7 +70,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 // ReLU with inplace option
                 bool inplace = offset < Size && (Data[offset++] & 0x01);
                 auto relu = torch::nn::ReLU(torch::nn::ReLUOptions().inplace(inplace));
-                auto output = relu->forward(input);
+                // Clone for inplace to avoid modifying original fuzzer tensor
+                auto input_copy = inplace ? input.clone() : input;
+                auto output = relu->forward(input_copy);
                 break;
             }
             case 2: {
@@ -68,7 +85,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 // LeakyReLU with inplace option
                 bool inplace = offset < Size && (Data[offset++] & 0x01);
                 auto leaky_relu = torch::nn::LeakyReLU(torch::nn::LeakyReLUOptions().negative_slope(alpha).inplace(inplace));
-                auto output = leaky_relu->forward(input);
+                auto input_copy = inplace ? input.clone() : input;
+                auto output = leaky_relu->forward(input_copy);
                 break;
             }
             case 4: {
@@ -79,25 +97,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             case 5: {
                 // Tanh
-                auto tanh = torch::nn::Tanh();
-                auto output = tanh->forward(input);
+                auto tanh_module = torch::nn::Tanh();
+                auto output = tanh_module->forward(input);
                 break;
             }
             case 6: {
-                // Softmax
-                auto softmax = torch::nn::Softmax(dim % (input.dim() + 1));
-                auto output = softmax->forward(input);
+                // Softmax - requires at least 1 dimension
+                if (input.dim() > 0) {
+                    int64_t valid_dim = dim % input.dim();
+                    if (valid_dim < 0) valid_dim += input.dim();
+                    auto softmax = torch::nn::Softmax(torch::nn::SoftmaxOptions(valid_dim));
+                    auto output = softmax->forward(input);
+                }
                 break;
             }
             case 7: {
-                // LogSoftmax
-                auto log_softmax = torch::nn::LogSoftmax(dim % (input.dim() + 1));
-                auto output = log_softmax->forward(input);
+                // LogSoftmax - requires at least 1 dimension
+                if (input.dim() > 0) {
+                    int64_t valid_dim = dim % input.dim();
+                    if (valid_dim < 0) valid_dim += input.dim();
+                    auto log_softmax = torch::nn::LogSoftmax(torch::nn::LogSoftmaxOptions(valid_dim));
+                    auto output = log_softmax->forward(input);
+                }
                 break;
             }
             case 8: {
                 // ELU
-                auto elu = torch::nn::ELU(torch::nn::ELUOptions().alpha(alpha));
+                double elu_alpha = std::abs(alpha) + 0.001; // ELU alpha should be positive
+                auto elu = torch::nn::ELU(torch::nn::ELUOptions().alpha(elu_alpha));
                 auto output = elu->forward(input);
                 break;
             }
@@ -109,7 +136,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             case 10: {
                 // CELU
-                auto celu = torch::nn::CELU(torch::nn::CELUOptions().alpha(alpha));
+                double celu_alpha = std::abs(alpha) + 0.001; // CELU alpha should be positive and non-zero
+                auto celu = torch::nn::CELU(torch::nn::CELUOptions().alpha(celu_alpha));
                 auto output = celu->forward(input);
                 break;
             }
@@ -121,13 +149,19 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             case 12: {
                 // Hardshrink
-                auto hardshrink = torch::nn::Hardshrink(torch::nn::HardshrinkOptions().lambda(alpha));
+                double lambda_val = std::abs(alpha); // lambda should be non-negative
+                auto hardshrink = torch::nn::Hardshrink(torch::nn::HardshrinkOptions().lambda(lambda_val));
                 auto output = hardshrink->forward(input);
                 break;
             }
             case 13: {
-                // Hardtanh
-                auto hardtanh = torch::nn::Hardtanh(torch::nn::HardtanhOptions().min_val(-alpha).max_val(beta));
+                // Hardtanh - ensure min_val < max_val
+                double min_val = std::min(alpha, beta);
+                double max_val = std::max(alpha, beta);
+                if (min_val == max_val) {
+                    max_val = min_val + 1.0;
+                }
+                auto hardtanh = torch::nn::Hardtanh(torch::nn::HardtanhOptions().min_val(min_val).max_val(max_val));
                 auto output = hardtanh->forward(input);
                 break;
             }
@@ -142,7 +176,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

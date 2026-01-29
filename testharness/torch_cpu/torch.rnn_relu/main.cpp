@@ -1,132 +1,190 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to proceed
-        if (Size < 4) {
+        // Need enough data for parameters
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract RNN parameters from fuzzer data
+        int64_t seq_len = (Data[offset++] % 10) + 1;      // 1-10
+        int64_t batch_size = (Data[offset++] % 8) + 1;    // 1-8
+        int64_t input_size = (Data[offset++] % 16) + 1;   // 1-16
+        int64_t hidden_size = (Data[offset++] % 16) + 1;  // 1-16
+        int64_t num_layers = (Data[offset++] % 3) + 1;    // 1-3
         
-        // Create weight tensors
-        torch::Tensor weight_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor weight_hh = fuzzer_utils::createTensor(Data, Size, offset);
+        bool batch_first = Data[offset++] & 0x1;
+        bool bidirectional = Data[offset++] & 0x1;
+        bool has_h0 = Data[offset++] & 0x1;
         
-        // Create bias tensors (optional)
-        bool has_biases = offset < Size && (Data[offset++] & 0x1);
-        torch::Tensor bias_ih, bias_hh;
-        
-        if (has_biases) {
-            bias_ih = fuzzer_utils::createTensor(Data, Size, offset);
-            bias_hh = fuzzer_utils::createTensor(Data, Size, offset);
-        }
-        
-        // Get parameters for RNN
-        int64_t hidden_size = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&hidden_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            hidden_size = std::abs(hidden_size) % 64 + 1; // Ensure positive and reasonable size
-        } else {
-            hidden_size = 10; // Default value
-        }
-        
-        int64_t num_layers = 1;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&num_layers, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            num_layers = std::abs(num_layers) % 3 + 1; // 1-3 layers is reasonable
-        }
-        
-        bool batch_first = offset < Size && (Data[offset++] & 0x1);
-        bool bidirectional = offset < Size && (Data[offset++] & 0x1);
         double dropout = 0.0;
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&dropout, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            dropout = std::abs(dropout) / 10.0; // Ensure reasonable dropout value
+        if (num_layers > 1 && offset < Size) {
+            dropout = (Data[offset++] % 50) / 100.0;  // 0.0 - 0.49
         }
         
-        // Create initial hidden state (optional)
-        bool has_h0 = offset < Size && (Data[offset++] & 0x1);
+        int64_t num_directions = bidirectional ? 2 : 1;
+        
+        // Create input tensor with proper shape
+        torch::Tensor input;
+        if (batch_first) {
+            input = torch::randn({batch_size, seq_len, input_size});
+        } else {
+            input = torch::randn({seq_len, batch_size, input_size});
+        }
+        
+        // Create initial hidden state if requested
         torch::Tensor h0;
         if (has_h0) {
-            h0 = fuzzer_utils::createTensor(Data, Size, offset);
+            h0 = torch::randn({num_layers * num_directions, batch_size, hidden_size});
         }
         
-        // Try different variants of the RNN call
+        // Variant 1: Test torch::nn::RNN with ReLU nonlinearity
         try {
-            // Variant 1: Basic RNN call
-            auto rnn = torch::nn::RNN(torch::nn::RNNOptions(input.size(-1), hidden_size)
-                                     .num_layers(num_layers)
-                                     .batch_first(batch_first)
-                                     .bidirectional(bidirectional)
-                                     .dropout(dropout)
-                                     .nonlinearity(torch::kReLU));
+            auto rnn_options = torch::nn::RNNOptions(input_size, hidden_size)
+                .num_layers(num_layers)
+                .batch_first(batch_first)
+                .bidirectional(bidirectional)
+                .nonlinearity(torch::kReLU);
             
-            auto output = rnn->forward(input);
+            if (num_layers > 1) {
+                rnn_options.dropout(dropout);
+            }
             
-            // Variant 2: With initial hidden state
+            auto rnn = torch::nn::RNN(rnn_options);
+            
             if (has_h0) {
-                auto output_with_h0 = rnn->forward(input, h0);
-            }
-            
-            // Variant 3: Direct call to functional API
-            if (has_biases) {
-                auto output_functional = torch::rnn_relu(
-                    input, h0, 
-                    {weight_ih, weight_hh, bias_ih, bias_hh}, 
-                    has_biases,
-                    num_layers, dropout, true, 
-                    bidirectional, batch_first);
+                auto [output, hn] = rnn->forward(input, h0);
+                (void)output;
+                (void)hn;
             } else {
-                auto output_functional = torch::rnn_relu(
-                    input, h0, 
-                    {weight_ih, weight_hh}, 
-                    has_biases,
-                    num_layers, dropout, true, 
-                    bidirectional, batch_first);
+                auto [output, hn] = rnn->forward(input);
+                (void)output;
+                (void)hn;
+            }
+        } catch (const std::exception&) {
+            // Shape mismatches or other expected errors
+        }
+        
+        // Variant 2: Test torch::nn::RNNCell with ReLU nonlinearity
+        try {
+            auto rnn_cell = torch::nn::RNNCell(
+                torch::nn::RNNCellOptions(input_size, hidden_size)
+                    .nonlinearity(torch::kReLU));
+            
+            // Create single timestep input: (batch, input_size)
+            torch::Tensor cell_input = torch::randn({batch_size, input_size});
+            torch::Tensor hx = torch::randn({batch_size, hidden_size});
+            
+            // Forward with hidden state
+            torch::Tensor h_new = rnn_cell->forward(cell_input, hx);
+            (void)h_new;
+            
+            // Forward without explicit hidden state (uses zeros)
+            torch::Tensor h_new2 = rnn_cell->forward(cell_input);
+            (void)h_new2;
+        } catch (const std::exception&) {
+            // Expected errors
+        }
+        
+        // Variant 3: Test the low-level torch::rnn_relu function if available
+        try {
+            // Create properly shaped weight tensors for a single layer
+            // weight_ih: (hidden_size, input_size)
+            // weight_hh: (hidden_size, hidden_size)
+            // bias_ih: (hidden_size)
+            // bias_hh: (hidden_size)
+            
+            torch::Tensor weight_ih = torch::randn({hidden_size, input_size});
+            torch::Tensor weight_hh = torch::randn({hidden_size, hidden_size});
+            torch::Tensor bias_ih = torch::randn({hidden_size});
+            torch::Tensor bias_hh = torch::randn({hidden_size});
+            
+            // For multi-layer, we need weights for each layer
+            std::vector<torch::Tensor> all_weights;
+            for (int64_t layer = 0; layer < num_layers; ++layer) {
+                int64_t layer_input_size = (layer == 0) ? input_size : hidden_size * num_directions;
+                
+                for (int64_t dir = 0; dir < num_directions; ++dir) {
+                    all_weights.push_back(torch::randn({hidden_size, layer_input_size}));  // weight_ih
+                    all_weights.push_back(torch::randn({hidden_size, hidden_size}));       // weight_hh
+                    all_weights.push_back(torch::randn({hidden_size}));                    // bias_ih
+                    all_weights.push_back(torch::randn({hidden_size}));                    // bias_hh
+                }
             }
             
-            // Variant 4: Cell-level operations
-            auto rnn_cell = torch::nn::RNNCell(torch::nn::RNNCellOptions(input.size(-1), hidden_size)
-                                              .nonlinearity(torch::kReLU));
+            torch::Tensor hx_func = torch::randn({num_layers * num_directions, batch_size, hidden_size});
             
-            // Try to get a single input for the cell
-            torch::Tensor single_input;
-            if (input.dim() > 1) {
-                single_input = input.select(0, 0);
-            } else {
-                single_input = input;
+            // Prepare input in non-batch-first format for the functional API
+            torch::Tensor func_input = batch_first ? input.transpose(0, 1) : input;
+            
+            auto result = torch::rnn_relu(
+                func_input,
+                hx_func,
+                all_weights,
+                true,           // has_biases
+                num_layers,
+                dropout,
+                false,          // training = false for inference
+                bidirectional,
+                false           // batch_first = false (we transposed above)
+            );
+            
+            (void)std::get<0>(result);  // output
+            (void)std::get<1>(result);  // hn
+        } catch (const std::exception&) {
+            // Expected errors from parameter mismatches
+        }
+        
+        // Variant 4: Test without biases
+        try {
+            std::vector<torch::Tensor> weights_no_bias;
+            for (int64_t layer = 0; layer < num_layers; ++layer) {
+                int64_t layer_input_size = (layer == 0) ? input_size : hidden_size * num_directions;
+                
+                for (int64_t dir = 0; dir < num_directions; ++dir) {
+                    weights_no_bias.push_back(torch::randn({hidden_size, layer_input_size}));
+                    weights_no_bias.push_back(torch::randn({hidden_size, hidden_size}));
+                }
             }
             
-            // Create a hidden state for the cell if needed
-            torch::Tensor cell_hidden;
-            if (has_h0 && h0.dim() > 0) {
-                cell_hidden = h0.select(0, 0);
-            } else {
-                cell_hidden = torch::zeros({hidden_size}, input.options());
-            }
+            torch::Tensor hx_nb = torch::randn({num_layers * num_directions, batch_size, hidden_size});
+            torch::Tensor func_input = batch_first ? input.transpose(0, 1) : input;
             
-            auto cell_output = rnn_cell->forward(single_input, cell_hidden);
-        } catch (const std::exception& e) {
-            // Catch inner exceptions but continue with the fuzzing
+            auto result = torch::rnn_relu(
+                func_input,
+                hx_nb,
+                weights_no_bias,
+                false,          // has_biases = false
+                num_layers,
+                dropout,
+                false,          // training
+                bidirectional,
+                false           // batch_first
+            );
+            
+            (void)std::get<0>(result);
+            (void)std::get<1>(result);
+        } catch (const std::exception&) {
+            // Expected errors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

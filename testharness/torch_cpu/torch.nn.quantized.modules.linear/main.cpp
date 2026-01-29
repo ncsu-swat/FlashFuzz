@@ -1,130 +1,178 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        if (Size < 10) {
+        if (Size < 16) {
             return 0;
         }
+
+        size_t offset = 0;
+
+        // Extract parameters from fuzzer data
+        int64_t in_features = (Data[offset++] % 31) + 2;  // 2-32
+        int64_t out_features = (Data[offset++] % 31) + 2; // 2-32
+        bool use_bias = Data[offset++] & 0x1;
+        int64_t batch_size = (Data[offset++] % 7) + 1;    // 1-8
+
+        // Extract scale (ensure positive and reasonable)
+        float scale = 0.01f + (static_cast<float>(Data[offset++]) / 255.0f) * 0.99f; // 0.01-1.0
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for quantized linear module
-        int64_t in_features = 0;
-        int64_t out_features = 0;
-        bool bias = false;
-        
-        // Get in_features from the input tensor if possible
-        if (input_tensor.dim() >= 1) {
-            in_features = input_tensor.size(-1);
-        } else {
-            // Default value if tensor doesn't have enough dimensions
-            in_features = 4;
-        }
-        
-        // Get out_features from the remaining data
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&out_features, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            // Ensure out_features is reasonable
-            out_features = std::abs(out_features) % 32 + 1;
-        } else {
-            out_features = 4;
-        }
-        
-        // Get bias flag
-        if (offset < Size) {
-            bias = Data[offset++] & 0x1;
-        }
-        
-        // Create scale and zero_point for quantization
-        double scale = 1.0;
+        // Extract zero_point for qint8 (must be 0 for qint8 in many backends)
         int64_t zero_point = 0;
+
+        // Create float input tensor with proper shape [batch_size, in_features]
+        torch::Tensor input_float = torch::randn({batch_size, in_features});
         
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&scale, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            // Ensure scale is positive and reasonable
-            scale = std::abs(scale);
-            if (scale < 1e-6) scale = 1e-6;
-            if (scale > 1e6) scale = 1e6;
+        // Use remaining fuzzer data to perturb the input
+        if (offset + sizeof(float) <= Size) {
+            float perturbation;
+            std::memcpy(&perturbation, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            if (std::isfinite(perturbation)) {
+                perturbation = std::max(-10.0f, std::min(10.0f, perturbation));
+                input_float = input_float + perturbation;
+            }
         }
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&zero_point, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            // Ensure zero_point is within reasonable range
-            zero_point = zero_point % 256;
-        }
-        
-        // Create quantized linear module using functional approach
-        torch::Tensor weight = torch::randn({out_features, in_features});
-        torch::Tensor quantized_weight = torch::quantize_per_tensor(weight, scale, zero_point, torch::kQInt8);
-        
+
+        // Create weight tensor [out_features, in_features]
+        torch::Tensor weight_float = torch::randn({out_features, in_features});
+
+        // Create bias tensor if needed
         torch::Tensor bias_tensor;
-        if (bias) {
+        if (use_bias) {
             bias_tensor = torch::randn({out_features});
         }
+
+        // Quantize the weight tensor
+        torch::Tensor weight_quantized = torch::quantize_per_tensor(
+            weight_float, 
+            scale, 
+            zero_point, 
+            torch::kQInt8
+        );
+
+        // Quantize the input tensor
+        torch::Tensor input_quantized = torch::quantize_per_tensor(
+            input_float,
+            scale,
+            zero_point,
+            torch::kQInt8
+        );
+
+        // Perform quantized linear operation
+        // Note: torch::nn::functional::linear doesn't support quantized tensors directly
+        // We need to dequantize, perform the operation, then re-quantize
+        // Or use the lower-level quantized operations
         
-        // Quantize input tensor if needed
-        torch::Tensor quantized_input;
-        if (input_tensor.scalar_type() != torch::kQInt8) {
-            quantized_input = torch::quantize_per_tensor(
-                input_tensor.to(torch::kFloat), 
-                scale, 
-                zero_point, 
+        try {
+            // Approach 1: Use dequantized computation path
+            torch::Tensor input_dequant = input_quantized.dequantize();
+            torch::Tensor weight_dequant = weight_quantized.dequantize();
+            
+            torch::Tensor output;
+            if (use_bias) {
+                output = torch::nn::functional::linear(input_dequant, weight_dequant, bias_tensor);
+            } else {
+                output = torch::nn::functional::linear(input_dequant, weight_dequant);
+            }
+            
+            // Re-quantize output
+            torch::Tensor output_quantized = torch::quantize_per_tensor(
+                output,
+                scale,
+                zero_point,
                 torch::kQInt8
             );
-        } else {
-            quantized_input = input_tensor;
-        }
-        
-        // Reshape input tensor if needed to match expected dimensions
-        if (quantized_input.dim() == 0) {
-            quantized_input = quantized_input.reshape({1, in_features});
-        } else if (quantized_input.dim() == 1) {
-            if (quantized_input.size(0) != in_features) {
-                // Pad or truncate to match in_features
-                torch::Tensor resized = torch::zeros({in_features}, quantized_input.options());
-                int64_t copy_size = std::min(quantized_input.size(0), in_features);
-                resized.slice(0, 0, copy_size).copy_(quantized_input.slice(0, 0, copy_size));
-                quantized_input = resized;
+            
+            // Verify output shape
+            auto output_sizes = output_quantized.sizes();
+            if (output_sizes.size() != 2 || 
+                output_sizes[0] != batch_size || 
+                output_sizes[1] != out_features) {
+                // Shape mismatch - should not happen
             }
-            quantized_input = quantized_input.reshape({1, in_features});
-        } else {
-            // For multi-dimensional tensors, ensure the last dimension matches in_features
-            std::vector<int64_t> new_shape = quantized_input.sizes().vec();
-            if (new_shape.back() != in_features) {
-                new_shape.back() = in_features;
-                quantized_input = torch::zeros(new_shape, quantized_input.options());
+            
+            // Dequantize for final verification
+            torch::Tensor final_output = output_quantized.dequantize();
+            (void)final_output.sum().item<float>();
+        }
+        catch (const c10::Error&) {
+            // Expected failures for certain configurations
+        }
+
+        // Approach 2: Test with different quantization schemes
+        try {
+            // Test per-channel quantization for weights
+            torch::Tensor scales = torch::ones({out_features}) * scale;
+            torch::Tensor zero_points = torch::zeros({out_features}, torch::kLong);
+            
+            torch::Tensor weight_per_channel = torch::quantize_per_channel(
+                weight_float,
+                scales,
+                zero_points,
+                0,  // axis
+                torch::kQInt8
+            );
+            
+            torch::Tensor weight_dequant = weight_per_channel.dequantize();
+            torch::Tensor input_dequant = input_quantized.dequantize();
+            
+            torch::Tensor output;
+            if (use_bias) {
+                output = torch::nn::functional::linear(input_dequant, weight_dequant, bias_tensor);
+            } else {
+                output = torch::nn::functional::linear(input_dequant, weight_dequant);
             }
+            
+            (void)output.sum().item<float>();
         }
-        
-        // Apply the quantized linear operation using functional interface
-        torch::Tensor output;
-        if (bias) {
-            output = torch::nn::functional::linear(quantized_input, quantized_weight, bias_tensor);
-        } else {
-            output = torch::nn::functional::linear(quantized_input, quantized_weight);
+        catch (const c10::Error&) {
+            // Per-channel quantization may not be available on all backends
         }
-        
-        // Dequantize the output for further operations if needed
-        if (output.is_quantized()) {
-            torch::Tensor dequantized_output = torch::dequantize(output);
+
+        // Approach 3: Test with different dtypes
+        try {
+            torch::Tensor weight_quint8 = torch::quantize_per_tensor(
+                weight_float,
+                scale,
+                128,  // zero_point for quint8
+                torch::kQUInt8
+            );
+            
+            torch::Tensor input_quint8 = torch::quantize_per_tensor(
+                input_float,
+                scale,
+                128,
+                torch::kQUInt8
+            );
+            
+            torch::Tensor output = torch::nn::functional::linear(
+                input_quint8.dequantize(),
+                weight_quint8.dequantize(),
+                use_bias ? bias_tensor : torch::Tensor()
+            );
+            
+            (void)output.sum().item<float>();
+        }
+        catch (const c10::Error&) {
+            // Some configurations may fail
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

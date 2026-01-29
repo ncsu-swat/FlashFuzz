@@ -1,44 +1,50 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <iostream>       // For cerr, cout
 #include <fstream>        // For file operations
 #include <sstream>        // For string stream
+#include <cstdio>         // For std::remove
+#include <unistd.h>       // For getpid
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least some data to work with
         if (Size < 4) {
             return 0;
         }
         
+        size_t offset = 0;
+        
         // Create a tensor to serialize
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a temporary file path for serialization
-        std::string temp_file = "temp_serialized_tensor";
+        // Create a temporary file path for serialization (unique per process)
+        std::string temp_file = "/tmp/fuzz_serialized_tensor_" + std::to_string(getpid());
         
-        // Test torch::save
+        // Test torch::save to file
         try {
             torch::save(tensor, temp_file);
-        } catch (const std::exception&) {
-            // If save fails, try another approach
-        }
-        
-        // Test torch::load
-        try {
+            
+            // Test torch::load from file
             torch::Tensor loaded_tensor;
             torch::load(loaded_tensor, temp_file);
+            
+            // Verify basic properties match
+            (void)(loaded_tensor.sizes() == tensor.sizes());
         } catch (const std::exception&) {
-            // If load fails, continue
+            // Expected failures for certain tensor types, continue
         }
         
-        // Test serialization to a buffer
+        // Test serialization to/from a stringstream buffer
         try {
             std::stringstream ss;
             torch::save(tensor, ss);
@@ -51,8 +57,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Test serializing multiple tensors
-        if (offset + 8 < Size) {
-            torch::Tensor tensor2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+        if (offset < Size) {
+            size_t offset2 = 0;
+            torch::Tensor tensor2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset2);
             std::vector<torch::Tensor> tensors = {tensor, tensor2};
             
             try {
@@ -65,17 +72,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Test serializing to/from a raw buffer
+        // Test round-trip through string
         try {
-            std::stringstream ss;
-            torch::save(tensor, ss);
-            std::string serialized_data = ss.str();
+            std::ostringstream oss;
+            torch::save(tensor, oss);
+            std::string serialized_data = oss.str();
             
-            std::istringstream input_stream(serialized_data);
+            std::istringstream iss(serialized_data);
             torch::Tensor loaded_tensor;
-            torch::load(loaded_tensor, input_stream);
+            torch::load(loaded_tensor, iss);
         } catch (const std::exception&) {
             // If raw buffer serialization fails, continue
+        }
+        
+        // Test with different tensor types created from fuzzer data
+        if (offset + 4 < Size) {
+            try {
+                // Create tensors of specific types
+                auto int_tensor = torch::randint(0, 256, {2, 2}, torch::kInt32);
+                auto float_tensor = torch::rand({3, 3}, torch::kFloat32);
+                
+                std::stringstream ss;
+                torch::save(int_tensor, ss);
+                torch::Tensor loaded_int;
+                torch::load(loaded_int, ss);
+                
+                ss.str("");
+                ss.clear();
+                torch::save(float_tensor, ss);
+                torch::Tensor loaded_float;
+                torch::load(loaded_float, ss);
+            } catch (const std::exception&) {
+                // Continue on failure
+            }
         }
         
         // Clean up temporary file
@@ -84,7 +113,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

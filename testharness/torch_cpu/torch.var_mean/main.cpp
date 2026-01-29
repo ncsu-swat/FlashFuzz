@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,13 +20,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor - needs to be floating point for var_mean
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Extract parameters for var_mean from the remaining data
-        bool unbiased = false;
+        // var_mean requires floating point tensor
+        if (!input_tensor.is_floating_point()) {
+            input_tensor = input_tensor.to(torch::kFloat32);
+        }
+        
+        // Skip empty tensors
+        if (input_tensor.numel() == 0) {
+            return 0;
+        }
+        
+        // Extract parameters from the remaining data
+        int64_t correction = 1; // default: unbiased (Bessel's correction)
         if (offset < Size) {
-            unbiased = Data[offset++] & 0x1;
+            correction = Data[offset++] % 3; // 0, 1, or 2
         }
         
         // Get a dimension to compute var_mean along
@@ -36,48 +51,80 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             keepdim = Data[offset++] & 0x1;
         }
         
-        // Try different variants of var_mean
-        
-        // Variant 1: var_mean on entire tensor
-        auto result1 = torch::var_mean(input_tensor, unbiased);
+        // Variant 1: var_mean on entire tensor (returns tuple of scalars)
+        {
+            auto result = torch::var_mean(input_tensor);
+            torch::Tensor var = std::get<0>(result);
+            torch::Tensor mean = std::get<1>(result);
+            // Force computation
+            (void)var.item<float>();
+            (void)mean.item<float>();
+        }
         
         // Variant 2: var_mean along a dimension
         if (input_tensor.dim() > 0) {
-            auto result2 = torch::var_mean(input_tensor, dim, unbiased, keepdim);
-            
-            // Access the results to ensure they're computed
-            torch::Tensor var = std::get<0>(result2);
-            torch::Tensor mean = std::get<1>(result2);
-        }
-        
-        // Variant 3: var_mean along multiple dimensions (if tensor has at least 2 dimensions)
-        if (input_tensor.dim() >= 2 && offset + 1 < Size) {
-            int64_t dim2 = static_cast<int64_t>(Data[offset++]) % input_tensor.dim();
-            if (dim2 == dim) {
-                dim2 = (dim2 + 1) % input_tensor.dim();
+            try {
+                auto result = torch::var_mean(input_tensor, {dim}, correction, keepdim);
+                torch::Tensor var = std::get<0>(result);
+                torch::Tensor mean = std::get<1>(result);
+                // Access results to ensure computation
+                (void)var.numel();
+                (void)mean.numel();
+            } catch (const std::exception &) {
+                // Some dimension combinations may be invalid, ignore
             }
-            
-            std::vector<int64_t> dims = {dim, dim2};
-            auto result3 = torch::var_mean(input_tensor, dims, unbiased, keepdim);
         }
         
-        // Variant 4: var_mean with int dim parameter
-        if (input_tensor.dim() > 0) {
-            int int_dim = static_cast<int>(dim);
-            auto result4 = torch::var_mean(input_tensor, int_dim);
-            
-            auto result5 = torch::var_mean(input_tensor, int_dim, unbiased, keepdim);
+        // Variant 3: var_mean along multiple dimensions
+        if (input_tensor.dim() >= 2 && offset < Size) {
+            try {
+                int64_t dim2 = static_cast<int64_t>(Data[offset++]) % input_tensor.dim();
+                // Ensure different dimensions
+                if (dim2 == dim) {
+                    dim2 = (dim2 + 1) % input_tensor.dim();
+                }
+                
+                std::vector<int64_t> dims = {std::min(dim, dim2), std::max(dim, dim2)};
+                auto result = torch::var_mean(input_tensor, dims, correction, keepdim);
+                torch::Tensor var = std::get<0>(result);
+                torch::Tensor mean = std::get<1>(result);
+                (void)var.numel();
+                (void)mean.numel();
+            } catch (const std::exception &) {
+                // Invalid dimension combinations, ignore
+            }
         }
         
-        // Variant 5: Named dimension variant (if available)
-        if (input_tensor.dim() > 0) {
-            auto result6 = torch::var_mean(input_tensor, {dim}, unbiased, keepdim);
+        // Variant 4: var_mean with different correction values
+        if (input_tensor.dim() > 0 && input_tensor.size(dim) > 2) {
+            try {
+                // correction = 0 (biased/population variance)
+                auto result_biased = torch::var_mean(input_tensor, {dim}, 0, keepdim);
+                (void)std::get<0>(result_biased).numel();
+                
+                // correction = 2 (higher correction)
+                auto result_corr2 = torch::var_mean(input_tensor, {dim}, 2, keepdim);
+                (void)std::get<0>(result_corr2).numel();
+            } catch (const std::exception &) {
+                // May fail if size along dim <= correction
+            }
+        }
+        
+        // Variant 5: Test with different dtypes
+        if (offset < Size) {
+            try {
+                torch::Tensor double_tensor = input_tensor.to(torch::kFloat64);
+                auto result = torch::var_mean(double_tensor);
+                (void)std::get<0>(result).item<double>();
+            } catch (const std::exception &) {
+                // Dtype conversion issues, ignore
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

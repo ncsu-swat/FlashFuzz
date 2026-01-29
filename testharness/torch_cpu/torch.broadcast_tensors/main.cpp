@@ -5,7 +5,13 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -50,10 +56,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 for (auto& tensor : result) {
                     // Simple operation to check tensor validity
                     torch::Tensor sum = tensor.sum();
+                    (void)sum; // Avoid unused variable warning
+                }
+                
+                // Additional coverage: verify number of output tensors matches input
+                if (result.size() != tensors.size()) {
+                    throw std::runtime_error("Output tensor count mismatch");
+                }
+                
+                // Verify broadcast semantics - output shapes should be >= input shapes
+                for (size_t i = 0; i < tensors.size(); ++i) {
+                    if (result[i].dim() < tensors[i].dim()) {
+                        throw std::runtime_error("Broadcast reduced dimensions");
+                    }
                 }
             }
         } catch (const c10::Error& e) {
             // PyTorch specific errors are expected for invalid inputs
+            // (e.g., shapes that cannot be broadcast together)
             return 0;
         }
     }

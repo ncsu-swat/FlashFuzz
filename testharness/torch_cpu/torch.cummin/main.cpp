@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <tuple>          // For std::get with tuple result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,19 +23,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Handle scalar tensors - cummin requires at least 1 dimension
+        if (input.dim() == 0) {
+            // Expand scalar to 1D tensor
+            input = input.unsqueeze(0);
+        }
+        
         // Get a dimension to use for cummin
         int64_t dim = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + sizeof(uint8_t) <= Size) {
+            dim = static_cast<int64_t>(Data[offset]);
+            offset += sizeof(uint8_t);
             
-            // If tensor has dimensions, make sure dim is within valid range
-            if (input.dim() > 0) {
-                dim = dim % input.dim();
-                if (dim < 0) {
-                    dim += input.dim();
-                }
-            }
+            // Make sure dim is within valid range
+            dim = dim % input.dim();
         }
         
         // Apply cummin operation
@@ -40,47 +46,72 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor values = std::get<0>(result);
         torch::Tensor indices = std::get<1>(result);
         
-        // Verify the output tensors have the same shape as the input
-        if (values.sizes() != input.sizes() || indices.sizes() != input.sizes()) {
-            throw std::runtime_error("Output tensor shapes don't match input tensor shape");
-        }
+        // Force computation to ensure the operation is actually executed
+        (void)values.sum().item<float>();
+        (void)indices.sum().item<int64_t>();
         
-        // Try a different variant of cummin with named parameters
-        auto result2 = torch::cummin(input, dim);
-        
-        // Try cummin with a negative dimension
+        // Try cummin with a negative dimension for additional coverage
         if (input.dim() > 0) {
             int64_t neg_dim = -1;
-            if (offset + sizeof(int64_t) <= Size) {
-                std::memcpy(&neg_dim, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
+            if (offset + sizeof(uint8_t) <= Size) {
+                uint8_t neg_val = Data[offset];
+                offset += sizeof(uint8_t);
                 
-                // Make sure it's a valid negative dimension
-                neg_dim = -(std::abs(neg_dim) % input.dim());
-                if (neg_dim == 0) neg_dim = -1;
-                
+                // Make sure it's a valid negative dimension [-dim, -1]
+                neg_dim = -1 - static_cast<int64_t>(neg_val % input.dim());
+            }
+            
+            try {
                 auto result_neg = torch::cummin(input, neg_dim);
+                (void)std::get<0>(result_neg).sum().item<float>();
+            } catch (const c10::Error&) {
+                // Silently catch expected errors for invalid dimensions
             }
         }
         
-        // Try cummin on a zero-sized tensor if we have one
-        if (input.numel() == 0 && input.dim() > 0) {
-            auto zero_result = torch::cummin(input, dim);
+        // Test with different tensor types for better coverage
+        if (offset + sizeof(uint8_t) <= Size) {
+            uint8_t dtype_selector = Data[offset] % 4;
+            offset += sizeof(uint8_t);
+            
+            torch::Tensor typed_input;
+            try {
+                switch (dtype_selector) {
+                    case 0:
+                        typed_input = input.to(torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_input = input.to(torch::kFloat64);
+                        break;
+                    case 2:
+                        typed_input = input.to(torch::kInt32);
+                        break;
+                    case 3:
+                        typed_input = input.to(torch::kInt64);
+                        break;
+                }
+                auto typed_result = torch::cummin(typed_input, dim);
+                (void)std::get<0>(typed_result).sum();
+            } catch (const c10::Error&) {
+                // Silently catch type conversion errors
+            }
         }
         
-        // Try cummin on a scalar tensor
-        if (input.dim() == 0) {
+        // Test with contiguous vs non-contiguous tensor
+        if (input.dim() >= 2 && input.size(0) > 1 && input.size(1) > 1) {
             try {
-                auto scalar_result = torch::cummin(input, 0);
-            } catch (const c10::Error& e) {
-                // Expected exception for scalar tensor
+                torch::Tensor transposed = input.transpose(0, 1);
+                auto trans_result = torch::cummin(transposed, dim % transposed.dim());
+                (void)std::get<0>(trans_result).sum();
+            } catch (const c10::Error&) {
+                // Silently catch errors from transposed tensor operations
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

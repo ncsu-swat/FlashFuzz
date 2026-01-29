@@ -1,22 +1,26 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Skip if data is too small
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create a simple model to wrap with DataParallel
+        // Define a simple model for testing
         struct SimpleModel : torch::nn::Module {
             SimpleModel() {
                 linear = register_module("linear", torch::nn::Linear(10, 5));
@@ -31,76 +35,129 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         auto model = std::make_shared<SimpleModel>();
         
-        // Parse device IDs from input data
-        uint8_t num_devices = Data[offset++] % 4 + 1; // 1-4 devices
-        std::vector<torch::Device> device_ids;
-        for (uint8_t i = 0; i < num_devices && offset < Size; ++i) {
-            int device_id = static_cast<int>(Data[offset++]) % 8; // Device IDs 0-7
-            device_ids.push_back(torch::Device(torch::kCUDA, device_id));
-        }
+        // Parse batch size and other parameters from input data
+        uint8_t batch_size = (Data[offset++] % 8) + 1;  // 1-8 batch size
+        int64_t dim = static_cast<int64_t>(Data[offset++] % 2);  // dim 0 or 1
         
-        // Create DataParallel wrapper
-        auto data_parallel_model = torch::nn::parallel::data_parallel(model, device_ids);
+        // Create input tensor with proper shape for the model [batch_size, 10]
+        torch::Tensor input = torch::randn({batch_size, 10});
         
-        // Create input tensor
-        torch::Tensor input;
+        // Use remaining data to perturb the input values
         if (offset < Size) {
-            input = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure input has at least 2 dimensions for batch processing
-            if (input.dim() < 2) {
-                // Reshape to add batch dimension if needed
-                std::vector<int64_t> new_shape;
-                new_shape.push_back(1); // Batch size of 1
-                for (int64_t i = 0; i < input.dim(); ++i) {
-                    new_shape.push_back(input.size(i));
+            torch::Tensor fuzz_data = fuzzer_utils::createTensor(Data, Size, offset);
+            // Flatten and use first elements to modify input
+            fuzz_data = fuzz_data.flatten();
+            int64_t copy_len = std::min(fuzz_data.numel(), input.numel());
+            if (copy_len > 0 && fuzz_data.scalar_type() == input.scalar_type()) {
+                try {
+                    input.flatten().slice(0, 0, copy_len).copy_(fuzz_data.slice(0, 0, copy_len));
+                } catch (...) {
+                    // Ignore copy errors, use random input
                 }
-                if (input.dim() == 0) {
-                    new_shape.push_back(1); // Add feature dimension for scalar
-                }
-                input = input.reshape(new_shape);
-            }
-            
-            // Ensure the last dimension is compatible with the model's input size
-            if (input.size(-1) != 10) {
-                // Resize the last dimension to match model input
-                std::vector<int64_t> new_shape;
-                for (int64_t i = 0; i < input.dim() - 1; ++i) {
-                    new_shape.push_back(input.size(i));
-                }
-                new_shape.push_back(10);
-                input = input.reshape(new_shape);
-            }
-            
-            // Apply the model
-            torch::Tensor output = data_parallel_model(input);
-        }
-        
-        // Test with different output_device settings
-        if (offset < Size) {
-            int output_device = static_cast<int>(Data[offset++]) % 8;
-            torch::Device output_dev(torch::kCUDA, output_device);
-            auto data_parallel_model_with_options = torch::nn::parallel::data_parallel(model, device_ids, output_dev);
-            
-            if (input.defined()) {
-                torch::Tensor output = data_parallel_model_with_options(input);
             }
         }
         
-        // Test with dim parameter
-        if (offset < Size) {
-            int64_t dim = static_cast<int64_t>(Data[offset++]) % 4;
-            auto data_parallel_model_with_dim = torch::nn::parallel::data_parallel(model, device_ids, c10::nullopt, dim);
-            
-            if (input.defined()) {
-                torch::Tensor output = data_parallel_model_with_dim(input);
+        // Check if CUDA is available
+        if (!torch::cuda::is_available()) {
+            // On CPU-only systems, we can still test the API path but it will fail
+            // This is expected behavior - the API requires CUDA
+            // Just test that the model works on CPU directly
+            try {
+                torch::Tensor output = model->forward(input);
+                (void)output;
+            } catch (...) {
+                // Expected on some configurations
             }
+            return 0;
+        }
+        
+        // CUDA is available - test data_parallel functionality
+        int64_t num_devices = torch::cuda::device_count();
+        if (num_devices == 0) {
+            return 0;
+        }
+        
+        // Build device_ids list from available devices
+        std::vector<int64_t> device_ids;
+        uint8_t num_requested = (Data[offset % Size] % static_cast<uint8_t>(num_devices)) + 1;
+        for (int64_t i = 0; i < num_requested && i < num_devices; ++i) {
+            device_ids.push_back(i);
+        }
+        
+        // Move model and input to CUDA
+        model->to(torch::kCUDA);
+        input = input.to(torch::kCUDA);
+        
+        // Test 1: Basic data_parallel call with device_ids
+        try {
+            torch::Tensor output = torch::nn::parallel::data_parallel(
+                model,
+                input,
+                device_ids
+            );
+            (void)output;
+        } catch (...) {
+            // May fail due to device configuration
+        }
+        
+        // Test 2: data_parallel with output_device specified
+        if (offset + 1 < Size) {
+            int64_t output_device = static_cast<int64_t>(Data[++offset % Size]) % num_devices;
+            try {
+                torch::Tensor output = torch::nn::parallel::data_parallel(
+                    model,
+                    input,
+                    device_ids,
+                    output_device
+                );
+                (void)output;
+            } catch (...) {
+                // May fail due to device configuration
+            }
+        }
+        
+        // Test 3: data_parallel with dim parameter
+        try {
+            torch::Tensor output = torch::nn::parallel::data_parallel(
+                model,
+                input,
+                device_ids,
+                std::nullopt,  // output_device
+                dim
+            );
+            (void)output;
+        } catch (...) {
+            // May fail due to invalid dim
+        }
+        
+        // Test 4: Single device (should work like regular forward)
+        try {
+            std::vector<int64_t> single_device = {0};
+            torch::Tensor output = torch::nn::parallel::data_parallel(
+                model,
+                input,
+                single_device
+            );
+            (void)output;
+        } catch (...) {
+            // May fail
+        }
+        
+        // Test 5: No device_ids (use default)
+        try {
+            torch::Tensor output = torch::nn::parallel::data_parallel(
+                model,
+                input
+            );
+            (void)output;
+        } catch (...) {
+            // May fail
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

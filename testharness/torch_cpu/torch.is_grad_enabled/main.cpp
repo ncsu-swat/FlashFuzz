@@ -1,16 +1,19 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Check if we have enough data to proceed
         if (Size < 1) {
             return 0;
         }
@@ -27,15 +30,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test if is_grad_enabled returns the value we just set
         bool current_grad_state = torch::autograd::GradMode::is_enabled();
         
-        // Create a tensor with requires_grad=true to test gradient tracking
-        torch::Tensor tensor;
+        // Create a floating point tensor for gradient tracking
         if (offset < Size) {
-            tensor = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Set requires_grad on the tensor
-            tensor = tensor.set_requires_grad(true);
+            // Convert to float for gradient operations
+            tensor = tensor.to(torch::kFloat32);
             
-            // Verify that requires_grad is properly set based on grad_enabled state
+            // set_requires_grad returns void, don't chain
+            tensor.set_requires_grad(true);
+            
+            // Verify that requires_grad is properly set
             bool tensor_requires_grad = tensor.requires_grad();
             
             // Perform some operation on the tensor
@@ -46,43 +51,56 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Test gradient computation if gradients are enabled
             if (current_grad_state && tensor_requires_grad) {
-                // Sum to get a scalar output for backward
-                torch::Tensor sum = result.sum();
-                sum.backward();
-                
-                // Check if gradient was computed
-                bool has_grad = tensor.grad().defined();
+                try {
+                    // Sum to get a scalar output for backward
+                    torch::Tensor sum_val = result.sum();
+                    sum_val.backward();
+                    
+                    // Check if gradient was computed
+                    bool has_grad = tensor.grad().defined();
+                    (void)has_grad;
+                } catch (...) {
+                    // Silently handle backward failures
+                }
             }
+            
+            (void)result_requires_grad;
         }
         
-        // Test gradient context manager
+        // Test NoGradGuard context manager
         {
             torch::NoGradGuard no_grad;
             bool grad_disabled = !torch::autograd::GradMode::is_enabled();
+            (void)grad_disabled;
             
-            // Create another tensor inside NoGradGuard
             if (offset < Size) {
                 torch::Tensor tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
-                tensor2 = tensor2.set_requires_grad(true);
+                tensor2 = tensor2.to(torch::kFloat32);
+                tensor2.set_requires_grad(true);
                 
                 // Even with requires_grad=true, operations should not track gradients
                 torch::Tensor result2 = tensor2.cos();
                 bool result2_requires_grad = result2.requires_grad();
+                (void)result2_requires_grad;
             }
         }
         
         // Check that grad state is restored after the guard is destroyed
         bool restored_grad_state = torch::autograd::GradMode::is_enabled();
+        (void)restored_grad_state;
         
-        // Test with GradMode guard
+        // Test with AutoGradMode guard
         {
             torch::AutoGradMode grad_mode(enable_grad);
             bool grad_mode_state = torch::autograd::GradMode::is_enabled();
+            (void)grad_mode_state;
             
             if (offset < Size) {
                 torch::Tensor tensor3 = fuzzer_utils::createTensor(Data, Size, offset);
-                tensor3 = tensor3.set_requires_grad(true);
+                tensor3 = tensor3.to(torch::kFloat32);
+                tensor3.set_requires_grad(true);
                 torch::Tensor result3 = tensor3.exp();
+                (void)result3;
             }
         }
         
@@ -92,7 +110,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

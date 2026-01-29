@@ -1,139 +1,129 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <vector>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        if (Size < 4) return 0;
+        
         size_t offset = 0;
         
-        // Parse the number of tensors to create (between 2 and 5)
-        if (Size < 1) return 0;
-        uint8_t num_tensors = (Data[offset++] % 4) + 2; // 2 to 5 tensors
+        // Parse the number of tensors (between 2 and 5)
+        uint8_t num_tensors = (Data[offset++] % 4) + 2;
         
-        // Create a vector to store the tensors
+        // Parse dimensions for the chain
+        // For multi_dot: tensor[i] has shape (d[i], d[i+1])
+        // We need num_tensors + 1 dimension values
+        std::vector<int64_t> dims;
+        for (int i = 0; i <= num_tensors; ++i) {
+            if (offset >= Size) {
+                dims.push_back(2); // Default dimension
+            } else {
+                // Limit dimensions to reasonable range (1-16) to avoid memory issues
+                dims.push_back((Data[offset++] % 16) + 1);
+            }
+        }
+        
+        // Create tensors with compatible dimensions
         std::vector<torch::Tensor> tensors;
         
-        // Create tensors with compatible dimensions for matrix multiplication
-        for (uint8_t i = 0; i < num_tensors; ++i) {
-            if (offset >= Size) break;
+        // Determine dtype from fuzzer input
+        torch::ScalarType dtype = torch::kFloat;
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset++] % 4;
+            switch (dtype_selector) {
+                case 0: dtype = torch::kFloat; break;
+                case 1: dtype = torch::kDouble; break;
+                case 2: dtype = torch::kComplexFloat; break;
+                case 3: dtype = torch::kComplexDouble; break;
+            }
+        }
+        
+        for (int i = 0; i < num_tensors; ++i) {
+            int64_t rows = dims[i];
+            int64_t cols = dims[i + 1];
             
+            // Create tensor with proper shape for matrix multiplication chain
+            torch::Tensor tensor = torch::randn({rows, cols}, torch::TensorOptions().dtype(dtype));
+            tensors.push_back(tensor);
+        }
+        
+        // Apply torch::linalg_multi_dot (C++ API uses underscore naming)
+        torch::Tensor result = torch::linalg_multi_dot(tensors);
+        
+        // Verify result shape: should be (dims[0], dims[num_tensors])
+        if (result.size(0) != dims[0] || result.size(1) != dims[num_tensors]) {
+            std::cerr << "Unexpected result shape" << std::endl;
+        }
+        
+        // Test with 1D tensors at the ends (special case)
+        if (offset < Size && Data[offset++] % 2 == 0 && num_tensors >= 2) {
             try {
-                torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                std::vector<torch::Tensor> tensors_1d;
                 
-                // Ensure tensor has at least 2 dimensions for matrix multiplication
-                // If not, reshape it to a 2D tensor
-                if (tensor.dim() < 2) {
-                    if (tensor.dim() == 0) {
-                        // Scalar tensor, reshape to 1x1
-                        tensor = tensor.reshape({1, 1});
-                    } else if (tensor.dim() == 1) {
-                        // 1D tensor, reshape to nx1 or 1xn
-                        int64_t size = tensor.size(0);
-                        if (i % 2 == 0 || i == num_tensors - 1) {
-                            tensor = tensor.reshape({size, 1});
-                        } else {
-                            tensor = tensor.reshape({1, size});
-                        }
-                    }
+                // First tensor can be 1D (vector)
+                tensors_1d.push_back(torch::randn({dims[0]}, torch::TensorOptions().dtype(dtype)));
+                
+                // Middle tensors are 2D
+                for (int i = 1; i < num_tensors - 1; ++i) {
+                    tensors_1d.push_back(torch::randn({dims[i], dims[i + 1]}, torch::TensorOptions().dtype(dtype)));
                 }
                 
-                // For tensors after the first one, ensure matrix multiplication compatibility
-                if (i > 0) {
-                    // Get the last dimension of the previous tensor
-                    int64_t prev_last_dim = tensors.back().size(-1);
-                    
-                    // Get the first dimension of the current tensor
-                    int64_t curr_first_dim = tensor.size(0);
-                    
-                    // If dimensions don't match, reshape the current tensor
-                    if (prev_last_dim != curr_first_dim) {
-                        // Create a new shape with the first dimension matching the previous tensor's last dimension
-                        std::vector<int64_t> new_shape;
-                        new_shape.push_back(prev_last_dim);
-                        
-                        // Calculate the product of all other dimensions
-                        int64_t remaining_elements = 1;
-                        for (int64_t d = 1; d < tensor.dim(); ++d) {
-                            remaining_elements *= tensor.size(d);
-                        }
-                        
-                        // If remaining_elements is 0, set it to 1 to avoid empty tensor
-                        if (remaining_elements == 0) remaining_elements = 1;
-                        
-                        new_shape.push_back(remaining_elements);
-                        
-                        // Reshape the tensor
-                        tensor = tensor.reshape(new_shape);
-                    }
+                // Last tensor can be 1D (vector)
+                if (num_tensors > 1) {
+                    tensors_1d.push_back(torch::randn({dims[num_tensors - 1]}, torch::TensorOptions().dtype(dtype)));
                 }
                 
-                tensors.push_back(tensor);
-            } catch (const std::exception &e) {
-                // If tensor creation fails, continue with the next tensor
-                continue;
-            }
-        }
-        
-        // Need at least 2 tensors for multi_dot
-        if (tensors.size() < 2) return 0;
-        
-        // Ensure all tensors have compatible dimensions for matrix multiplication
-        for (size_t i = 0; i < tensors.size() - 1; ++i) {
-            if (tensors[i].size(-1) != tensors[i+1].size(0)) {
-                // If dimensions don't match, reshape the second tensor
-                std::vector<int64_t> new_shape;
-                new_shape.push_back(tensors[i].size(-1));
-                
-                // Calculate the product of all other dimensions
-                int64_t remaining_elements = 1;
-                for (int64_t d = 1; d < tensors[i+1].dim(); ++d) {
-                    remaining_elements *= tensors[i+1].size(d);
+                if (tensors_1d.size() >= 2) {
+                    torch::Tensor result_1d = torch::linalg_multi_dot(tensors_1d);
                 }
-                
-                // If remaining_elements is 0, set it to 1 to avoid empty tensor
-                if (remaining_elements == 0) remaining_elements = 1;
-                
-                new_shape.push_back(remaining_elements);
-                
-                // Reshape the tensor
-                tensors[i+1] = tensors[i+1].reshape(new_shape);
-            }
-        }
-        
-        // Apply torch.linalg.multi_dot using chain_matmul as alternative
-        torch::Tensor result = torch::chain_matmul(tensors);
-        
-        // Optional: Try different data types
-        if (Size > offset && Data[offset] % 3 == 0) {
-            // Convert tensors to double and try again
-            std::vector<torch::Tensor> double_tensors;
-            for (const auto& t : tensors) {
-                double_tensors.push_back(t.to(torch::kDouble));
-            }
-            torch::Tensor double_result = torch::chain_matmul(double_tensors);
-        }
-        
-        // Optional: Try with complex tensors if available
-        if (Size > offset && Data[offset] % 5 == 0) {
-            try {
-                std::vector<torch::Tensor> complex_tensors;
-                for (const auto& t : tensors) {
-                    complex_tensors.push_back(t.to(torch::kComplexFloat));
-                }
-                torch::Tensor complex_result = torch::chain_matmul(complex_tensors);
             } catch (const std::exception &) {
-                // Ignore exceptions for complex conversion
+                // 1D edge cases may fail, that's expected
+            }
+        }
+        
+        // Test with contiguous vs non-contiguous tensors
+        if (offset < Size && Data[offset++] % 3 == 0) {
+            try {
+                std::vector<torch::Tensor> nc_tensors;
+                for (const auto& t : tensors) {
+                    // Make non-contiguous by transposing twice with different memory layout
+                    if (t.dim() == 2) {
+                        nc_tensors.push_back(t.t().t().clone());
+                    } else {
+                        nc_tensors.push_back(t.clone());
+                    }
+                }
+                torch::Tensor nc_result = torch::linalg_multi_dot(nc_tensors);
+            } catch (const std::exception &) {
+                // May fail for some configurations
+            }
+        }
+        
+        // Test with single-element dimensions
+        if (offset < Size && Data[offset++] % 4 == 0) {
+            try {
+                std::vector<torch::Tensor> small_tensors;
+                small_tensors.push_back(torch::randn({1, 3}, torch::TensorOptions().dtype(dtype)));
+                small_tensors.push_back(torch::randn({3, 1}, torch::TensorOptions().dtype(dtype)));
+                torch::Tensor small_result = torch::linalg_multi_dot(small_tensors);
+            } catch (const std::exception &) {
+                // Expected for edge cases
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

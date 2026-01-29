@@ -5,7 +5,12 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -42,11 +47,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto sum = result.sum();
             
             // Try to access the last dimension which should be 2 (real and imaginary parts)
-            if (result.dim() > 0) {
-                auto last_dim_size = result.size(-1);
-                if (last_dim_size > 0) {
-                    auto first_element = result.index({0});
+            try {
+                if (result.dim() > 0) {
+                    auto last_dim_size = result.size(-1);
+                    if (last_dim_size > 0 && result.size(0) > 0) {
+                        auto first_element = result.index({0});
+                    }
                 }
+            } catch (...) {
+                // Silently handle indexing errors
             }
         }
         
@@ -67,23 +76,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             
             // Try with non-contiguous tensor
-            if (another_tensor.dim() > 1 && another_tensor.size(0) > 1) {
-                auto non_contiguous = another_tensor.transpose(0, another_tensor.dim() - 1);
-                auto result_non_contiguous = torch::view_as_real_copy(non_contiguous);
+            try {
+                if (another_tensor.dim() > 1 && another_tensor.size(0) > 1) {
+                    auto non_contiguous = another_tensor.transpose(0, another_tensor.dim() - 1);
+                    auto result_non_contiguous = torch::view_as_real_copy(non_contiguous);
+                }
+            } catch (...) {
+                // Silently handle shape errors
             }
             
             // Try with zero-sized tensor if possible
-            std::vector<int64_t> zero_shape = another_tensor.sizes().vec();
-            if (!zero_shape.empty()) {
-                zero_shape[0] = 0;
-                torch::Tensor zero_tensor;
-                if (another_tensor.dtype() == torch::kComplexFloat) {
-                    zero_tensor = torch::empty(zero_shape, torch::kComplexFloat);
-                } else {
-                    zero_tensor = torch::empty(zero_shape, torch::kComplexDouble);
+            try {
+                std::vector<int64_t> zero_shape = another_tensor.sizes().vec();
+                if (!zero_shape.empty()) {
+                    zero_shape[0] = 0;
+                    torch::Tensor zero_tensor;
+                    if (another_tensor.dtype() == torch::kComplexFloat) {
+                        zero_tensor = torch::empty(zero_shape, torch::kComplexFloat);
+                    } else {
+                        zero_tensor = torch::empty(zero_shape, torch::kComplexDouble);
+                    }
+                    auto zero_result = torch::view_as_real_copy(zero_tensor);
                 }
-                auto zero_result = torch::view_as_real_copy(zero_tensor);
+            } catch (...) {
+                // Silently handle edge case errors
             }
+        }
+        
+        // Test with ComplexHalf if supported
+        try {
+            torch::Tensor half_complex = input_tensor.to(torch::kComplexHalf);
+            auto half_result = torch::view_as_real_copy(half_complex);
+        } catch (...) {
+            // ComplexHalf may not be supported on all platforms
         }
     }
     catch (const std::exception &e)

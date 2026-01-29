@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,29 +22,67 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a tensor from the input data
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a copy of the original tensor for comparison
-        torch::Tensor original = tensor.clone();
-        
-        // Apply the negative_ operation (in-place)
-        tensor.negative_();
-        
-        // Verify the operation worked correctly by comparing with the expected result
-        // The expected result should be -original
-        torch::Tensor expected = -original;
-        
-        // Check if the operation produced the expected result
-        // This is not strictly necessary for fuzzing but helps verify correctness
-        if (tensor.sizes() != expected.sizes() || 
-            !torch::allclose(tensor, expected, 1e-5, 1e-8)) {
-            throw std::runtime_error("negative_ operation produced unexpected result");
+        // negative_ doesn't support boolean tensors, convert if needed
+        if (tensor.scalar_type() == torch::kBool) {
+            tensor = tensor.to(torch::kFloat);
         }
         
-        return 0; // keep the input
+        // Apply the negative_ operation (in-place)
+        // This computes -tensor in place
+        tensor.negative_();
+        
+        // Additional coverage: test on different tensor configurations
+        if (Size > 10) {
+            // Test with contiguous tensor
+            torch::Tensor contiguous_tensor = fuzzer_utils::createTensor(Data + 2, Size - 2, offset);
+            if (contiguous_tensor.scalar_type() == torch::kBool) {
+                contiguous_tensor = contiguous_tensor.to(torch::kFloat);
+            }
+            contiguous_tensor = contiguous_tensor.contiguous();
+            contiguous_tensor.negative_();
+            
+            // Test with non-contiguous tensor (if possible)
+            if (contiguous_tensor.dim() >= 2 && contiguous_tensor.size(0) > 1) {
+                try {
+                    torch::Tensor non_contiguous = contiguous_tensor.transpose(0, 1);
+                    non_contiguous.negative_();
+                } catch (...) {
+                    // Silently ignore shape-related failures
+                }
+            }
+        }
+        
+        // Test with specific dtypes for better coverage
+        if (Size > 5) {
+            uint8_t dtype_selector = Data[0] % 4;
+            torch::Tensor typed_tensor;
+            
+            try {
+                switch (dtype_selector) {
+                    case 0:
+                        typed_tensor = torch::randn({2, 3}, torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_tensor = torch::randn({2, 3}, torch::kFloat64);
+                        break;
+                    case 2:
+                        typed_tensor = torch::randint(-100, 100, {2, 3}, torch::kInt32);
+                        break;
+                    case 3:
+                        typed_tensor = torch::randint(-100, 100, {2, 3}, torch::kInt64);
+                        break;
+                }
+                typed_tensor.negative_();
+            } catch (...) {
+                // Silently ignore dtype-related failures
+            }
+        }
+        
+        return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

@@ -1,108 +1,103 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 10) {
+        // Need sufficient data for dimensions and tensors
+        if (Size < 20) {
             return 0;
         }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create hidden state tensor
-        torch::Tensor hx = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create weight_ih tensor (quantized)
-        torch::Tensor weight_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create weight_hh tensor (quantized)
-        torch::Tensor weight_hh = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create bias_ih tensor
-        torch::Tensor bias_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create bias_hh tensor
-        torch::Tensor bias_hh = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create packed_ih tensor
-        torch::Tensor packed_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create packed_hh tensor
-        torch::Tensor packed_hh = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create col_offsets_ih tensor
-        torch::Tensor col_offsets_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create col_offsets_hh tensor
-        torch::Tensor col_offsets_hh = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Parse scale values for quantization
-        double w_ih_scale = 1.0;
-        double w_hh_scale = 1.0;
-        
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&w_ih_scale, Data + offset, sizeof(double));
-            offset += sizeof(double);
+
+        size_t offset = 0;
+
+        // Parse dimensions from fuzzer data
+        int batch_size = 1 + (Data[offset++] % 8);      // 1-8
+        int input_size = 1 + (Data[offset++] % 32);     // 1-32
+        int hidden_size = 1 + (Data[offset++] % 32);    // 1-32
+
+        // Create input tensor: (batch, input_size)
+        torch::Tensor input = torch::randn({batch_size, input_size});
+
+        // Create hidden state tensor: (batch, hidden_size)
+        torch::Tensor hx = torch::randn({batch_size, hidden_size});
+
+        // For quantized GRU cell, we need:
+        // weight_ih: (3 * hidden_size, input_size)
+        // weight_hh: (3 * hidden_size, hidden_size)
+        int gate_size = 3 * hidden_size;
+
+        // Create float weight tensors first, then quantize
+        torch::Tensor weight_ih_float = torch::randn({gate_size, input_size});
+        torch::Tensor weight_hh_float = torch::randn({gate_size, hidden_size});
+
+        // Parse scale and zero point values
+        double w_ih_scale = 0.01 + (Data[offset++ % Size] / 255.0) * 0.1;
+        double w_hh_scale = 0.01 + (Data[offset++ % Size] / 255.0) * 0.1;
+        int64_t w_ih_zero_point = Data[offset++ % Size] % 256;
+        int64_t w_hh_zero_point = Data[offset++ % Size] % 256;
+
+        // Quantize the weight tensors
+        torch::Tensor weight_ih = torch::quantize_per_tensor(
+            weight_ih_float, w_ih_scale, w_ih_zero_point, torch::kQInt8);
+        torch::Tensor weight_hh = torch::quantize_per_tensor(
+            weight_hh_float, w_hh_scale, w_hh_zero_point, torch::kQInt8);
+
+        // Create bias tensors: (3 * hidden_size)
+        torch::Tensor bias_ih = torch::randn({gate_size});
+        torch::Tensor bias_hh = torch::randn({gate_size});
+
+        // Create packed weight tensors (for FBGEMM, these are precomputed)
+        // For testing, use the same quantized weights
+        torch::Tensor packed_ih = weight_ih;
+        torch::Tensor packed_hh = weight_hh;
+
+        // Create column offsets tensors: (3 * hidden_size)
+        torch::Tensor col_offsets_ih = torch::zeros({gate_size}, torch::kInt32);
+        torch::Tensor col_offsets_hh = torch::zeros({gate_size}, torch::kInt32);
+
+        // Call quantized_gru_cell
+        try {
+            torch::Tensor result = torch::quantized_gru_cell(
+                input,
+                hx,
+                weight_ih,
+                weight_hh,
+                bias_ih,
+                bias_hh,
+                packed_ih,
+                packed_hh,
+                col_offsets_ih,
+                col_offsets_hh,
+                w_ih_scale,
+                w_hh_scale,
+                w_ih_zero_point,
+                w_hh_zero_point
+            );
+
+            // Use the result to prevent optimization
+            if (result.defined()) {
+                volatile float sum_val = result.sum().item<float>();
+                (void)sum_val;
+            }
         }
-        
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&w_hh_scale, Data + offset, sizeof(double));
-            offset += sizeof(double);
-        }
-        
-        // Parse zero points for quantization
-        int64_t w_ih_zero_point = 0;
-        int64_t w_hh_zero_point = 0;
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&w_ih_zero_point, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&w_hh_zero_point, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        // Try to apply the quantized_gru_cell operation
-        torch::Tensor result;
-        
-        // Attempt to call quantized_gru_cell with the created tensors
-        result = torch::quantized_gru_cell(
-            input,
-            hx,
-            weight_ih,
-            weight_hh,
-            bias_ih,
-            bias_hh,
-            packed_ih,
-            packed_hh,
-            col_offsets_ih,
-            col_offsets_hh,
-            w_ih_scale,
-            w_hh_scale,
-            w_ih_zero_point,
-            w_hh_zero_point
-        );
-        
-        // Perform some operation on the result to ensure it's used
-        if (result.defined()) {
-            auto sum = result.sum();
+        catch (const c10::Error &e) {
+            // Silently catch expected errors (shape mismatches, unsupported configs)
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

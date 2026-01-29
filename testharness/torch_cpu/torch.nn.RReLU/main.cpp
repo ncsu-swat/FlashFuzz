@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,48 +27,77 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         bool inplace = false;
         
         if (offset + 8 <= Size) {
-            // Extract lower bound
             std::memcpy(&lower, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize lower bound
+            if (!std::isfinite(lower)) {
+                lower = 0.125;
+            }
+            // Clamp to reasonable range [0, 1]
+            lower = std::fabs(lower);
+            if (lower > 1.0) {
+                lower = std::fmod(lower, 1.0);
+            }
         }
         
         if (offset + 8 <= Size) {
-            // Extract upper bound
             std::memcpy(&upper, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize upper bound
+            if (!std::isfinite(upper)) {
+                upper = 0.3333333333333333;
+            }
+            // Clamp to reasonable range [0, 1]
+            upper = std::fabs(upper);
+            if (upper > 1.0) {
+                upper = std::fmod(upper, 1.0);
+            }
+        }
+        
+        // Ensure lower <= upper
+        if (lower > upper) {
+            std::swap(lower, upper);
         }
         
         if (offset < Size) {
-            // Extract inplace flag
             inplace = Data[offset] & 0x1;
             offset++;
         }
         
         // Create RReLU module
-        torch::nn::RReLU rrelu = torch::nn::RReLU(
-            torch::nn::RReLUOptions().lower(lower).upper(upper).inplace(inplace)
+        torch::nn::RReLU rrelu(
+            torch::nn::RReLUOptions().lower(lower).upper(upper).inplace(false)
         );
         
-        // Apply RReLU to the input tensor
-        torch::Tensor output;
+        // Apply RReLU to the input tensor (non-inplace first)
+        torch::Tensor output = rrelu(input);
+        
+        // Test inplace operation only with floating point tensors
         if (inplace && input.is_floating_point()) {
-            // For inplace operations, we need to make sure the tensor is floating point
-            // and we need to clone it to avoid modifying the original
-            torch::Tensor input_clone = input.clone();
-            output = rrelu(input_clone);
-        } else {
-            output = rrelu(input);
+            try {
+                torch::nn::RReLU rrelu_inplace(
+                    torch::nn::RReLUOptions().lower(lower).upper(upper).inplace(true)
+                );
+                torch::Tensor input_clone = input.clone();
+                torch::Tensor output_inplace = rrelu_inplace(input_clone);
+            } catch (const std::exception &) {
+                // Inplace operations may fail for various reasons - expected
+            }
         }
         
-        // Test the functional version as well
-        torch::Tensor output_functional = torch::nn::functional::rrelu(
-            input, 
-            torch::nn::functional::RReLUFuncOptions()
-                .lower(lower)
-                .upper(upper)
-                .inplace(false)
-                .training(true)
-        );
+        // Test the functional version
+        try {
+            torch::Tensor output_functional = torch::nn::functional::rrelu(
+                input, 
+                torch::nn::functional::RReLUFuncOptions()
+                    .lower(lower)
+                    .upper(upper)
+                    .inplace(false)
+                    .training(true)
+            );
+        } catch (const std::exception &) {
+            // Expected for certain inputs
+        }
         
         // Test with different training modes
         rrelu->eval();
@@ -73,20 +106,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         rrelu->train();
         torch::Tensor output_train = rrelu(input);
         
-        // Test with different device if available
-        if (torch::cuda::is_available()) {
-            torch::Tensor input_cuda = input.to(torch::kCUDA);
-            torch::nn::RReLU rrelu_cuda = torch::nn::RReLU(
-                torch::nn::RReLUOptions().lower(lower).upper(upper).inplace(inplace)
-            );
-            rrelu_cuda->to(torch::kCUDA);
-            torch::Tensor output_cuda = rrelu_cuda(input_cuda);
-        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

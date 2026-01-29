@@ -1,71 +1,76 @@
 #include "fuzzer_utils.h"                         // General fuzzing utilities
-#include <iostream>                               // For cerr
+#include <iostream>                               // For cerr, cout
 #include <sstream>                                // For std::istringstream
-#include <torch/script.h>                         // For torch::jit::IValue
+#include <torch/script.h>                         // For torch::jit::Module
 #include <torch/csrc/jit/serialization/import.h>  // For torch::jit::import_ir_module
+
 // Target API: torch.import_ir_module
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         if (Size < 4) {
             return 0;
         }
+
+        // Use fuzz data directly as potential IR/serialized module content
+        // This tests the parser's robustness against malformed input
+        std::string ir_content(reinterpret_cast<const char *>(Data), Size);
         
-        // Create a tensor to use as input
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-
-        // Extract a bounded string from the remaining data to use as IR module content
-        std::string ir_content;
-        if (offset < Size)
-        {
-            size_t content_length = std::min(Size - offset, static_cast<size_t>(2048));
-            ir_content = std::string(reinterpret_cast<const char *>(Data + offset), content_length);
-            offset += content_length;
-        }
-        else
-        {
-            ir_content = "JITVERSION 4\n\n"; // Minimal header-like content to keep importer busy
-        }
-
-        // Try importing the IR module directly from the buffer with torch.import_ir_module
+        // Try importing the IR module from the fuzz data buffer
         try
         {
             auto cu = std::make_shared<torch::jit::CompilationUnit>();
             std::istringstream ir_stream(ir_content);
+            
+            // Main API under test: import_ir_module
             torch::jit::Module module = torch::jit::import_ir_module(cu, ir_stream);
 
-            std::vector<torch::jit::IValue> inputs;
-            inputs.push_back(input_tensor);
-
+            // If import succeeds (very unlikely with random data), try to use the module
             try
             {
-                torch::jit::IValue output = module.forward(inputs);
-                if (output.isTensor())
-                {
-                    auto out_tensor = output.toTensor();
-                    (void)out_tensor.sum(); // Touch output to exercise execution
+                // Get method names to see what's available
+                auto methods = module.get_methods();
+                
+                // Try forward if it exists
+                if (module.find_method("forward")) {
+                    // Create a simple input tensor
+                    std::vector<torch::jit::IValue> inputs;
+                    inputs.push_back(torch::randn({1, 3, 32, 32}));
+                    
+                    torch::jit::IValue output = module.forward(inputs);
+                    if (output.isTensor())
+                    {
+                        auto out_tensor = output.toTensor();
+                        (void)out_tensor.sum(); // Touch output to exercise execution
+                    }
                 }
             }
             catch (...)
             {
                 // Silently catch exceptions from running the module
+                // Expected since fuzz data won't produce valid callable modules
             }
         }
         catch (...)
         {
             // Silently catch exceptions from importing the module
+            // This is expected - most fuzz inputs won't be valid serialized modules
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

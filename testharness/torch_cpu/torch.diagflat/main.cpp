@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,20 +23,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Parse offset parameter if we have more data
-        int64_t offset_param = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&offset_param, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        // diagflat works on 1D input or flattens the input
+        // Flatten if not already 1D to test the flattening behavior
+        if (input.dim() > 1 && offset < Size && (Data[offset] % 2 == 0)) {
+            // Sometimes test with already flattened input
+            input = input.flatten();
+        }
+        
+        // Parse offset parameter (diagonal offset)
+        int64_t diag_offset = 0;
+        if (offset + sizeof(int8_t) <= Size) {
+            // Use int8_t to get reasonable offset values (-128 to 127)
+            int8_t small_offset;
+            std::memcpy(&small_offset, Data + offset, sizeof(int8_t));
+            diag_offset = static_cast<int64_t>(small_offset);
+            offset += sizeof(int8_t);
         }
         
         // Apply diagflat operation
         torch::Tensor result;
         
-        // Try different variants of diagflat
-        if (offset < Size) {
-            // Use the offset parameter if we have it
-            result = torch::diagflat(input, offset_param);
+        // Try different variants based on fuzzer data
+        bool use_offset = (offset < Size) && (Data[offset % Size] % 2 == 0);
+        
+        if (use_offset) {
+            // Use the diagonal offset parameter
+            result = torch::diagflat(input, diag_offset);
         } else {
             // Default offset = 0
             result = torch::diagflat(input);
@@ -42,14 +59,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             throw std::runtime_error("diagflat returned undefined tensor");
         }
         
-        // Try to access some properties to ensure the tensor is valid
+        // Access properties to ensure the tensor is valid
         auto sizes = result.sizes();
         auto dtype = result.dtype();
+        
+        // Verify the result is 2D (diagflat always produces 2D output)
+        if (result.dim() != 2) {
+            throw std::runtime_error("diagflat should produce 2D output");
+        }
         
         // Try to perform some operations on the result
         if (result.numel() > 0) {
             auto sum = torch::sum(result);
-            auto mean = torch::mean(result);
+            
+            // Mean only works on floating point tensors
+            if (result.is_floating_point()) {
+                auto mean = torch::mean(result);
+            }
+            
+            // Extract diagonal to verify roundtrip
+            auto diag = torch::diag(result, diag_offset);
         }
     }
     catch (const std::exception &e)

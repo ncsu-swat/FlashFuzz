@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -25,11 +30,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             uint8_t dim_byte = Data[offset++];
             
             // Convert to a dimension value that could be positive or negative
-            int rank = input_tensor.dim();
+            int64_t rank = input_tensor.dim();
             
-            // Allow dim to be in range [-rank-1, rank]
-            // This includes valid dimensions plus one position beyond each end
-            dim = static_cast<int64_t>(dim_byte) % (2 * rank + 2) - (rank + 1);
+            // Valid dim range for unsqueeze is [-rank-1, rank]
+            // Map dim_byte to this range
+            int64_t range_size = 2 * rank + 2;
+            if (range_size > 0) {
+                dim = static_cast<int64_t>(dim_byte % range_size) - (rank + 1);
+            }
         }
         
         // Apply unsqueeze operation
@@ -40,24 +48,70 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             throw std::runtime_error("Unexpected result dimension");
         }
         
-        // Try to access elements to ensure tensor is valid
+        // Access the data to ensure tensor is valid (sum works for any tensor)
         if (result.numel() > 0) {
-            result.item();
+            auto sum_val = result.sum();
+            (void)sum_val;
         }
         
-        // Try alternative API
-        torch::Tensor result2 = input_tensor.unsqueeze(dim);
+        // Try alternative API (method form)
+        try {
+            torch::Tensor result2 = input_tensor.unsqueeze(dim);
+            
+            // Verify both APIs produce same shape
+            if (!result.sizes().equals(result2.sizes())) {
+                throw std::runtime_error("API mismatch in result shapes");
+            }
+        } catch (const c10::Error &) {
+            // Silently catch expected PyTorch errors
+        }
         
         // Try chained unsqueeze operations if we have more data
         if (offset < Size) {
-            int64_t dim2 = static_cast<int64_t>(Data[offset++]) % (result.dim() + 1) - (result.dim() / 2);
-            torch::Tensor result3 = result.unsqueeze(dim2);
+            try {
+                int64_t rank2 = result.dim();
+                int64_t range_size2 = 2 * rank2 + 2;
+                int64_t dim2 = 0;
+                if (range_size2 > 0) {
+                    dim2 = static_cast<int64_t>(Data[offset++] % range_size2) - (rank2 + 1);
+                }
+                torch::Tensor result3 = result.unsqueeze(dim2);
+                (void)result3;
+            } catch (const c10::Error &) {
+                // Silently catch expected PyTorch errors for invalid dimensions
+            }
+        }
+        
+        // Test unsqueeze with different dtypes
+        if (offset < Size) {
+            try {
+                uint8_t dtype_selector = Data[offset++] % 4;
+                torch::Tensor typed_tensor;
+                switch (dtype_selector) {
+                    case 0:
+                        typed_tensor = input_tensor.to(torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_tensor = input_tensor.to(torch::kFloat64);
+                        break;
+                    case 2:
+                        typed_tensor = input_tensor.to(torch::kInt32);
+                        break;
+                    default:
+                        typed_tensor = input_tensor.to(torch::kInt64);
+                        break;
+                }
+                torch::Tensor dtype_result = torch::unsqueeze(typed_tensor, 0);
+                (void)dtype_result;
+            } catch (const c10::Error &) {
+                // Silently catch dtype conversion errors
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

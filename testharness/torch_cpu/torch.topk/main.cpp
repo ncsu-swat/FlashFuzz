@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,27 +27,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Get k value (number of top elements to return)
-        int64_t k = 1;
-        if (!input.numel()) {
-            // If tensor is empty, use default k=1
-            k = 1;
-        } else {
-            // Get a dimension to use for k
-            int64_t max_k = input.numel();
-            if (max_k > 0) {
-                // Use the next byte to determine k
-                uint8_t k_byte = Data[offset++];
-                k = (k_byte % max_k) + 1; // Ensure k is at least 1 and at most numel
-            }
+        // Skip empty tensors or 0-dim tensors
+        if (input.numel() == 0 || input.dim() == 0) {
+            return 0;
         }
         
         // Get dimension to perform topk along
-        int64_t dim = 0;
-        if (input.dim() > 0) {
-            uint8_t dim_byte = Data[offset++];
-            dim = dim_byte % input.dim(); // Ensure dim is valid
+        uint8_t dim_byte = Data[offset++];
+        int64_t dim = dim_byte % input.dim();
+        
+        // Get k value (must be <= size along the chosen dimension)
+        int64_t dim_size = input.size(dim);
+        if (dim_size <= 0) {
+            return 0;
         }
+        
+        uint8_t k_byte = Data[offset++];
+        int64_t k = (k_byte % dim_size) + 1; // Ensure k is in [1, dim_size]
         
         // Get largest flag (true = largest values, false = smallest values)
         bool largest = (Data[offset++] % 2) == 0;
@@ -51,7 +51,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Get sorted flag (true = sort results, false = don't sort)
         bool sorted = (Data[offset++] % 2) == 0;
         
-        // Call topk with different parameter combinations
+        // Call topk with the main parameter combination
         try {
             auto result = torch::topk(input, k, dim, largest, sorted);
             
@@ -59,66 +59,66 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto values = std::get<0>(result);
             auto indices = std::get<1>(result);
             
-            // Try to use the results to ensure they're valid
+            // Use the results to ensure they're valid
             if (values.numel() > 0 && indices.numel() > 0) {
                 auto sum = values.sum();
                 auto max_idx = indices.max();
+                (void)sum;
+                (void)max_idx;
             }
-        } catch (const c10::Error& e) {
+        } catch (const c10::Error&) {
             // PyTorch specific exceptions are expected for invalid inputs
-            return 0;
         }
         
-        // Try with different k values
-        if (offset < Size && input.numel() > 0) {
-            uint8_t alt_k_byte = Data[offset++];
-            // Try with k=0 (should throw an exception)
-            try {
-                auto result = torch::topk(input, 0, dim, largest, sorted);
-            } catch (const c10::Error&) {
-                // Expected exception for k=0
-            }
-            
-            // Try with k > dimension size (should be clamped or throw)
-            try {
-                int64_t dim_size = 1;
-                if (input.dim() > 0) {
-                    dim_size = input.size(dim);
-                }
-                
-                if (dim_size > 0) {
-                    int64_t large_k = dim_size + (alt_k_byte % 10) + 1;
-                    auto result = torch::topk(input, large_k, dim, largest, sorted);
-                }
-            } catch (const c10::Error&) {
-                // Expected exception for k > dimension size
-            }
-        }
-        
-        // Try with negative dimension
-        if (offset < Size && input.dim() > 0) {
-            try {
-                int64_t neg_dim = -1 - (Data[offset++] % input.dim());
-                auto result = torch::topk(input, k, neg_dim, largest, sorted);
-            } catch (const c10::Error&) {
-                // May throw for invalid negative dimension
-            }
-        }
-        
-        // Try with out-of-bounds dimension
+        // Try with negative dimension (valid in PyTorch)
         if (offset < Size) {
             try {
-                int64_t invalid_dim = input.dim() + (Data[offset++] % 5);
-                auto result = torch::topk(input, k, invalid_dim, largest, sorted);
+                int64_t neg_dim = -(1 + (Data[offset++] % input.dim()));
+                int64_t neg_dim_size = input.size(neg_dim);
+                if (neg_dim_size > 0) {
+                    int64_t neg_k = (k_byte % neg_dim_size) + 1;
+                    auto result = torch::topk(input, neg_k, neg_dim, largest, sorted);
+                    (void)std::get<0>(result);
+                }
             } catch (const c10::Error&) {
-                // Expected exception for invalid dimension
+                // May throw for edge cases
             }
+        }
+        
+        // Try topk with k=1 (edge case)
+        try {
+            auto result = torch::topk(input, 1, dim, largest, sorted);
+            (void)std::get<0>(result);
+        } catch (const c10::Error&) {
+            // Handle potential errors
+        }
+        
+        // Try topk with k equal to full dimension size
+        try {
+            auto result = torch::topk(input, dim_size, dim, largest, sorted);
+            (void)std::get<0>(result);
+        } catch (const c10::Error&) {
+            // Handle potential errors
+        }
+        
+        // Try with all combinations of largest and sorted flags
+        try {
+            auto result1 = torch::topk(input, k, dim, true, true);
+            auto result2 = torch::topk(input, k, dim, true, false);
+            auto result3 = torch::topk(input, k, dim, false, true);
+            auto result4 = torch::topk(input, k, dim, false, false);
+            (void)std::get<0>(result1);
+            (void)std::get<0>(result2);
+            (void)std::get<0>(result3);
+            (void)std::get<0>(result4);
+        } catch (const c10::Error&) {
+            // Handle potential errors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

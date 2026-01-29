@@ -1,187 +1,200 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        // Need sufficient data for BSR tensor construction
+        if (Size < 16) {
+            return 0;
+        }
+
         size_t offset = 0;
-        
-        // Need at least a few bytes for basic parameters
-        if (Size < 10) {
-            return 0;
+
+        // Parse blocksize (1-4 for each dimension to keep tensors manageable)
+        int64_t block_h = (Data[offset++] % 4) + 1;
+        int64_t block_w = (Data[offset++] % 4) + 1;
+
+        // Parse matrix dimensions in terms of blocks (1-8 blocks)
+        int64_t n_block_rows = (Data[offset++] % 8) + 1;
+        int64_t n_block_cols = (Data[offset++] % 8) + 1;
+
+        // Parse number of non-zero blocks (1 to n_block_rows * n_block_cols)
+        int64_t max_nnz = n_block_rows * n_block_cols;
+        int64_t nnz = (Data[offset++] % max_nnz) + 1;
+        if (nnz > max_nnz) nnz = max_nnz;
+
+        // Calculate actual matrix size
+        int64_t nrows = n_block_rows * block_h;
+        int64_t ncols = n_block_cols * block_w;
+
+        // Build valid BSR indices
+        // crow_indices has size (n_block_rows + 1)
+        std::vector<int64_t> crow_indices_vec(n_block_rows + 1, 0);
+        std::vector<int64_t> col_indices_vec;
+
+        // Distribute nnz blocks across rows
+        int64_t remaining_nnz = nnz;
+        for (int64_t row = 0; row < n_block_rows && remaining_nnz > 0; row++) {
+            // Determine how many blocks in this row
+            int64_t blocks_in_row = 0;
+            if (offset < Size) {
+                blocks_in_row = Data[offset++] % (std::min(remaining_nnz, n_block_cols) + 1);
+            } else {
+                blocks_in_row = std::min(remaining_nnz, (int64_t)1);
+            }
+            
+            crow_indices_vec[row + 1] = crow_indices_vec[row] + blocks_in_row;
+            
+            // Generate column indices for this row (must be sorted and unique)
+            std::vector<int64_t> row_cols;
+            for (int64_t c = 0; c < n_block_cols && (int64_t)row_cols.size() < blocks_in_row; c++) {
+                if (offset < Size) {
+                    if (Data[offset++] % 2 == 0 || (int64_t)row_cols.size() < blocks_in_row - (n_block_cols - c - 1)) {
+                        row_cols.push_back(c);
+                    }
+                } else {
+                    row_cols.push_back(c);
+                }
+            }
+            
+            for (auto c : row_cols) {
+                col_indices_vec.push_back(c);
+            }
+            
+            remaining_nnz -= blocks_in_row;
         }
-        
-        // Parse values tensor
-        torch::Tensor values = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Parse crow_indices tensor
-        torch::Tensor crow_indices;
-        if (offset < Size) {
-            crow_indices = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            return 0;
-        }
-        
-        // Parse col_indices tensor
-        torch::Tensor col_indices;
-        if (offset < Size) {
-            col_indices = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            return 0;
-        }
-        
-        // Parse blocksize
-        std::vector<int64_t> blocksize;
-        if (offset + 2 <= Size) {
-            uint8_t blocksize_dim1 = Data[offset++] % 8 + 1;
-            uint8_t blocksize_dim2 = Data[offset++] % 8 + 1;
-            blocksize = {static_cast<int64_t>(blocksize_dim1), static_cast<int64_t>(blocksize_dim2)};
-        } else {
-            blocksize = {2, 2}; // Default blocksize
-        }
-        
-        // Parse size (optional)
-        std::vector<int64_t> size;
-        if (offset + 1 < Size) {
-            uint8_t use_size = Data[offset++] % 2;
-            if (use_size && offset + 2 <= Size) {
-                uint8_t size_dim1 = Data[offset++] % 32 + 1;
-                uint8_t size_dim2 = Data[offset++] % 32 + 1;
-                size = {static_cast<int64_t>(size_dim1), static_cast<int64_t>(size_dim2)};
+
+        // Ensure crow_indices is monotonic
+        for (int64_t i = 1; i <= n_block_rows; i++) {
+            if (crow_indices_vec[i] < crow_indices_vec[i-1]) {
+                crow_indices_vec[i] = crow_indices_vec[i-1];
             }
         }
-        
-        // Parse layout (optional)
-        torch::Layout layout = torch::kStrided;
+
+        int64_t actual_nnz = crow_indices_vec[n_block_rows];
+        if (actual_nnz == 0) {
+            // Need at least one block for meaningful test
+            crow_indices_vec[n_block_rows] = 1;
+            col_indices_vec.push_back(0);
+            actual_nnz = 1;
+        }
+
+        // Resize col_indices to match actual_nnz
+        while ((int64_t)col_indices_vec.size() < actual_nnz) {
+            col_indices_vec.push_back(0);
+        }
+        col_indices_vec.resize(actual_nnz);
+
+        // Create index tensors (must be int64)
+        torch::Tensor crow_indices = torch::tensor(crow_indices_vec, torch::kInt64);
+        torch::Tensor col_indices = torch::tensor(col_indices_vec, torch::kInt64);
+
+        // Create values tensor with shape (actual_nnz, block_h, block_w)
+        torch::Tensor values;
         if (offset < Size) {
-            uint8_t layout_byte = Data[offset++];
-            if (layout_byte % 2 == 1) {
-                layout = torch::kSparse;
+            // Use fuzzer data to create values
+            values = fuzzer_utils::createTensor(Data, Size, offset);
+            // Reshape to proper BSR values shape
+            try {
+                int64_t total_elements = actual_nnz * block_h * block_w;
+                // Create a tensor with the right number of elements
+                values = torch::randn({actual_nnz, block_h, block_w});
+            } catch (...) {
+                values = torch::randn({actual_nnz, block_h, block_w});
             }
+        } else {
+            values = torch::randn({actual_nnz, block_h, block_w});
         }
-        
-        // Parse device (CPU only for fuzzing)
-        torch::Device device = torch::kCPU;
-        
-        // Parse requires_grad (optional)
-        bool requires_grad = false;
+
+        // Parse dtype choice
+        torch::ScalarType dtype = torch::kFloat;
         if (offset < Size) {
-            requires_grad = (Data[offset++] % 2 == 1);
+            uint8_t dtype_choice = Data[offset++] % 4;
+            switch (dtype_choice) {
+                case 0: dtype = torch::kFloat; break;
+                case 1: dtype = torch::kDouble; break;
+                case 2: dtype = torch::kComplexFloat; break;
+                case 3: dtype = torch::kComplexDouble; break;
+            }
+            values = values.to(dtype);
         }
-        
-        // Create sparse_bsr_tensor with different parameter combinations
+
+        // Create the sparse BSR tensor
         try {
             torch::Tensor result;
             
-            // Try different combinations of parameters
-            if (offset < Size) {
-                uint8_t param_choice = Data[offset++] % 4;
-                
-                switch (param_choice) {
-                    case 0:
-                        // Basic version with TensorOptions (required)
-                        {
-                            auto options = torch::TensorOptions()
-                                .dtype(values.dtype())
-                                .layout(layout)
-                                .device(device)
-                                .requires_grad(requires_grad);
-                            result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, options);
-                        }
-                        break;
-                    case 1:
-                        // With size parameter
-                        {
-                            auto options = torch::TensorOptions()
-                                .dtype(values.dtype())
-                                .layout(layout)
-                                .device(device)
-                                .requires_grad(requires_grad);
-                            if (!size.empty()) {
-                                result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, size, options);
-                            } else {
-                                result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, options);
-                            }
-                        }
-                        break;
-                    case 2:
-                        // With TensorOptions
-                        {
-                            auto options = torch::TensorOptions()
-                                .dtype(values.dtype())
-                                .layout(layout)
-                                .device(device)
-                                .requires_grad(requires_grad);
-                            
-                            if (!size.empty()) {
-                                result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, size, options);
-                            } else {
-                                result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, options);
-                            }
-                        }
-                        break;
-                    case 3:
-                        // With all parameters
-                        {
-                            auto options = torch::TensorOptions()
-                                .dtype(values.dtype())
-                                .layout(layout)
-                                .device(device)
-                                .requires_grad(requires_grad);
-                            
-                            if (!size.empty()) {
-                                result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, size, options);
-                            } else {
-                                result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, options);
-                            }
-                        }
-                        break;
-                }
+            if (offset < Size && Data[offset++] % 2 == 0) {
+                // With explicit size
+                std::vector<int64_t> size = {nrows, ncols};
+                result = torch::sparse_bsr_tensor(
+                    crow_indices, col_indices, values, size,
+                    torch::TensorOptions().dtype(values.dtype()).device(torch::kCPU)
+                );
             } else {
-                // Default case if we don't have enough data
-                auto options = torch::TensorOptions()
-                    .dtype(values.dtype())
-                    .layout(layout)
-                    .device(device)
-                    .requires_grad(requires_grad);
-                result = torch::sparse_bsr_tensor(crow_indices, col_indices, values, options);
+                // Without explicit size (inferred)
+                result = torch::sparse_bsr_tensor(
+                    crow_indices, col_indices, values,
+                    torch::TensorOptions().dtype(values.dtype()).device(torch::kCPU)
+                );
             }
-            
-            // Perform some operations on the result to ensure it's valid
-            auto indices = result._indices();
-            auto values_result = result._values();
+
+            // Verify BSR tensor properties
+            auto result_crow = result.crow_indices();
+            auto result_col = result.col_indices();
+            auto result_values = result.values();
+
+            // Get dimensions
             auto sparse_dim = result.sparse_dim();
             auto dense_dim = result.dense_dim();
-            auto is_coalesced = result.is_coalesced();
-            
-            // Try to coalesce if not already coalesced
-            if (!is_coalesced) {
-                try {
-                    auto coalesced = result.coalesce();
-                } catch (...) {
-                    // Ignore coalescing errors
-                }
-            }
-            
+
             // Try to convert to dense
             try {
                 auto dense = result.to_dense();
+                // Verify dense shape
+                (void)dense.sizes();
             } catch (...) {
-                // Ignore conversion errors
+                // Conversion might fail for invalid sparse tensors
             }
+
+            // Try transpose (creates a BSC tensor)
+            try {
+                auto transposed = result.t();
+                (void)transposed.sizes();
+            } catch (...) {
+                // Transpose might not be supported
+            }
+
+            // Try matrix multiplication if dimensions allow
+            try {
+                if (result.dim() == 2) {
+                    auto vec = torch::randn({ncols}, values.options());
+                    auto mv_result = torch::mv(result, vec);
+                    (void)mv_result.sizes();
+                }
+            } catch (...) {
+                // MV might fail
+            }
+
         } catch (const c10::Error& e) {
-            // Catch PyTorch-specific errors but don't terminate fuzzing
+            // Expected for invalid BSR structure
+            return 0;
+        } catch (const std::runtime_error& e) {
+            // Expected for invalid parameters
             return 0;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

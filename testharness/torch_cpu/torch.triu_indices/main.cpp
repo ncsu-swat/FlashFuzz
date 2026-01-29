@@ -1,115 +1,153 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
+        size_t data_offset = 0;
         
-        // Need at least 4 bytes for row, col, offset, and diagonal
-        if (Size < 4) {
+        // Need at least 3 bytes for row, col, and offset parameters
+        if (Size < 3) {
             return 0;
         }
         
-        // Parse row and column dimensions
+        // Parse row and column dimensions from fuzzer data
+        // Constrain to reasonable sizes to avoid OOM (0-500)
         int64_t row = 0;
         int64_t col = 0;
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&row, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&col, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        // Parse offset and diagonal parameters
         int64_t offset_param = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&offset_param, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        
+        if (data_offset + sizeof(int16_t) <= Size) {
+            int16_t raw_row;
+            std::memcpy(&raw_row, Data + data_offset, sizeof(int16_t));
+            data_offset += sizeof(int16_t);
+            row = std::abs(raw_row) % 501;  // 0-500
         }
         
-        bool diagonal = false;
-        if (offset < Size) {
-            diagonal = static_cast<bool>(Data[offset++] & 0x01);
+        if (data_offset + sizeof(int16_t) <= Size) {
+            int16_t raw_col;
+            std::memcpy(&raw_col, Data + data_offset, sizeof(int16_t));
+            data_offset += sizeof(int16_t);
+            col = std::abs(raw_col) % 501;  // 0-500
         }
         
-        // Call triu_indices with various combinations
+        if (data_offset + sizeof(int16_t) <= Size) {
+            int16_t raw_offset;
+            std::memcpy(&raw_offset, Data + data_offset, sizeof(int16_t));
+            data_offset += sizeof(int16_t);
+            // Offset can be negative or positive, constrain to reasonable range
+            offset_param = raw_offset % 1001 - 500;  // -500 to 500
+        }
+        
+        // Call triu_indices with parsed parameters
         try {
             auto indices = torch::triu_indices(row, col, offset_param);
+            // Verify the output has expected shape (2, num_indices)
+            if (indices.dim() == 2 && indices.size(0) == 2) {
+                // Access elements to ensure tensor is properly formed
+                auto row_indices = indices[0];
+                auto col_indices = indices[1];
+            }
         } catch (const c10::Error &e) {
             // Expected exceptions from PyTorch API are fine
         }
         
-        // Try with different row/col combinations
+        // Try with zero dimensions
         try {
-            // Try with negative dimensions
-            auto indices_neg_row = torch::triu_indices(-row, col, offset_param);
+            auto indices_zero = torch::triu_indices(0, 0, 0);
         } catch (const c10::Error &e) {
-            // Expected exceptions from PyTorch API are fine
+            // Expected
         }
         
+        // Try with zero row
         try {
-            // Try with negative dimensions
-            auto indices_neg_col = torch::triu_indices(row, -col, offset_param);
+            auto indices_zero_row = torch::triu_indices(0, col, offset_param);
         } catch (const c10::Error &e) {
-            // Expected exceptions from PyTorch API are fine
+            // Expected
         }
         
+        // Try with zero col
         try {
-            // Try with zero dimensions
-            auto indices_zero = torch::triu_indices(0, 0, offset_param);
+            auto indices_zero_col = torch::triu_indices(row, 0, offset_param);
         } catch (const c10::Error &e) {
-            // Expected exceptions from PyTorch API are fine
+            // Expected
         }
         
+        // Try with large positive offset (beyond matrix)
         try {
-            // Try with large offset
-            auto indices_large_offset = torch::triu_indices(row, col, row + col);
+            auto indices_large_offset = torch::triu_indices(row, col, static_cast<int64_t>(row + col));
         } catch (const c10::Error &e) {
-            // Expected exceptions from PyTorch API are fine
+            // Expected
         }
         
+        // Try with large negative offset
         try {
-            // Try with negative offset
-            auto indices_neg_offset = torch::triu_indices(row, col, -offset_param);
+            auto indices_neg_offset = torch::triu_indices(row, col, -static_cast<int64_t>(row + col));
         } catch (const c10::Error &e) {
-            // Expected exceptions from PyTorch API are fine
+            // Expected
         }
         
-        // Try with very large dimensions if there's enough data
-        if (Size > offset + 2 * sizeof(int64_t)) {
-            int64_t large_row = 0;
-            int64_t large_col = 0;
-            
-            std::memcpy(&large_row, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            std::memcpy(&large_col, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Make them large but not too large to avoid OOM
-            large_row = std::abs(large_row) % 1000;
-            large_col = std::abs(large_col) % 1000;
+        // Try with different dtype options if we have more data
+        if (data_offset < Size) {
+            uint8_t dtype_selector = Data[data_offset++] % 2;
             
             try {
-                auto indices_large = torch::triu_indices(large_row, large_col, offset_param);
+                torch::TensorOptions options;
+                if (dtype_selector == 0) {
+                    options = torch::TensorOptions().dtype(torch::kInt64);
+                } else {
+                    options = torch::TensorOptions().dtype(torch::kInt32);
+                }
+                auto indices_typed = torch::triu_indices(row, col, offset_param, options);
             } catch (const c10::Error &e) {
-                // Expected exceptions from PyTorch API are fine
+                // Expected
             }
+        }
+        
+        // Try square matrix case
+        try {
+            int64_t size = (row + col) / 2;
+            if (size > 0 && size <= 500) {
+                auto indices_square = torch::triu_indices(size, size, offset_param);
+            }
+        } catch (const c10::Error &e) {
+            // Expected
+        }
+        
+        // Try rectangular matrices (wide and tall)
+        try {
+            if (row > 0 && col > 0) {
+                // Wide matrix
+                auto indices_wide = torch::triu_indices(row, col * 2 > 500 ? 500 : col * 2, offset_param);
+            }
+        } catch (const c10::Error &e) {
+            // Expected
+        }
+        
+        try {
+            if (row > 0 && col > 0) {
+                // Tall matrix
+                auto indices_tall = torch::triu_indices(row * 2 > 500 ? 500 : row * 2, col, offset_param);
+            }
+        } catch (const c10::Error &e) {
+            // Expected
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
+    return 0;
 }

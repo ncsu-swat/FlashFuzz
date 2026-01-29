@@ -1,119 +1,172 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least a few bytes for basic operations
-        if (Size < 4) {
+        // Need at least a few bytes for parameters
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Get some parameters for the linear layer
-        int64_t in_features = 0;
-        int64_t out_features = 0;
-        bool bias = true;
+        // Extract in_features from data (1-64 range)
+        int64_t in_features = (Data[offset++] % 64) + 1;
         
-        // Determine in_features from the input tensor
-        if (input.dim() >= 2) {
-            in_features = input.size(-1);
-        } else if (input.dim() == 1) {
-            in_features = input.size(0);
-        } else {
-            // For scalar tensors, use a default value
-            in_features = 1;
-        }
+        // Extract out_features from data (1-64 range)
+        int64_t out_features = (Data[offset++] % 64) + 1;
         
-        // Extract out_features from the remaining data
-        if (offset + sizeof(int64_t) <= Size) {
-            int64_t raw_out_features;
-            std::memcpy(&raw_out_features, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure out_features is reasonable (avoid excessive memory usage)
-            out_features = std::abs(raw_out_features) % 128 + 1;
-        } else {
-            // Default if not enough data
-            out_features = 10;
-        }
+        // Extract bias flag
+        bool bias = Data[offset++] & 0x1;
         
-        // Extract bias flag if data available
-        if (offset < Size) {
-            bias = Data[offset++] & 0x1;  // Use lowest bit to determine bias
-        }
+        // Extract batch size (1-16 range)
+        int64_t batch_size = (Data[offset++] % 16) + 1;
         
-        // Create the linear module using LinearOptions
+        // Create the linear module
         torch::nn::LinearOptions options(in_features, out_features);
         options.bias(bias);
         torch::nn::Linear linear_module(options);
         
-        // Try different input shapes and scenarios
+        // Create input tensor with correct shape for the linear layer
+        torch::Tensor input = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+        
+        // Reshape or create a properly shaped input tensor
+        torch::Tensor shaped_input;
         try {
-            // Forward pass with the input tensor
-            torch::Tensor output = linear_module->forward(input);
+            // Create a tensor with the correct last dimension
+            shaped_input = torch::randn({batch_size, in_features});
+            
+            // If we have fuzzer-generated data, try to use it to fill values
+            if (input.numel() > 0) {
+                auto flat_input = input.flatten();
+                int64_t copy_size = std::min(flat_input.numel(), shaped_input.numel());
+                if (copy_size > 0 && flat_input.scalar_type() == torch::kFloat) {
+                    shaped_input.flatten().slice(0, 0, copy_size).copy_(
+                        flat_input.slice(0, 0, copy_size));
+                }
+            }
+        } catch (...) {
+            // If shaping fails, create a simple valid input
+            shaped_input = torch::randn({batch_size, in_features});
+        }
+        
+        // Test 1: Basic forward pass
+        try {
+            torch::Tensor output = linear_module->forward(shaped_input);
         } catch (const c10::Error& e) {
-            // Expected exceptions from PyTorch are fine
+            // Expected exceptions are fine
         }
         
-        // Try with different input shapes if possible
-        if (input.dim() > 1) {
-            try {
-                // Reshape to batch size of 1 if possible
-                auto reshaped = input.reshape({1, -1});
-                torch::Tensor output = linear_module->forward(reshaped);
-            } catch (const c10::Error& e) {
-                // Expected exceptions from PyTorch are fine
-            }
+        // Test 2: Forward pass with 1D input (single sample)
+        try {
+            torch::Tensor input_1d = torch::randn({in_features});
+            torch::Tensor output = linear_module->forward(input_1d);
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
         }
         
-        // Try with different data types if original tensor is floating point
-        if (input.scalar_type() == torch::kFloat || 
-            input.scalar_type() == torch::kDouble) {
-            try {
-                auto other_dtype = (input.scalar_type() == torch::kFloat) ? 
-                                   torch::kDouble : torch::kFloat;
-                auto converted = input.to(other_dtype);
-                torch::Tensor output = linear_module->forward(converted);
-            } catch (const c10::Error& e) {
-                // Expected exceptions from PyTorch are fine
-            }
+        // Test 3: Forward pass with 3D input (sequence data)
+        try {
+            int64_t seq_len = (batch_size % 8) + 1;
+            torch::Tensor input_3d = torch::randn({batch_size, seq_len, in_features});
+            torch::Tensor output = linear_module->forward(input_3d);
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
         }
         
-        // Test with zero weights/bias
+        // Test 4: Test with different dtypes
+        try {
+            torch::Tensor double_input = shaped_input.to(torch::kDouble);
+            auto double_module = torch::nn::Linear(
+                torch::nn::LinearOptions(in_features, out_features).bias(bias));
+            double_module->to(torch::kDouble);
+            torch::Tensor output = double_module->forward(double_input);
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
+        }
+        
+        // Test 5: Test with zero weights
         try {
             linear_module->weight.zero_();
-            if (bias) {
+            if (bias && linear_module->bias.defined()) {
                 linear_module->bias.zero_();
             }
-            torch::Tensor output = linear_module->forward(input);
+            torch::Tensor output = linear_module->forward(shaped_input);
         } catch (const c10::Error& e) {
-            // Expected exceptions from PyTorch are fine
+            // Expected exceptions are fine
         }
         
-        // Test with extreme weight values
+        // Test 6: Test module parameters iteration
         try {
-            linear_module->weight.fill_(1e10);
-            if (bias) {
-                linear_module->bias.fill_(1e10);
+            for (auto& param : linear_module->parameters()) {
+                auto grad = torch::ones_like(param);
             }
-            torch::Tensor output = linear_module->forward(input);
         } catch (const c10::Error& e) {
-            // Expected exceptions from PyTorch are fine
+            // Expected exceptions are fine
+        }
+        
+        // Test 7: Test named_parameters
+        try {
+            for (auto& named_param : linear_module->named_parameters()) {
+                auto name = named_param.key();
+                auto param = named_param.value();
+            }
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
+        }
+        
+        // Test 8: Test clone
+        try {
+            auto cloned_module = std::dynamic_pointer_cast<torch::nn::LinearImpl>(
+                linear_module->clone());
+            if (cloned_module) {
+                torch::Tensor output = cloned_module->forward(shaped_input);
+            }
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
+        }
+        
+        // Test 9: Test eval and train modes
+        try {
+            linear_module->eval();
+            torch::Tensor output_eval = linear_module->forward(shaped_input);
+            linear_module->train();
+            torch::Tensor output_train = linear_module->forward(shaped_input);
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
+        }
+        
+        // Test 10: Test with extreme values in input
+        try {
+            torch::Tensor extreme_input = torch::full({batch_size, in_features}, 1e10);
+            torch::Tensor output = linear_module->forward(extreme_input);
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
+        }
+        
+        // Test 11: Test with NaN/Inf input
+        try {
+            torch::Tensor nan_input = torch::full({batch_size, in_features}, 
+                                                   std::numeric_limits<float>::quiet_NaN());
+            torch::Tensor output = linear_module->forward(nan_input);
+        } catch (const c10::Error& e) {
+            // Expected exceptions are fine
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

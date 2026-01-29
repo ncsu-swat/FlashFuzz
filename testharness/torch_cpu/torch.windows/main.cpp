@@ -1,108 +1,130 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Parse window parameters from the remaining data
-        int64_t window_length = 10;
+        // Extract window_length from data (1 to 1000)
+        uint16_t raw_window_length;
+        std::memcpy(&raw_window_length, Data + offset, sizeof(uint16_t));
+        offset += sizeof(uint16_t);
+        int64_t window_length = static_cast<int64_t>(raw_window_length % 1000) + 1;
         
-        if (offset + 2 < Size) {
-            // Extract window_length from data
-            uint16_t raw_window_length;
-            std::memcpy(&raw_window_length, Data + offset, sizeof(uint16_t));
-            offset += sizeof(uint16_t);
-            window_length = static_cast<int64_t>(raw_window_length % 100) + 1; // Ensure positive
-        }
-        
-        // Parse window function type
-        std::string window_fn = "hann";
+        // Parse window function selector
+        uint8_t window_fn_selector = 0;
         if (offset < Size) {
-            uint8_t window_fn_selector = Data[offset++] % 7;
-            
-            switch (window_fn_selector) {
-                case 0:
-                    window_fn = "hann";
-                    break;
-                case 1:
-                    window_fn = "hamming";
-                    break;
-                case 2:
-                    window_fn = "bartlett";
-                    break;
-                case 3:
-                    window_fn = "blackman";
-                    break;
-                case 4:
-                    window_fn = "kaiser";
-                    break;
-                case 5:
-                    window_fn = "gaussian";
-                    break;
-                case 6:
-                    window_fn = "tukey";
-                    break;
-            }
+            window_fn_selector = Data[offset++] % 5;
         }
         
-        // Parse additional parameters for specific window functions
-        double beta = 12.0;
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&beta, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            if (beta < 0) beta = 12.0;
-        }
-        
-        // Parse additional options
+        // Parse periodic flag
         bool periodic = true;
         if (offset < Size) {
-            periodic = Data[offset++] % 2 == 0;
+            periodic = (Data[offset++] % 2) == 0;
         }
         
-        // Try different window functions
+        // Parse beta for kaiser window (ensure valid range 0-50)
+        double beta = 12.0;
+        if (offset < Size) {
+            beta = static_cast<double>(Data[offset++]) / 5.0; // 0 to ~51
+        }
+        
+        // Parse dtype selector
+        uint8_t dtype_selector = 0;
+        if (offset < Size) {
+            dtype_selector = Data[offset++] % 3;
+        }
+        
+        torch::TensorOptions options;
+        switch (dtype_selector) {
+            case 0:
+                options = options.dtype(torch::kFloat32);
+                break;
+            case 1:
+                options = options.dtype(torch::kFloat64);
+                break;
+            case 2:
+                options = options.dtype(torch::kFloat16);
+                break;
+        }
+        
+        // Test the selected window function
         try {
-            // Basic Hann window
-            torch::Tensor result1 = torch::hann_window(window_length);
+            torch::Tensor result;
             
-            // Hamming window
-            torch::Tensor result2 = torch::hamming_window(window_length);
+            switch (window_fn_selector) {
+                case 0: {
+                    // Hann window
+                    result = torch::hann_window(window_length, periodic, options);
+                    break;
+                }
+                case 1: {
+                    // Hamming window
+                    result = torch::hamming_window(window_length, periodic, options);
+                    // Also test with alpha/beta parameters
+                    if (offset + 2 <= Size) {
+                        double alpha = 0.54 + (Data[offset++] % 46) / 100.0; // 0.54 to 1.0
+                        double ham_beta = 1.0 - alpha;
+                        result = torch::hamming_window(window_length, periodic, alpha, ham_beta, options);
+                    }
+                    break;
+                }
+                case 2: {
+                    // Bartlett window
+                    result = torch::bartlett_window(window_length, periodic, options);
+                    break;
+                }
+                case 3: {
+                    // Blackman window
+                    result = torch::blackman_window(window_length, periodic, options);
+                    break;
+                }
+                case 4: {
+                    // Kaiser window
+                    result = torch::kaiser_window(window_length, periodic, beta, options);
+                    break;
+                }
+            }
             
-            // Bartlett window
-            torch::Tensor result3 = torch::bartlett_window(window_length);
-            
-            // Blackman window
-            torch::Tensor result4 = torch::blackman_window(window_length);
-            
-            // Kaiser window with beta parameter
-            torch::Tensor result5 = torch::kaiser_window(window_length, periodic, beta);
-            
-            // Test with periodic parameter
-            torch::Tensor result6 = torch::hann_window(window_length, periodic);
-            torch::Tensor result7 = torch::hamming_window(window_length, periodic);
-            torch::Tensor result8 = torch::bartlett_window(window_length, periodic);
-            torch::Tensor result9 = torch::blackman_window(window_length, periodic);
+            // Verify output properties
+            if (result.defined()) {
+                (void)result.size(0);
+                (void)result.sum();
+            }
             
         } catch (const c10::Error& e) {
-            // PyTorch specific errors are expected and can be ignored
+            // Expected PyTorch errors (invalid parameters, etc.)
+        }
+        
+        // Additional coverage: test all window functions with base parameters
+        try {
+            torch::Tensor h1 = torch::hann_window(window_length);
+            torch::Tensor h2 = torch::hamming_window(window_length);
+            torch::Tensor h3 = torch::bartlett_window(window_length);
+            torch::Tensor h4 = torch::blackman_window(window_length);
+            torch::Tensor h5 = torch::kaiser_window(window_length);
+            (void)h1; (void)h2; (void)h3; (void)h4; (void)h5;
+        } catch (const c10::Error& e) {
+            // Expected errors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

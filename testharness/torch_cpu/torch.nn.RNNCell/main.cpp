@@ -1,143 +1,142 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least a few bytes for basic parameters
         if (Size < 8) {
             return 0;
         }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create hidden state tensor
-        torch::Tensor h0;
+
+        size_t offset = 0;
+
+        // Parse input_size (1-64)
+        int64_t input_size = 1;
         if (offset < Size) {
-            h0 = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data for h0, create a compatible one
-            if (input.dim() > 0 && input.size(0) > 0) {
-                h0 = torch::zeros({input.size(0), 10}, input.options());
-            } else {
-                h0 = torch::zeros({1, 10}, input.options());
-            }
+            input_size = (Data[offset++] % 64) + 1;
         }
-        
-        // Extract parameters for RNNCell
-        int64_t input_size = 0;
-        int64_t hidden_size = 0;
-        bool bias = true;
-        bool nonlinearity_tanh = true;
-        
-        // Parse input_size
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&input_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            input_size = std::abs(input_size) % 100 + 1; // Ensure positive and reasonable
-        } else {
-            // Default value if not enough data
-            input_size = 10;
+
+        // Parse hidden_size (1-64)
+        int64_t hidden_size = 1;
+        if (offset < Size) {
+            hidden_size = (Data[offset++] % 64) + 1;
         }
-        
-        // Parse hidden_size
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&hidden_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            hidden_size = std::abs(hidden_size) % 100 + 1; // Ensure positive and reasonable
-        } else {
-            // Default value if not enough data
-            hidden_size = 20;
+
+        // Parse batch_size (1-16)
+        int64_t batch_size = 1;
+        if (offset < Size) {
+            batch_size = (Data[offset++] % 16) + 1;
         }
-        
+
         // Parse bias flag
+        bool bias = true;
         if (offset < Size) {
-            bias = Data[offset++] & 0x1; // Use lowest bit to determine bias
+            bias = Data[offset++] & 0x1;
         }
-        
+
         // Parse nonlinearity type
+        bool use_tanh = true;
         if (offset < Size) {
-            nonlinearity_tanh = Data[offset++] & 0x1; // Use lowest bit to determine nonlinearity
+            use_tanh = Data[offset++] & 0x1;
         }
-        
-        // Create RNNCell
+
+        // Create RNNCell with parsed options
         torch::nn::RNNCellOptions options(input_size, hidden_size);
         options.bias(bias);
-        options.nonlinearity(nonlinearity_tanh ? torch::nn::RNNCellOptions::Nonlinearity::Tanh : torch::nn::RNNCellOptions::Nonlinearity::ReLU);
         
+        // Set nonlinearity based on parsed value
+        if (use_tanh) {
+            options.nonlinearity(torch::kTanh);
+        } else {
+            options.nonlinearity(torch::kReLU);
+        }
+
         torch::nn::RNNCell cell(options);
-        
-        // Reshape input tensor if needed to match expected dimensions
-        if (input.dim() < 2) {
-            if (input.dim() == 0) {
-                input = input.reshape({1, 1});
+
+        // Create input tensor with correct dimensions: (batch_size, input_size)
+        torch::Tensor input;
+        if (offset < Size) {
+            input = fuzzer_utils::createTensor(Data, Size, offset);
+            // Calculate total elements and reshape safely
+            int64_t numel = input.numel();
+            if (numel >= batch_size * input_size) {
+                input = input.flatten().slice(0, 0, batch_size * input_size)
+                            .reshape({batch_size, input_size});
+            } else if (numel > 0) {
+                // Pad with zeros if not enough elements
+                auto flat = input.flatten();
+                input = torch::zeros({batch_size, input_size}, input.options());
+                input.flatten().slice(0, 0, numel).copy_(flat);
             } else {
-                input = input.reshape({1, input.size(0)});
+                input = torch::randn({batch_size, input_size});
             }
+        } else {
+            input = torch::randn({batch_size, input_size});
         }
-        
-        // Reshape h0 to match expected dimensions
-        if (h0.dim() < 2) {
-            if (h0.dim() == 0) {
-                h0 = h0.reshape({1, 1});
+
+        // Create hidden state tensor with correct dimensions: (batch_size, hidden_size)
+        torch::Tensor hx;
+        if (offset < Size) {
+            hx = fuzzer_utils::createTensor(Data, Size, offset);
+            int64_t numel = hx.numel();
+            if (numel >= batch_size * hidden_size) {
+                hx = hx.flatten().slice(0, 0, batch_size * hidden_size)
+                       .reshape({batch_size, hidden_size});
+            } else if (numel > 0) {
+                auto flat = hx.flatten();
+                hx = torch::zeros({batch_size, hidden_size}, hx.options());
+                hx.flatten().slice(0, 0, numel).copy_(flat);
             } else {
-                h0 = h0.reshape({1, h0.size(0)});
+                hx = torch::zeros({batch_size, hidden_size});
             }
+        } else {
+            hx = torch::zeros({batch_size, hidden_size});
         }
-        
-        // Try to make dimensions compatible
-        if (input.size(1) != input_size) {
-            if (input.dim() >= 2) {
-                input = input.reshape({input.size(0), input_size});
-            }
+
+        // Ensure tensors are float type (RNNCell requires float)
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat);
         }
-        
-        if (h0.size(1) != hidden_size) {
-            if (h0.dim() >= 2) {
-                h0 = h0.reshape({h0.size(0), hidden_size});
-            }
+        if (!hx.is_floating_point()) {
+            hx = hx.to(torch::kFloat);
         }
-        
-        // Ensure batch sizes match
-        if (input.size(0) != h0.size(0)) {
-            int64_t batch_size = std::min(input.size(0), h0.size(0));
-            if (batch_size > 0) {
-                input = input.slice(0, 0, batch_size);
-                h0 = h0.slice(0, 0, batch_size);
-            } else {
-                // Handle edge case where one dimension is 0
-                batch_size = std::max(input.size(0), h0.size(0));
-                if (input.size(0) == 0) {
-                    input = torch::zeros({batch_size, input_size}, input.options());
-                }
-                if (h0.size(0) == 0) {
-                    h0 = torch::zeros({batch_size, hidden_size}, h0.options());
-                }
-            }
+
+        // Test 1: Forward pass with hidden state
+        torch::Tensor output = cell->forward(input, hx);
+
+        // Verify output shape
+        if (output.size(0) != batch_size || output.size(1) != hidden_size) {
+            std::cerr << "Unexpected output shape" << std::endl;
         }
-        
-        // Apply RNNCell
-        torch::Tensor output = cell(input, h0);
-        
-        // Perform some operations on the output to ensure it's used
-        auto sum = output.sum();
-        
-        // Prevent optimization from removing the computation
-        if (sum.item<float>() == -1.0f) {
-            throw std::runtime_error("This should never happen");
+
+        // Test 2: Forward pass without hidden state (uses zeros)
+        torch::Tensor output2 = cell->forward(input);
+
+        // Test 3: Chain multiple steps to test recurrent behavior
+        torch::Tensor h = hx;
+        for (int step = 0; step < 3; step++) {
+            h = cell->forward(input, h);
+        }
+
+        // Use results to prevent optimization
+        auto sum = output.sum() + output2.sum() + h.sum();
+        if (sum.item<float>() == std::numeric_limits<float>::quiet_NaN()) {
+            return 0;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

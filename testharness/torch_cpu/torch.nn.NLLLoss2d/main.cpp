@@ -1,87 +1,91 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor (log probabilities)
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Ensure input has at least 3 dimensions (N, C, H, W) for NLLLoss2d
-        if (input.dim() < 3) {
+        // Ensure input has 4 dimensions (N, C, H, W) for 2D NLLLoss
+        while (input.dim() < 4) {
             input = input.unsqueeze(0);
         }
-        if (input.dim() < 3) {
-            input = input.unsqueeze(0);
-        }
-        if (input.dim() < 3) {
-            input = input.unsqueeze(0);
+        // If too many dimensions, reshape to 4D
+        if (input.dim() > 4) {
+            auto sizes = input.sizes().vec();
+            int64_t total = input.numel();
+            // Reshape to [1, C, H, W] where we try to preserve some structure
+            int64_t c = std::max<int64_t>(1, sizes[0]);
+            int64_t remaining = total / c;
+            int64_t h = std::max<int64_t>(1, static_cast<int64_t>(std::sqrt(remaining)));
+            int64_t w = std::max<int64_t>(1, remaining / h);
+            input = input.flatten().slice(0, 0, c * h * w).reshape({1, c, h, w});
         }
         
-        // Create target tensor (class indices)
+        // Ensure we have at least 1 class
+        if (input.size(1) < 1) {
+            return 0;
+        }
+        
+        // Convert input to float and apply log_softmax to get proper log probabilities
+        input = input.to(torch::kFloat);
+        input = torch::log_softmax(input, /*dim=*/1);
+        
+        int64_t N = input.size(0);
+        int64_t C = input.size(1);
+        int64_t H = input.size(2);
+        int64_t W = input.size(3);
+        
+        // Create target tensor with shape [N, H, W] and valid class indices [0, C-1]
         torch::Tensor target;
         if (offset < Size) {
             target = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure target has proper dimensions (N, H, W) for NLLLoss2d
-            // Target should have one less dimension than input
-            while (target.dim() >= input.dim()) {
-                target = target.squeeze(0);
+            target = target.flatten();
+            int64_t needed = N * H * W;
+            if (target.numel() < needed) {
+                target = target.repeat((needed / target.numel()) + 1);
             }
-            
-            // Ensure target has at least 2 dimensions
-            while (target.dim() < 2) {
-                target = target.unsqueeze(0);
-            }
-            
-            // Convert target to long type as required by NLLLoss2d
-            target = target.to(torch::kLong);
+            target = target.slice(0, 0, needed).reshape({N, H, W});
         } else {
-            // Create a default target if we don't have enough data
-            auto input_sizes = input.sizes().vec();
-            std::vector<int64_t> target_sizes;
-            
-            // Target should have dimensions [N, H, W] if input is [N, C, H, W]
-            if (input.dim() >= 3) {
-                target_sizes.push_back(input_sizes[0]); // N
-                for (size_t i = 2; i < input_sizes.size(); i++) {
-                    target_sizes.push_back(input_sizes[i]); // H, W, ...
-                }
-            } else {
-                target_sizes = {1, 1}; // Fallback
-            }
-            
-            target = torch::zeros(target_sizes, torch::kLong);
+            target = torch::zeros({N, H, W});
         }
+        
+        // Convert target to long and clamp to valid range [0, C-1]
+        target = target.to(torch::kFloat).abs();
+        target = target.fmod(static_cast<float>(C)).to(torch::kLong);
         
         // Get weight tensor (optional)
         torch::Tensor weight;
         bool use_weight = false;
         if (offset < Size && Data[offset++] % 2 == 0) {
+            use_weight = true;
             if (offset < Size) {
-                use_weight = true;
                 weight = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Ensure weight is 1D and has size equal to number of classes
-                if (input.dim() >= 2) {
-                    int64_t num_classes = input.size(1);
-                    weight = weight.flatten();
-                    if (weight.size(0) != num_classes) {
-                        weight = weight.repeat(num_classes / (weight.size(0) + 1) + 1);
-                        weight = weight.slice(0, 0, num_classes);
-                    }
+                weight = weight.to(torch::kFloat).flatten();
+                // Ensure weight has size C
+                if (weight.numel() < C) {
+                    weight = weight.repeat((C / weight.numel()) + 1);
                 }
+                weight = weight.slice(0, 0, C).abs() + 0.01f; // Ensure positive weights
+            } else {
+                weight = torch::ones({C});
             }
         }
         
@@ -103,14 +107,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Parse ignore_index
-        int64_t ignore_index = -100; // Default value
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&ignore_index, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        // Parse ignore_index - limit to reasonable range
+        int64_t ignore_index = -100;
+        if (offset < Size) {
+            int8_t idx_byte;
+            std::memcpy(&idx_byte, Data + offset, 1);
+            offset++;
+            // Map to range [-100, C] to include valid ignore scenarios
+            ignore_index = (idx_byte % (C + 101)) - 100;
         }
         
-        // Create NLLLoss2d options
+        // Create NLLLoss options (NLLLoss2d is just NLLLoss in PyTorch)
         auto options = torch::nn::NLLLossOptions()
             .reduction(reduction_mode)
             .ignore_index(ignore_index);
@@ -119,22 +126,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             options = options.weight(weight);
         }
         
-        // Create NLLLoss2d module
-        torch::nn::NLLLoss nll_loss2d(options);
+        // Create NLLLoss module (NLLLoss2d is deprecated alias for NLLLoss)
+        torch::nn::NLLLoss nll_loss(options);
         
-        // Apply NLLLoss2d
-        torch::Tensor output = nll_loss2d(input, target);
-        
-        // Ensure we use the output to prevent optimization
-        if (output.defined()) {
-            volatile float sum = output.sum().item<float>();
-            (void)sum;
+        // Apply NLLLoss - this works for 2D spatial inputs
+        try {
+            torch::Tensor output = nll_loss(input, target);
+            
+            // Ensure we use the output to prevent optimization
+            if (output.defined()) {
+                volatile float sum = output.sum().item<float>();
+                (void)sum;
+            }
+        } catch (const c10::Error&) {
+            // Shape mismatch or other torch errors - silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

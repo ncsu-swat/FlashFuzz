@@ -1,63 +1,46 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes for basic parameters
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for BatchNorm1d from the remaining data
-        int64_t num_features = 0;
+        // Extract parameters for BatchNorm1d from the data
         double eps = 1e-5;
         double momentum = 0.1;
         bool affine = true;
         bool track_running_stats = true;
         
-        if (offset < Size) {
-            // Extract num_features from the data
-            // For BatchNorm1d, num_features should match the second dimension (channels)
-            // If input is 2D: [batch_size, num_features]
-            // If input is 3D: [batch_size, num_features, length]
-            if (input.dim() >= 2) {
-                num_features = input.size(1);
-            } else if (input.dim() == 1) {
-                // For 1D input, use the first dimension
-                num_features = input.size(0);
-            } else {
-                // For 0D input (scalar), use a small value
-                num_features = 1 + (Data[offset] % 10);
-            }
-            offset++;
-        }
-        
         // Extract eps parameter
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&eps, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            // Ensure eps is positive and not too small
-            eps = std::abs(eps);
-            if (eps < 1e-10) eps = 1e-5;
+        if (offset + 4 <= Size) {
+            uint32_t eps_raw;
+            std::memcpy(&eps_raw, Data + offset, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            // Map to reasonable eps range [1e-10, 1e-1]
+            eps = 1e-10 + (static_cast<double>(eps_raw) / UINT32_MAX) * (1e-1 - 1e-10);
         }
         
         // Extract momentum parameter
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&momentum, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            // Ensure momentum is in [0, 1]
-            momentum = std::abs(momentum);
-            if (momentum > 1.0) momentum = momentum - std::floor(momentum);
+        if (offset + 4 <= Size) {
+            uint32_t momentum_raw;
+            std::memcpy(&momentum_raw, Data + offset, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            // Map to [0, 1] range
+            momentum = static_cast<double>(momentum_raw) / UINT32_MAX;
         }
         
         // Extract boolean parameters
@@ -71,7 +54,98 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset++;
         }
         
-        // Create the BatchNorm1d module (PyTorch C++ doesn't have LazyBatchNorm1d)
+        // Create input tensor - BatchNorm1d expects 2D (N, C) or 3D (N, C, L)
+        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        // Reshape input to valid dimensions for BatchNorm1d
+        // BatchNorm1d expects input of shape (N, C) or (N, C, L)
+        int64_t total_elements = input.numel();
+        if (total_elements < 2) {
+            return 0;
+        }
+        
+        // Determine batch size and channels
+        int64_t batch_size = 1;
+        int64_t channels = 1;
+        int64_t length = 1;
+        bool use_3d = false;
+        
+        if (offset < Size) {
+            // Use fuzzer data to determine shape configuration
+            uint8_t shape_config = Data[offset % Size];
+            offset++;
+            
+            if (shape_config % 3 == 0) {
+                // 2D: (N, C) - flatten everything
+                batch_size = std::max(int64_t(1), total_elements / 4);
+                channels = total_elements / batch_size;
+                if (channels < 1) channels = 1;
+                int64_t new_total = batch_size * channels;
+                input = input.flatten().narrow(0, 0, std::min(new_total, total_elements))
+                            .reshape({batch_size, channels});
+                use_3d = false;
+            } else if (shape_config % 3 == 1) {
+                // 3D: (N, C, L)
+                batch_size = std::max(int64_t(1), (int64_t)(std::cbrt(total_elements)));
+                channels = std::max(int64_t(1), (int64_t)(std::sqrt(total_elements / batch_size)));
+                length = std::max(int64_t(1), total_elements / (batch_size * channels));
+                int64_t new_total = batch_size * channels * length;
+                if (new_total > total_elements) {
+                    length = total_elements / (batch_size * channels);
+                    if (length < 1) {
+                        channels = total_elements / batch_size;
+                        length = 1;
+                    }
+                }
+                new_total = batch_size * channels * length;
+                try {
+                    input = input.flatten().narrow(0, 0, std::min(new_total, total_elements))
+                                .reshape({batch_size, channels, length});
+                    use_3d = true;
+                } catch (...) {
+                    // Fall back to 2D
+                    new_total = batch_size * channels;
+                    input = input.flatten().narrow(0, 0, std::min(new_total, total_elements))
+                                .reshape({batch_size, channels});
+                    use_3d = false;
+                }
+            } else {
+                // Simple 2D with small batch
+                batch_size = 2;
+                channels = total_elements / batch_size;
+                if (channels < 1) {
+                    batch_size = 1;
+                    channels = total_elements;
+                }
+                int64_t new_total = batch_size * channels;
+                input = input.flatten().narrow(0, 0, std::min(new_total, total_elements))
+                            .reshape({batch_size, channels});
+                use_3d = false;
+            }
+        } else {
+            // Default: 2D shape
+            batch_size = std::min(int64_t(4), total_elements);
+            channels = total_elements / batch_size;
+            if (channels < 1) channels = 1;
+            int64_t new_total = batch_size * channels;
+            input = input.flatten().narrow(0, 0, std::min(new_total, total_elements))
+                        .reshape({batch_size, channels});
+            use_3d = false;
+        }
+        
+        // Ensure input is float type for batch norm
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Get number of channels from reshaped input
+        int64_t num_features = input.size(1);
+        if (num_features < 1) {
+            return 0;
+        }
+        
+        // Create the BatchNorm1d module
+        // Note: LazyBatchNorm1d is Python-only, use BatchNorm1d in C++
         torch::nn::BatchNorm1d batch_norm(
             torch::nn::BatchNorm1dOptions(num_features)
                 .eps(eps)
@@ -81,31 +155,78 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         );
         
         // Apply the batch norm operation
-        torch::Tensor output = batch_norm->forward(input);
+        torch::Tensor output;
+        try {
+            output = batch_norm->forward(input);
+        } catch (const c10::Error&) {
+            // Shape or dimension mismatch - valid rejection
+            return 0;
+        }
         
         // Force materialization of the tensor
         output = output.clone();
         
-        // Access some properties to ensure computation
+        // Verify output properties
         auto sizes = output.sizes();
-        auto dtype = output.dtype();
+        (void)sizes;
         
-        // Try to access the running stats if they're being tracked
-        if (track_running_stats) {
-            auto running_mean = batch_norm->running_mean;
-            auto running_var = batch_norm->running_var;
+        // Access running stats if they're being tracked
+        if (track_running_stats && batch_norm->running_mean.defined()) {
+            auto mean_sum = batch_norm->running_mean.sum().item<float>();
+            (void)mean_sum;
+        }
+        if (track_running_stats && batch_norm->running_var.defined()) {
+            auto var_sum = batch_norm->running_var.sum().item<float>();
+            (void)var_sum;
         }
         
-        // Try to access the learnable parameters if affine is true
-        if (affine) {
-            auto weight = batch_norm->weight;
-            auto bias = batch_norm->bias;
+        // Access learnable parameters if affine is true
+        if (affine && batch_norm->weight.defined()) {
+            auto weight_sum = batch_norm->weight.sum().item<float>();
+            (void)weight_sum;
+        }
+        if (affine && batch_norm->bias.defined()) {
+            auto bias_sum = batch_norm->bias.sum().item<float>();
+            (void)bias_sum;
+        }
+        
+        // Test in eval mode as well
+        batch_norm->eval();
+        try {
+            torch::Tensor eval_output = batch_norm->forward(input);
+            eval_output = eval_output.clone();
+        } catch (const c10::Error&) {
+            // May fail in eval mode without running stats
+        }
+        
+        // Test reset_running_stats if tracking
+        if (track_running_stats) {
+            try {
+                batch_norm->reset_running_stats();
+            } catch (const c10::Error&) {
+                // May not be available
+            }
+        }
+        
+        // Test with different input having same channel dimension
+        if (use_3d) {
+            // Create another 3D input with same channels but different batch/length
+            int64_t new_batch = std::max(int64_t(1), batch_size / 2 + 1);
+            int64_t new_length = std::max(int64_t(1), length * 2);
+            torch::Tensor new_input = torch::randn({new_batch, num_features, new_length});
+            try {
+                batch_norm->train();
+                torch::Tensor new_output = batch_norm->forward(new_input);
+                (void)new_output;
+            } catch (const c10::Error&) {
+                // Shape mismatch is acceptable
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

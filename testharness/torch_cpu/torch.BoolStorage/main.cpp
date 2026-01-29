@@ -2,7 +2,6 @@
 #include <algorithm>      // For std::min, std::clamp
 #include <cstring>        // For std::memcpy
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <vector>         // For std::vector
 
 // Target API keyword to satisfy harness checks: torch.BoolStorage
@@ -10,7 +9,12 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -20,174 +24,219 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create a tensor to get data for the BoolStorage
-        torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Determine how to create the boolean tensor/storage
+        uint8_t creation_mode = Data[offset++] % 5;
         
-        // Create a BoolStorage
-        try {
-            // Create a Storage for bool type
-            at::Storage storage;
-            
-            // Try different ways to initialize the Storage
-            if (offset < Size) {
-                uint8_t option = Data[offset++] % 4;
+        torch::Tensor bool_tensor;
+        
+        switch (creation_mode) {
+            case 0: {
+                // Create boolean tensor from fuzzer data directly
+                size_t num_elements = std::min<size_t>((Size - offset), 256);
+                if (num_elements == 0) num_elements = 1;
                 
-                switch (option) {
-                    case 0: {
-                        // Default constructor already called
-                        break;
-                    }
-                    case 1: {
-                        // Create with size
-                        int64_t size = 1;
-                        if (offset + sizeof(int64_t) <= Size) {
-                            std::memcpy(&size, Data + offset, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                        }
-                        if (size > 0) {
-                            size = std::clamp<int64_t>(size, 1, 1024);
-                            storage = at::Storage(at::Storage::use_byte_size_t(), size * static_cast<int64_t>(sizeof(bool)), at::DataPtr(nullptr, at::Device(at::kCPU)), nullptr, false);
-                        }
-                        break;
-                    }
-                    case 2: {
-                        // Create from tensor data if tensor is boolean type
-                        if (tensor.dtype() == torch::kBool) {
-                            // Convert tensor to contiguous if needed
-                            auto contiguous_tensor = tensor.contiguous();
-                            storage = contiguous_tensor.storage();
-                        } else {
-                            // Create a new boolean tensor and use its data
-                            auto bool_tensor = tensor.to(torch::kBool);
-                            auto contiguous_bool = bool_tensor.contiguous();
-                            storage = contiguous_bool.storage();
-                        }
-                        break;
-                    }
-                    case 3: {
-                        // Create from vector of bools
-                        std::vector<int64_t> values;
-                        size_t num_values = (Size - offset > 100) ? 100 : (Size - offset);
-                        for (size_t i = 0; i < num_values; i++) {
-                            values.push_back((Data[offset + i] & 0x1) ? 1 : 0);
-                        }
-                        offset += num_values;
-                        if (!values.empty()) {
-                            auto bool_tensor = torch::tensor(values, torch::TensorOptions().dtype(torch::kBool));
-                            storage = bool_tensor.storage();
-                        }
-                        break;
-                    }
+                std::vector<bool> values;
+                values.reserve(num_elements);
+                for (size_t i = 0; i < num_elements && offset < Size; i++) {
+                    values.push_back((Data[offset++] & 0x1) != 0);
                 }
+                if (values.empty()) values.push_back(false);
+                
+                // Create tensor from bool vector
+                auto int_values = std::vector<int64_t>(values.begin(), values.end());
+                bool_tensor = torch::tensor(int_values, torch::kBool);
+                break;
+            }
+            case 1: {
+                // Create tensor using createTensor and convert to bool
+                torch::Tensor source_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                bool_tensor = source_tensor.to(torch::kBool);
+                break;
+            }
+            case 2: {
+                // Create zeros tensor of bool type
+                int64_t size = 1;
+                if (offset + sizeof(int32_t) <= Size) {
+                    int32_t raw_size;
+                    std::memcpy(&raw_size, Data + offset, sizeof(int32_t));
+                    offset += sizeof(int32_t);
+                    size = std::clamp<int64_t>(std::abs(raw_size) % 1000, 1, 512);
+                }
+                bool_tensor = torch::zeros({size}, torch::kBool);
+                break;
+            }
+            case 3: {
+                // Create ones tensor of bool type
+                int64_t size = 1;
+                if (offset + sizeof(int32_t) <= Size) {
+                    int32_t raw_size;
+                    std::memcpy(&raw_size, Data + offset, sizeof(int32_t));
+                    offset += sizeof(int32_t);
+                    size = std::clamp<int64_t>(std::abs(raw_size) % 1000, 1, 512);
+                }
+                bool_tensor = torch::ones({size}, torch::kBool);
+                break;
+            }
+            case 4: {
+                // Create 2D boolean tensor
+                int64_t rows = 1, cols = 1;
+                if (offset + 2 <= Size) {
+                    rows = std::clamp<int64_t>((Data[offset++] % 32) + 1, 1, 32);
+                    cols = std::clamp<int64_t>((Data[offset++] % 32) + 1, 1, 32);
+                }
+                bool_tensor = torch::randint(0, 2, {rows, cols}, torch::kBool);
+                break;
+            }
+        }
+        
+        // Ensure tensor is valid and contiguous for storage access
+        bool_tensor = bool_tensor.contiguous();
+        
+        // Access the storage (this is what BoolStorage represents in C++)
+        at::Storage storage = bool_tensor.storage();
+        
+        // Test storage properties
+        size_t nbytes = storage.nbytes();
+        (void)nbytes;
+        
+        // Test storage data access
+        if (storage.data_ptr().get() != nullptr) {
+            // Read from storage
+            bool* data_ptr = static_cast<bool*>(storage.data_ptr().get());
+            size_t num_elements = bool_tensor.numel();
+            
+            if (num_elements > 0 && offset < Size) {
+                // Read a random element
+                size_t read_idx = Data[offset++] % num_elements;
+                bool val = data_ptr[read_idx];
+                (void)val;
             }
             
-            // Test Storage operations
-            if (offset < Size) {
-                uint8_t op = Data[offset++] % 5;
-                
+            // Write to storage if we have more data
+            if (num_elements > 0 && offset < Size) {
+                size_t write_idx = Data[offset++] % num_elements;
+                bool new_val = (offset < Size) ? ((Data[offset++] & 0x1) != 0) : false;
+                data_ptr[write_idx] = new_val;
+            }
+        }
+        
+        // Perform operations that exercise the boolean storage
+        if (offset < Size) {
+            uint8_t op = Data[offset++] % 8;
+            
+            try {
                 switch (op) {
                     case 0: {
-                        // Get size
-                        if (storage) {
-                            auto size = storage.nbytes();
-                            (void)size;
-                        }
+                        // Sum - counts true values
+                        auto result = bool_tensor.sum();
+                        (void)result;
                         break;
                     }
                     case 1: {
-                        // Access elements if storage is not empty
-                        if (storage && storage.nbytes() > 0) {
-                            size_t idx = 0;
-                            if (offset + sizeof(size_t) <= Size) {
-                                std::memcpy(&idx, Data + offset, sizeof(size_t));
-                                offset += sizeof(size_t);
-                            }
-                            size_t max_elements = storage.nbytes() / sizeof(bool);
-                            if (max_elements > 0) {
-                                idx = idx % max_elements; // Ensure valid index
-                                if (storage.data_ptr().get()) {
-                                    bool* data = static_cast<bool*>(storage.data_ptr().get());
-                                    bool val = data[idx];
-                                }
-                            }
-                        }
+                        // any() - checks if any true
+                        auto result = bool_tensor.any();
+                        (void)result;
                         break;
                     }
                     case 2: {
-                        // Resize storage
-                        int64_t new_size = 1;
-                        if (offset + sizeof(int64_t) <= Size) {
-                            std::memcpy(&new_size, Data + offset, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                            if (new_size > 0 && storage) {
-                                new_size = std::clamp<int64_t>(new_size, 1, 1024);
-                                storage.set_nbytes(static_cast<size_t>(new_size) * sizeof(bool));
-                            }
-                        }
+                        // all() - checks if all true
+                        auto result = bool_tensor.all();
+                        (void)result;
                         break;
                     }
                     case 3: {
-                        // Fill with value
-                        bool fill_value = false;
-                        if (offset < Size) {
-                            fill_value = (Data[offset++] & 0x1);
-                        }
-                        if (storage && storage.data_ptr().get()) {
-                            size_t num_elements = storage.nbytes() / sizeof(bool);
-                            bool* data = static_cast<bool*>(storage.data_ptr().get());
-                            for (size_t i = 0; i < num_elements; i++) {
-                                data[i] = fill_value;
-                            }
-                        }
+                        // Logical not
+                        auto result = bool_tensor.logical_not();
+                        (void)result;
                         break;
                     }
                     case 4: {
-                        // Copy from another storage
-                        int64_t other_size = 10;
-                        if (offset + sizeof(int64_t) <= Size) {
-                            std::memcpy(&other_size, Data + offset, sizeof(int64_t));
-                            offset += sizeof(int64_t);
-                            if (other_size > 0) {
-                                other_size = std::clamp<int64_t>(other_size, 1, 1024);
-                                std::vector<int64_t> other_values;
-                                for (int64_t i = 0; i < other_size; i++) {
-                                    if (offset < Size) {
-                                        other_values.push_back((Data[offset++] & 0x1) ? 1 : 0);
-                                    }
-                                }
-                                auto other_tensor = torch::tensor(other_values, torch::TensorOptions().dtype(torch::kBool));
-                                auto other_storage = other_tensor.storage();
-                                
-                                // Copy to original storage
-                                if (storage && other_storage) {
-                                    size_t copy_size = std::min(storage.nbytes(), other_storage.nbytes());
-                                    if (storage.data_ptr().get() && other_storage.data_ptr().get() && copy_size > 0) {
-                                        std::memcpy(storage.data_ptr().get(), other_storage.data_ptr().get(), copy_size);
-                                    }
-                                }
-                            }
-                        }
+                        // Clone and verify storage is different
+                        auto cloned = bool_tensor.clone();
+                        at::Storage cloned_storage = cloned.storage();
+                        (void)cloned_storage;
+                        break;
+                    }
+                    case 5: {
+                        // Create another bool tensor and do logical operations
+                        auto other = torch::randint(0, 2, bool_tensor.sizes(), torch::kBool);
+                        auto and_result = bool_tensor.logical_and(other);
+                        auto or_result = bool_tensor.logical_or(other);
+                        auto xor_result = bool_tensor.logical_xor(other);
+                        (void)and_result;
+                        (void)or_result;
+                        (void)xor_result;
+                        break;
+                    }
+                    case 6: {
+                        // nonzero - get indices of true values
+                        auto indices = bool_tensor.nonzero();
+                        (void)indices;
+                        break;
+                    }
+                    case 7: {
+                        // Use as mask for another tensor
+                        auto values = torch::randn(bool_tensor.sizes());
+                        auto masked = values.masked_select(bool_tensor);
+                        (void)masked;
                         break;
                     }
                 }
+            } catch (const c10::Error &e) {
+                // Expected errors from shape mismatches, etc.
             }
-            
-            // Create a tensor from the storage
-            torch::Tensor storage_tensor;
-            if (storage && storage.nbytes() > 0) {
-                size_t num_elements = storage.nbytes() / sizeof(bool);
-                storage_tensor = torch::from_blob(storage.data_ptr().get(), {static_cast<int64_t>(num_elements)}, torch::kBool);
-                auto summed = storage_tensor.sum();
-                (void)summed;
+        }
+        
+        // Test storage sharing behavior
+        if (offset < Size && (Data[offset++] & 0x1)) {
+            try {
+                // Create a view and verify storage is shared
+                auto view = bool_tensor.view({-1});
+                at::Storage view_storage = view.storage();
+                
+                // Storages should be the same underlying object
+                bool same_storage = (storage.data_ptr().get() == view_storage.data_ptr().get());
+                (void)same_storage;
+            } catch (const c10::Error &e) {
+                // View may fail for certain tensor configurations
             }
-        } catch (const c10::Error &e) {
-            // PyTorch specific errors are expected and part of testing
+        }
+        
+        // Test conversion from bool storage to other types
+        if (offset < Size) {
+            uint8_t convert_type = Data[offset++] % 4;
+            try {
+                switch (convert_type) {
+                    case 0: {
+                        auto int_tensor = bool_tensor.to(torch::kInt32);
+                        (void)int_tensor;
+                        break;
+                    }
+                    case 1: {
+                        auto float_tensor = bool_tensor.to(torch::kFloat32);
+                        (void)float_tensor;
+                        break;
+                    }
+                    case 2: {
+                        auto long_tensor = bool_tensor.to(torch::kInt64);
+                        (void)long_tensor;
+                        break;
+                    }
+                    case 3: {
+                        auto byte_tensor = bool_tensor.to(torch::kUInt8);
+                        (void)byte_tensor;
+                        break;
+                    }
+                }
+            } catch (const c10::Error &e) {
+                // Conversion errors
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

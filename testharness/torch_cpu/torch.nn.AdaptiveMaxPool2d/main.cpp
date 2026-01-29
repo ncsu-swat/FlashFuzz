@@ -1,88 +1,174 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes to create a tensor
-        if (Size < 4) {
+        // Need enough bytes to create meaningful input
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Ensure we have at least 2 dimensions for AdaptiveMaxPool2d
-        // If not, reshape to make it compatible
-        if (input.dim() < 2) {
-            if (input.numel() == 0) {
-                // Handle empty tensor case
-                input = input.reshape({0, 0});
+        // AdaptiveMaxPool2d requires 3D (C, H, W) or 4D (N, C, H, W) input
+        // Reshape input to be compatible
+        int64_t numel = input.numel();
+        if (numel == 0) {
+            return 0; // Can't pool empty tensor
+        }
+        
+        // Try to reshape to 4D (N, C, H, W)
+        int64_t batch = 1;
+        int64_t channels = 1;
+        int64_t height = 1;
+        int64_t width = numel;
+        
+        // Try to factor numel into reasonable dimensions
+        if (numel >= 4) {
+            // Use fuzzer data to determine shape
+            if (offset < Size) {
+                batch = 1 + (Data[offset++] % 4);  // 1-4
+            }
+            if (offset < Size) {
+                channels = 1 + (Data[offset++] % 8);  // 1-8
+            }
+            
+            int64_t remaining = numel / (batch * channels);
+            if (remaining > 0 && batch * channels <= numel) {
+                // Factor remaining into height and width
+                height = 1;
+                width = remaining;
+                for (int64_t h = 1; h * h <= remaining; h++) {
+                    if (remaining % h == 0) {
+                        height = h;
+                        width = remaining / h;
+                    }
+                }
             } else {
-                // Reshape to 2D
-                input = input.reshape({1, input.numel()});
+                // Fallback: flatten everything
+                batch = 1;
+                channels = 1;
+                height = 1;
+                width = numel;
             }
         }
         
-        // Parse output size parameters from the remaining data
+        // Ensure we can actually reshape
+        if (batch * channels * height * width != numel) {
+            batch = 1;
+            channels = 1;
+            height = 1;
+            width = numel;
+        }
+        
+        // Inner try-catch for reshape failures (silently handle)
+        try {
+            input = input.reshape({batch, channels, height, width});
+        } catch (...) {
+            return 0;
+        }
+        
+        // Parse output size parameters from remaining data
         int64_t output_h = 1;
         int64_t output_w = 1;
         
-        if (offset + sizeof(int64_t) <= Size) {
-            memcpy(&output_h, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure output_h is within reasonable bounds
-            output_h = std::abs(output_h) % 32;
+        if (offset + sizeof(int32_t) <= Size) {
+            int32_t tmp;
+            memcpy(&tmp, Data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+            // Ensure output_h is within reasonable bounds (1-16)
+            output_h = 1 + (std::abs(tmp) % 16);
         }
         
-        if (offset + sizeof(int64_t) <= Size) {
-            memcpy(&output_w, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure output_w is within reasonable bounds
-            output_w = std::abs(output_w) % 32;
+        if (offset + sizeof(int32_t) <= Size) {
+            int32_t tmp;
+            memcpy(&tmp, Data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
+            // Ensure output_w is within reasonable bounds (1-16)
+            output_w = 1 + (std::abs(tmp) % 16);
         }
         
-        // Create AdaptiveMaxPool2d module
-        torch::nn::AdaptiveMaxPool2d pool = nullptr;
+        // Convert to float for pooling operations
+        input = input.to(torch::kFloat32);
         
-        // Set output size - can be a single number or a pair
-        if (Data[offset % Size] % 2 == 0) {
-            // Use a single number for both dimensions
-            pool = torch::nn::AdaptiveMaxPool2d(output_h);
-        } else {
-            // Use a pair of numbers
-            pool = torch::nn::AdaptiveMaxPool2d(torch::nn::AdaptiveMaxPool2dOptions({output_h, output_w}));
+        // Test 1: Use single output size (use brace initialization to avoid vexing parse)
+        try {
+            auto pool1 = torch::nn::AdaptiveMaxPool2d{torch::nn::AdaptiveMaxPool2dOptions(output_h)};
+            torch::Tensor output1 = pool1->forward(input);
+            (void)output1.sum().item<float>(); // Force computation
+        } catch (...) {
+            // Silently handle expected failures
         }
         
-        // Apply the pooling operation
-        torch::Tensor output = pool->forward(input);
-        
-        // Try to access the indices if available
-        if (offset + 1 < Size && Data[offset] % 2 == 0) {
-            auto [pooled, indices] = torch::nn::functional::detail::adaptive_max_pool2d_with_indices(input, {output_h, output_w});
-            
-            // Use indices to ensure they're computed
-            auto dummy = indices.sum();
+        // Test 2: Use pair of output sizes
+        try {
+            auto pool2 = torch::nn::AdaptiveMaxPool2d{
+                torch::nn::AdaptiveMaxPool2dOptions({output_h, output_w})};
+            torch::Tensor output2 = pool2->forward(input);
+            (void)output2.sum().item<float>(); // Force computation
+        } catch (...) {
+            // Silently handle expected failures
         }
         
-        // Test with different configurations
-        if (offset + 1 < Size) {
-            auto pool_test = torch::nn::AdaptiveMaxPool2d(torch::nn::AdaptiveMaxPool2dOptions({output_h, output_w}));
-            auto result = pool_test->forward(input);
+        // Test 3: Use functional interface with indices
+        try {
+            auto result = torch::adaptive_max_pool2d(input, {output_h, output_w});
+            (void)std::get<0>(result).sum().item<float>(); // Output tensor
+            (void)std::get<1>(result).sum().item<int64_t>(); // Indices tensor
+        } catch (...) {
+            // Silently handle expected failures
+        }
+        
+        // Test 4: Test with 3D input (C, H, W)
+        try {
+            torch::Tensor input3d = input.squeeze(0); // Remove batch dimension
+            if (input3d.dim() == 3) {
+                auto pool3 = torch::nn::AdaptiveMaxPool2d{
+                    torch::nn::AdaptiveMaxPool2dOptions({output_h, output_w})};
+                torch::Tensor output3 = pool3->forward(input3d);
+                (void)output3.sum().item<float>();
+            }
+        } catch (...) {
+            // Silently handle expected failures
+        }
+        
+        // Test 5: Edge case - output size equals input size
+        try {
+            auto pool4 = torch::nn::AdaptiveMaxPool2d{
+                torch::nn::AdaptiveMaxPool2dOptions({height, width})};
+            torch::Tensor output4 = pool4->forward(input);
+            (void)output4.sum().item<float>();
+        } catch (...) {
+            // Silently handle expected failures
+        }
+        
+        // Test 6: Very small output
+        try {
+            auto pool5 = torch::nn::AdaptiveMaxPool2d{
+                torch::nn::AdaptiveMaxPool2dOptions({1, 1})};
+            torch::Tensor output5 = pool5->forward(input);
+            (void)output5.sum().item<float>();
+        } catch (...) {
+            // Silently handle expected failures
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

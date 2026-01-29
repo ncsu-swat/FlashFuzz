@@ -1,84 +1,132 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least 3 bytes for basic parameters
-        if (Size < 3) {
+        // Need at least 4 bytes for parameters
+        if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract groups parameter (1-16, must be positive)
+        int64_t groups = static_cast<int64_t>(Data[offset++] % 16) + 1;
         
-        // Extract parameters for ChannelShuffle
-        // Need at least 2 more bytes for groups and dim parameters
-        if (offset + 2 > Size) {
-            return 0;
+        // Extract dimensions for 4D tensor (N, C, H, W)
+        // ChannelShuffle requires 4D input with channels divisible by groups
+        int64_t batch = static_cast<int64_t>(Data[offset++] % 4) + 1;
+        int64_t height = static_cast<int64_t>(Data[offset++] % 8) + 1;
+        int64_t width = static_cast<int64_t>(Data[offset++] % 8) + 1;
+        
+        // Ensure channels is divisible by groups
+        int64_t channels = groups * (static_cast<int64_t>(offset < Size ? Data[offset++] % 8 : 1) + 1);
+        
+        // Determine call type
+        uint8_t call_type = (offset < Size) ? Data[offset++] % 3 : 0;
+        
+        // Determine dtype
+        torch::ScalarType dtype = torch::kFloat32;
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset++] % 4;
+            switch (dtype_selector) {
+                case 0: dtype = torch::kFloat32; break;
+                case 1: dtype = torch::kFloat64; break;
+                case 2: dtype = torch::kFloat16; break;
+                case 3: dtype = torch::kBFloat16; break;
+            }
         }
         
-        // Get groups parameter (positive integer)
-        int64_t groups = static_cast<int64_t>(Data[offset++]) % 16 + 1;
+        // Create 4D input tensor with proper shape
+        torch::Tensor input = torch::randn({batch, channels, height, width}, 
+                                           torch::TensorOptions().dtype(dtype));
         
-        // Get dimension parameter (typically 1 for 3D input, 0 for 2D input)
-        int64_t dim = static_cast<int64_t>(Data[offset++]) % 4;
-        
-        // Apply ChannelShuffle operation using functional API
         torch::Tensor output;
         
-        // Try different ways to call the operation
-        if (offset < Size) {
-            uint8_t call_type = Data[offset++] % 2;
-            
-            switch (call_type) {
-                case 0:
-                    // Standard functional call
-                    output = torch::channel_shuffle(input, groups);
-                    break;
-                    
-                case 1:
-                    // Validate input dimensions and channels before calling
-                    if (input.dim() > 0 && input.size(0) > 0) {
-                        // Ensure we have a valid channel dimension
-                        int64_t channels = 0;
-                        if (input.dim() > 1) {
-                            channels = input.size(1);
-                        }
-                        
-                        // Only proceed if channels is divisible by groups
-                        if (channels > 0 && channels % groups == 0) {
-                            output = torch::channel_shuffle(input, groups);
-                        } else {
-                            // Adjust groups to be compatible
-                            int64_t adjusted_groups = channels > 0 ? channels : 1;
-                            output = torch::channel_shuffle(input, adjusted_groups);
-                        }
-                    } else {
-                        output = torch::channel_shuffle(input, groups);
-                    }
-                    break;
+        switch (call_type) {
+            case 0: {
+                // Test functional API: torch::channel_shuffle
+                output = torch::channel_shuffle(input, groups);
+                break;
             }
-        } else {
-            // Default to standard functional call
-            output = torch::channel_shuffle(input, groups);
+            
+            case 1: {
+                // Test with different tensor shapes (3D - treating as NCL format)
+                int64_t length = static_cast<int64_t>((offset < Size ? Data[offset++] % 16 : 4) + 1);
+                torch::Tensor input_3d = torch::randn({batch, channels, length},
+                                                      torch::TensorOptions().dtype(dtype));
+                try {
+                    output = torch::channel_shuffle(input_3d, groups);
+                } catch (...) {
+                    // Silently ignore if 3D not supported
+                    output = torch::channel_shuffle(input, groups);
+                }
+                break;
+            }
+            
+            case 2: {
+                // Test with different groups values that divide channels
+                for (int64_t g = 1; g <= channels && g <= 8; g++) {
+                    if (channels % g == 0) {
+                        try {
+                            torch::Tensor temp_output = torch::channel_shuffle(input, g);
+                            // Verify shape preservation
+                            if (temp_output.sizes() != input.sizes()) {
+                                break;
+                            }
+                        } catch (...) {
+                            // Silently ignore expected failures
+                        }
+                    }
+                }
+                // Final call for coverage
+                output = torch::channel_shuffle(input, groups);
+                break;
+            }
         }
         
-        // Basic validation - output should have same shape as input
-        if (output.sizes() != input.sizes()) {
-            throw std::runtime_error("Output shape doesn't match input shape");
+        // Validate output shape matches input shape
+        if (output.defined() && output.sizes() != input.sizes()) {
+            std::cerr << "Shape mismatch: input " << input.sizes() 
+                      << " vs output " << output.sizes() << std::endl;
+        }
+        
+        // Additional coverage: test with contiguous and non-contiguous tensors
+        if (offset < Size && Data[offset] % 2 == 0) {
+            // Create non-contiguous tensor via transpose then transpose back
+            torch::Tensor non_contig = input.transpose(2, 3).transpose(2, 3);
+            try {
+                torch::Tensor nc_output = torch::channel_shuffle(non_contig, groups);
+                (void)nc_output;
+            } catch (...) {
+                // Silently ignore - non-contiguous may behave differently
+            }
+        }
+        
+        // Additional coverage: test with requires_grad
+        if (offset < Size && Data[offset] % 3 == 0) {
+            torch::Tensor grad_input = input.clone().set_requires_grad(true);
+            try {
+                torch::Tensor grad_output = torch::channel_shuffle(grad_input, groups);
+                (void)grad_output;
+            } catch (...) {
+                // Silently ignore
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

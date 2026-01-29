@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,82 +20,125 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor - needs to be floating point for std_mean
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Extract parameters for std_mean operation
-        bool unbiased = false;
+        // Ensure tensor is floating point type (required for std_mean)
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Extract correction parameter (0 = population std, 1 = sample std, etc.)
+        int64_t correction = 1; // Default to Bessel's correction
         if (offset < Size) {
-            unbiased = Data[offset++] & 0x1;
+            correction = static_cast<int64_t>(Data[offset++] % 3); // 0, 1, or 2
         }
         
         // Get dimension parameter if there's data left
-        c10::optional<int64_t> dim = c10::nullopt;
         bool keepdim = false;
+        int64_t dim_value = 0;
+        bool use_dim = false;
         
         if (offset < Size) {
-            // Extract dimension value
-            int64_t dim_value = static_cast<int64_t>(Data[offset++]);
+            use_dim = Data[offset++] & 0x1;
+        }
+        
+        if (use_dim && offset < Size && input.dim() > 0) {
+            dim_value = static_cast<int64_t>(Data[offset++]);
+            // Ensure dimension is valid
+            dim_value = dim_value % input.dim();
             
-            // Modulo to ensure it's within tensor's dimension range
-            // Allow negative dimensions for testing edge cases
-            if (input.dim() > 0) {
-                dim = dim_value % (2 * input.dim()) - input.dim();
-            }
-            
-            // Extract keepdim parameter if there's data left
             if (offset < Size) {
                 keepdim = Data[offset++] & 0x1;
             }
         }
         
-        // Try different variants of std_mean
-        
-        // Variant 1: std_mean with no dimension specified
-        auto result1 = torch::std_mean(input, unbiased);
-        auto std_tensor1 = std::get<0>(result1);
-        auto mean_tensor1 = std::get<1>(result1);
-        
-        // Variant 2: std_mean with dimension specified (if available)
-        if (dim.has_value()) {
-            auto result2 = torch::std_mean(input, dim.value(), unbiased, keepdim);
-            auto std_tensor2 = std::get<0>(result2);
-            auto mean_tensor2 = std::get<1>(result2);
+        // Variant 1: std_mean over all elements (no dimension specified)
+        // Returns tuple of (std, mean)
+        {
+            auto result = torch::std_mean(input);
+            auto std_val = std::get<0>(result);
+            auto mean_val = std::get<1>(result);
+            (void)std_val;
+            (void)mean_val;
         }
         
-        // Variant 3: std_mean with dimension list (if tensor has dimensions)
-        if (input.dim() > 0) {
-            std::vector<int64_t> dims;
-            
-            // Create a list of dimensions to reduce over
-            int max_dims = std::min(static_cast<int>(input.dim()), 2);
-            for (int i = 0; i < max_dims && offset < Size; i++) {
-                int64_t d = static_cast<int64_t>(Data[offset++]) % input.dim();
-                dims.push_back(d);
-            }
-            
-            // Only proceed if we have dimensions to reduce over
-            if (!dims.empty()) {
-                auto result3 = torch::std_mean(input, dims, unbiased, keepdim);
-                auto std_tensor3 = std::get<0>(result3);
-                auto mean_tensor3 = std::get<1>(result3);
+        // Variant 2: std_mean with dimension specified
+        if (use_dim && input.dim() > 0) {
+            try {
+                auto result = torch::std_mean(input, dim_value, correction, keepdim);
+                auto std_val = std::get<0>(result);
+                auto mean_val = std::get<1>(result);
+                (void)std_val;
+                (void)mean_val;
+            } catch (...) {
+                // Silently catch dimension-related errors
             }
         }
         
-        // Variant 4: std_mean with correction parameter (if enough data)
-        if (offset < Size && input.dim() > 0) {
-            int64_t correction_dim = static_cast<int64_t>(Data[offset++]) % input.dim();
-            
-            // Try with correction parameter as dimension
-            auto result4 = torch::std_mean(input, correction_dim);
-            auto std_tensor4 = std::get<0>(result4);
-            auto mean_tensor4 = std::get<1>(result4);
+        // Variant 3: std_mean with dimension list
+        if (input.dim() > 1 && offset < Size) {
+            try {
+                std::vector<int64_t> dims;
+                int max_dims = std::min(static_cast<int64_t>(input.dim()), static_cast<int64_t>(2));
+                
+                for (int64_t i = 0; i < max_dims && offset < Size; i++) {
+                    int64_t d = static_cast<int64_t>(Data[offset++]) % input.dim();
+                    // Avoid duplicate dimensions
+                    bool duplicate = false;
+                    for (auto existing_d : dims) {
+                        if (existing_d == d) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (!duplicate) {
+                        dims.push_back(d);
+                    }
+                }
+                
+                if (!dims.empty()) {
+                    auto result = torch::std_mean(input, dims, correction, keepdim);
+                    auto std_val = std::get<0>(result);
+                    auto mean_val = std::get<1>(result);
+                    (void)std_val;
+                    (void)mean_val;
+                }
+            } catch (...) {
+                // Silently catch dimension-related errors
+            }
+        }
+        
+        // Variant 4: std_mean with correction=0 (population std)
+        {
+            try {
+                auto result = torch::std_mean(input, /*dim=*/0, /*correction=*/0, /*keepdim=*/false);
+                auto std_val = std::get<0>(result);
+                auto mean_val = std::get<1>(result);
+                (void)std_val;
+                (void)mean_val;
+            } catch (...) {
+                // Silently catch errors for edge cases
+            }
+        }
+        
+        // Variant 5: Test with different tensor configurations
+        if (offset + 2 < Size && input.numel() > 0) {
+            try {
+                // Create a contiguous copy
+                torch::Tensor contiguous_input = input.contiguous();
+                auto result = torch::std_mean(contiguous_input);
+                (void)std::get<0>(result);
+                (void)std::get<1>(result);
+            } catch (...) {
+                // Silently catch errors
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

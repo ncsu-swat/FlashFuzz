@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -21,10 +26,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply acos operation
         torch::Tensor result = torch::acos(input_tensor);
         
-        // Try to access the result to ensure computation is performed
+        // Force computation by accessing the result safely
         if (result.defined() && result.numel() > 0) {
-            auto accessor = result.accessor<float, 1>();
-            volatile float first_element = accessor[0];
+            // Use item() on a single element to force computation without assuming shape
+            volatile float first_element = result.flatten()[0].item<float>();
+            (void)first_element;
         }
         
         // Try some variants of the operation
@@ -33,18 +39,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor input_tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
             
             // Test in-place version
-            torch::Tensor inplace_result = input_tensor2.clone();
-            inplace_result.acos_();
+            try {
+                torch::Tensor inplace_result = input_tensor2.clone();
+                inplace_result.acos_();
+            } catch (...) {
+                // In-place may fail for certain dtypes, ignore silently
+            }
             
             // Test out variant
-            torch::Tensor out_tensor = torch::empty_like(input_tensor2);
-            torch::acos_out(out_tensor, input_tensor2);
+            try {
+                torch::Tensor out_tensor = torch::empty_like(input_tensor2);
+                torch::acos_out(out_tensor, input_tensor2);
+            } catch (...) {
+                // Out variant may fail for certain dtypes, ignore silently
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

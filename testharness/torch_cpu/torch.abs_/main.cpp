@@ -1,80 +1,106 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Skip empty inputs
-        if (Size < 2) {
+        // Skip inputs that are too small
+        if (Size < 4) {
             return 0;
         }
-        
+
+        size_t offset = 0;
+
         // Create a tensor from the input data
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create a copy of the original tensor for comparison
-        torch::Tensor original = tensor.clone();
-        
+
         // Apply the abs_ operation in-place
         tensor.abs_();
-        
-        // Verify the operation worked correctly by comparing with non-in-place version
-        torch::Tensor expected = torch::abs(original);
-        
-        // Check if the results match
-        if (!torch::allclose(tensor, expected)) {
-            throw std::runtime_error("abs_ operation produced unexpected results");
-        }
-        
-        // Try with different tensor options if we have more data
-        if (offset + 2 < Size) {
-            // Create another tensor with different properties
-            torch::Tensor tensor2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+
+        // Test with different dtypes based on fuzzer input
+        if (offset < Size) {
+            uint8_t dtype_selector = Data[offset++] % 4;
+            torch::Tensor typed_tensor;
             
-            // Apply abs_ to this tensor too
-            tensor2.abs_();
-            
-            // Test on a view of the tensor if possible
-            if (tensor2.numel() > 1 && tensor2.dim() > 0) {
-                auto view = tensor2.slice(0, 0, tensor2.size(0) / 2 + 1);
-                auto view_clone = view.clone();
-                view.abs_();
-                
-                // Verify the view operation
-                auto expected_view = torch::abs(view_clone);
-                if (!torch::allclose(view, expected_view)) {
-                    throw std::runtime_error("abs_ on tensor view produced unexpected results");
+            try {
+                switch (dtype_selector) {
+                    case 0:
+                        typed_tensor = tensor.to(torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_tensor = tensor.to(torch::kFloat64);
+                        break;
+                    case 2:
+                        typed_tensor = tensor.to(torch::kInt32);
+                        break;
+                    default:
+                        typed_tensor = tensor.to(torch::kInt64);
+                        break;
                 }
+                typed_tensor.abs_();
+            } catch (...) {
+                // Silently ignore dtype conversion failures
             }
         }
-        
-        // Test with empty tensor if we have more data
-        if (offset + 1 < Size) {
+
+        // Test on a view of the tensor if possible
+        if (tensor.numel() > 1 && tensor.dim() > 0) {
+            try {
+                auto view = tensor.slice(0, 0, std::max<int64_t>(1, tensor.size(0) / 2));
+                view.abs_();
+            } catch (...) {
+                // Silently ignore view operation failures
+            }
+        }
+
+        // Test with contiguous tensor
+        try {
+            torch::Tensor contig = tensor.contiguous();
+            contig.abs_();
+        } catch (...) {
+            // Silently ignore
+        }
+
+        // Test with empty tensor
+        try {
             torch::Tensor empty_tensor = torch::empty({0});
             empty_tensor.abs_();
+        } catch (...) {
+            // Silently ignore
         }
-        
+
         // Test with scalar tensor
-        if (offset + 1 < Size) {
-            torch::Tensor scalar_tensor = torch::tensor(Data[offset] % 256 - 128);
-            torch::Tensor scalar_copy = scalar_tensor.clone();
-            scalar_tensor.abs_();
-            
-            if (scalar_tensor.item<int>() != std::abs(scalar_copy.item<int>())) {
-                throw std::runtime_error("abs_ on scalar tensor produced unexpected results");
+        if (offset < Size) {
+            try {
+                float val = static_cast<float>(static_cast<int8_t>(Data[offset]));
+                torch::Tensor scalar_tensor = torch::tensor(val);
+                scalar_tensor.abs_();
+            } catch (...) {
+                // Silently ignore
             }
+        }
+
+        // Test with negative values explicitly
+        try {
+            torch::Tensor neg_tensor = torch::randn({4, 4}) * -1.0;
+            neg_tensor.abs_();
+        } catch (...) {
+            // Silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

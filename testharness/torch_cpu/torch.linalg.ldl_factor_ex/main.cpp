@@ -1,127 +1,150 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
         
-        // Create a square matrix for LDL factorization
+        // Parse parameters first
+        bool hermitian = Data[offset++] & 0x1;
+        bool check_errors = Data[offset++] & 0x1;
+        uint8_t size_hint = Data[offset++];
+        
+        // Determine matrix size (2 to 10)
+        int64_t n = 2 + (size_hint % 9);
+        
+        // Create a tensor from fuzzer data
         torch::Tensor A = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // LDL factorization requires a square matrix
-        // Make it square if it's not already
-        if (A.dim() < 2) {
-            // If tensor is 0D or 1D, reshape to a small square matrix
-            int64_t size = 2;
-            if (A.numel() > 0) {
-                A = A.reshape({1, 1});
-            } else {
-                A = torch::ones({1, 1}, A.options());
+        // Convert to float if needed (LDL requires floating point)
+        if (!A.is_floating_point() && !A.is_complex()) {
+            A = A.to(torch::kFloat32);
+        }
+        
+        // Reshape to square matrix
+        if (A.numel() == 0) {
+            A = torch::eye(n, A.options().dtype(torch::kFloat32));
+        } else if (A.dim() < 2) {
+            // Reshape 1D tensor to square matrix
+            int64_t total = A.numel();
+            int64_t side = static_cast<int64_t>(std::sqrt(static_cast<double>(total)));
+            if (side < 2) side = 2;
+            // Pad or truncate to make it square
+            A = A.flatten();
+            if (A.numel() < side * side) {
+                A = torch::cat({A, torch::zeros({side * side - A.numel()}, A.options())});
             }
+            A = A.slice(0, 0, side * side).reshape({side, side});
         } else {
-            // For 2D+ tensors, make the last two dimensions square
+            // For 2D+ tensors, take a square slice
             auto sizes = A.sizes().vec();
-            if (sizes.size() >= 2) {
-                int64_t max_dim = std::max(sizes[sizes.size()-1], sizes[sizes.size()-2]);
-                sizes[sizes.size()-1] = max_dim;
-                sizes[sizes.size()-2] = max_dim;
-                
-                // Resize tensor to have square last dimensions
-                if (A.numel() > 0) {
-                    A = A.expand(sizes);
-                    
-                    // Make sure the matrix is symmetric (required for LDL factorization)
-                    if (A.dim() == 2) {
-                        A = A + A.transpose(0, 1);
-                    } else {
-                        // For batched matrices, make each matrix in the batch symmetric
-                        int64_t last_dim = A.dim() - 1;
-                        int64_t second_last_dim = A.dim() - 2;
-                        A = A + A.transpose(second_last_dim, last_dim);
-                    }
-                } else {
-                    // Create a small identity matrix if A has no elements
-                    A = torch::eye(2, A.options());
-                }
-            }
-        }
-        
-        // Ensure the matrix is symmetric positive definite or at least symmetric
-        // by adding a small positive value to the diagonal
-        if (A.dim() >= 2) {
-            // Add a small positive value to the diagonal to improve numerical stability
-            torch::Tensor diag_indices = torch::arange(std::min(A.size(-1), A.size(-2)), A.options().dtype(torch::kLong));
+            int64_t rows = sizes[sizes.size() - 2];
+            int64_t cols = sizes[sizes.size() - 1];
+            int64_t min_dim = std::min(rows, cols);
+            if (min_dim < 2) min_dim = 2;
             
-            // For batched matrices
-            if (A.dim() > 2) {
-                std::vector<torch::indexing::TensorIndex> indices(A.dim(), torch::indexing::Slice());
-                indices[A.dim()-2] = diag_indices;
-                indices[A.dim()-1] = diag_indices;
-                
-                A.index_put_(indices, A.index(indices) + torch::ones_like(A.index(indices)) * 1.0);
-            } else {
-                // For 2D matrices
-                A.index_put_({diag_indices, diag_indices}, A.index({diag_indices, diag_indices}) + torch::ones_like(A.index({diag_indices, diag_indices})) * 1.0);
-            }
+            // Slice to make square
+            A = A.slice(-2, 0, min_dim).slice(-1, 0, min_dim);
         }
         
-        // Parse additional parameters for ldl_factor_ex
-        bool hermitian = false;
-        if (offset < Size) {
-            hermitian = Data[offset++] & 0x1;
-        }
+        // Make the matrix symmetric (required for LDL factorization)
+        // A_sym = (A + A^T) / 2
+        A = (A + A.transpose(-2, -1)) / 2.0;
         
-        // Call ldl_factor_ex
+        // Add positive value to diagonal for numerical stability
+        // This helps ensure the matrix is more likely to be factorizable
+        int64_t mat_size = A.size(-1);
+        torch::Tensor eye_mat = torch::eye(mat_size, A.options());
+        if (A.dim() > 2) {
+            // Broadcast eye matrix to batch dimensions
+            std::vector<int64_t> broadcast_shape(A.dim(), 1);
+            broadcast_shape[A.dim() - 2] = mat_size;
+            broadcast_shape[A.dim() - 1] = mat_size;
+            eye_mat = eye_mat.reshape(broadcast_shape).expand(A.sizes());
+        }
+        A = A + eye_mat * 1.0;
+        
+        // Ensure contiguous
+        A = A.contiguous();
+        
+        // Call torch::linalg_ldl_factor_ex (C++ API uses underscore naming)
         try {
-            auto result = torch::ldl_factor_ex(A, hermitian);
+            auto result = torch::linalg_ldl_factor_ex(A, hermitian, check_errors);
             
             // Unpack the result (LD, pivots, info)
             auto LD = std::get<0>(result);
             auto pivots = std::get<1>(result);
             auto info = std::get<2>(result);
             
-            // Optionally test the factorization by reconstructing the original matrix
-            // This is just to ensure the outputs are used and not optimized away
-            if (LD.numel() > 0 && pivots.numel() > 0) {
-                auto L = torch::tril(LD, -1) + torch::eye(LD.size(-1), LD.options());
-                auto D = torch::diag_embed(torch::diagonal(LD, 0, -2, -1));
-                
-                // Compute L * D * L^T (or L * D * L^H for hermitian case)
-                auto LT = hermitian ? L.transpose(-2, -1).conj() : L.transpose(-2, -1);
-                auto reconstructed = torch::matmul(torch::matmul(L, D), LT);
-                
-                // The reconstructed matrix should be close to the original
-                // (not checking here to avoid defensive checks)
+            // Use the outputs to prevent optimization
+            if (LD.numel() > 0) {
+                auto sum = LD.sum();
+                (void)sum;
+            }
+            if (pivots.numel() > 0) {
+                auto p_sum = pivots.sum();
+                (void)p_sum;
+            }
+            if (info.numel() > 0) {
+                auto i_sum = info.sum();
+                (void)i_sum;
             }
         } catch (const c10::Error& e) {
-            // Catch PyTorch-specific errors
-            return 0;
+            // Expected errors for invalid matrices
+        } catch (const std::runtime_error& e) {
+            // Expected runtime errors
         }
         
-        // Try with different options
-        if (offset < Size) {
-            // Try with check_errors=false
+        // Test with opposite hermitian flag
+        try {
+            auto result2 = torch::linalg_ldl_factor_ex(A, !hermitian, check_errors);
+            auto LD2 = std::get<0>(result2);
+            if (LD2.numel() > 0) {
+                auto sum = LD2.sum();
+                (void)sum;
+            }
+        } catch (const c10::Error& e) {
+            // Expected errors
+        } catch (const std::runtime_error& e) {
+            // Expected runtime errors
+        }
+        
+        // Test with complex tensor if we have enough data
+        if (offset + 10 < Size) {
             try {
-                auto result = torch::ldl_factor_ex(A, hermitian, false);
+                torch::Tensor A_complex = torch::complex(A, A * 0.1);
+                A_complex = (A_complex + A_complex.transpose(-2, -1).conj()) / 2.0;
+                
+                auto result3 = torch::linalg_ldl_factor_ex(A_complex, true, check_errors);
+                auto LD3 = std::get<0>(result3);
+                if (LD3.numel() > 0) {
+                    auto sum = LD3.abs().sum();
+                    (void)sum;
+                }
             } catch (const c10::Error& e) {
-                // Catch PyTorch-specific errors
-                return 0;
+                // Expected errors
+            } catch (const std::runtime_error& e) {
+                // Expected runtime errors
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

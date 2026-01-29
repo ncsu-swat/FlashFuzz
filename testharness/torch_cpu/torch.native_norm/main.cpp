@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For INFINITY
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,36 +24,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Skip empty tensors
+        if (input.numel() == 0) {
+            return 0;
+        }
+        
         // Extract parameters for native_norm
-        // We need at least 2 more bytes for p and dim
         if (offset + 2 <= Size) {
             // Extract p value (norm type)
             double p;
-            if (offset + sizeof(double) <= Size) {
-                std::memcpy(&p, Data + offset, sizeof(double));
-                offset += sizeof(double);
-            } else {
-                // Not enough data for double, use a byte to determine p
-                uint8_t p_selector = Data[offset++];
-                // Map to common p values: 0, 1, 2, inf, -inf, or fractional
-                switch (p_selector % 6) {
-                    case 0: p = 0.0; break;
-                    case 1: p = 1.0; break;
-                    case 2: p = 2.0; break;
-                    case 3: p = INFINITY; break;
-                    case 4: p = -INFINITY; break;
-                    case 5: p = 0.5 + (p_selector % 10) / 10.0; break;
-                }
+            uint8_t p_selector = Data[offset++];
+            // Map to common p values: 0, 1, 2, inf, -inf, or fractional
+            switch (p_selector % 7) {
+                case 0: p = 0.0; break;
+                case 1: p = 1.0; break;
+                case 2: p = 2.0; break;
+                case 3: p = std::numeric_limits<double>::infinity(); break;
+                case 4: p = -std::numeric_limits<double>::infinity(); break;
+                case 5: p = 0.5 + (p_selector / 7) % 10 / 10.0; break;
+                default: p = 2.0; break;
             }
             
-            // Extract dim value
+            // Extract dim value, bounded to valid range
             int64_t dim = 0;
-            if (offset + sizeof(int64_t) <= Size) {
-                std::memcpy(&dim, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
-            } else if (offset < Size) {
-                // Use a single byte if not enough data
-                dim = static_cast<int64_t>(Data[offset++]);
+            if (offset < Size) {
+                int64_t ndim = input.dim();
+                if (ndim > 0) {
+                    dim = static_cast<int64_t>(Data[offset++]) % ndim;
+                    // Handle negative dimensions too
+                    if (offset < Size && (Data[offset++] & 0x1)) {
+                        dim = dim - ndim;
+                    }
+                } else {
+                    offset++;
+                }
             }
             
             // Extract keepdim flag
@@ -61,22 +71,48 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             if (offset < Size) {
                 uint8_t dtype_selector = Data[offset++];
                 if (dtype_selector & 0x1) {
-                    dtype = fuzzer_utils::parseDataType(dtype_selector >> 1);
+                    // Use float types for norm computation
+                    switch ((dtype_selector >> 1) % 4) {
+                        case 0: dtype = torch::kFloat32; break;
+                        case 1: dtype = torch::kFloat64; break;
+                        case 2: dtype = torch::kFloat16; break;
+                        default: dtype = c10::nullopt; break;
+                    }
                 }
             }
             
             // Call native_norm with different parameter combinations
+            // Inner try-catch for expected PyTorch errors
             try {
                 // Call with all parameters
                 torch::Tensor result1 = torch::native_norm(input, c10::optional<torch::Scalar>(p), {dim}, keepdim, dtype);
-                
-                // Call with only p parameter
+            } catch (const c10::Error& e) {
+                // PyTorch specific errors are expected (shape mismatches, etc.)
+            }
+            
+            try {
+                // Call with only p parameter (returns scalar norm)
                 torch::Tensor result2 = torch::native_norm(input, p);
-                
+            } catch (const c10::Error& e) {
+                // PyTorch specific errors are expected
+            }
+            
+            try {
                 // Call with default p (2.0)
                 torch::Tensor result3 = torch::native_norm(input);
             } catch (const c10::Error& e) {
-                // PyTorch specific errors are expected and handled
+                // PyTorch specific errors are expected
+            }
+            
+            // Try with multiple dimensions if tensor has enough dims
+            if (input.dim() >= 2 && offset < Size) {
+                try {
+                    int64_t dim2 = (dim + 1) % input.dim();
+                    std::vector<int64_t> dims = {dim, dim2};
+                    torch::Tensor result4 = torch::native_norm(input, c10::optional<torch::Scalar>(p), dims, keepdim, dtype);
+                } catch (const c10::Error& e) {
+                    // Expected for invalid dimension combinations
+                }
             }
         } else {
             // Not enough data for parameters, try with defaults
@@ -90,7 +126,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

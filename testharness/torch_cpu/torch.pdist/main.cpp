@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,37 +23,46 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor for pdist
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // pdist requires a 2D tensor with shape [N, M] where N >= 1 and M >= 1
+        // pdist requires a 2D floating point tensor with shape [N, M] where N >= 1 and M >= 1
+        // Convert to float if not already floating point
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
         // If the tensor doesn't have the right shape, reshape it
         if (input.dim() != 2) {
-            // If tensor is empty, create a small valid tensor
             if (input.numel() == 0) {
-                input = torch::ones({2, 2});
+                input = torch::ones({2, 2}, torch::kFloat32);
             } else {
-                // Reshape to 2D tensor
                 int64_t numel = input.numel();
-                int64_t dim1 = std::max(static_cast<int64_t>(1), static_cast<int64_t>(std::sqrt(numel)));
-                int64_t dim2 = (numel + dim1 - 1) / dim1; // Ceiling division
-                input = input.reshape({dim1, dim2});
+                int64_t dim1 = std::max(static_cast<int64_t>(2), static_cast<int64_t>(std::sqrt(numel)));
+                int64_t dim2 = std::max(static_cast<int64_t>(1), numel / dim1);
+                // Flatten and take what we need
+                input = input.flatten().slice(0, 0, dim1 * dim2).reshape({dim1, dim2});
             }
+        }
+        
+        // Ensure at least 2 rows for meaningful pdist output
+        if (input.size(0) < 2) {
+            input = torch::cat({input, input}, 0);
         }
         
         // Get a p-norm value from the input data
         double p = 2.0; // Default to Euclidean distance
         if (offset < Size) {
-            // Use the next byte to determine p
             uint8_t p_byte = Data[offset++];
             
-            // Map to common p-norm values or use raw value
-            switch (p_byte % 5) {
-                case 0: p = 0.0; break;  // Test with p=0
+            // Map to common p-norm values
+            switch (p_byte % 6) {
+                case 0: p = 0.5; break;  // Fractional p
                 case 1: p = 1.0; break;  // Manhattan distance
                 case 2: p = 2.0; break;  // Euclidean distance
-                case 3: p = std::numeric_limits<double>::infinity(); break; // Infinity norm
-                case 4: 
-                    // Use a value from the data
+                case 3: p = 3.0; break;  // Higher order norm
+                case 4: p = std::numeric_limits<double>::infinity(); break; // Infinity norm
+                case 5: 
+                    // Use a positive value from the data
                     if (offset < Size) {
-                        p = static_cast<double>(Data[offset++]) / 10.0;
+                        p = 0.1 + static_cast<double>(Data[offset++]) / 25.5; // Range [0.1, 10.1]
                     }
                     break;
             }
@@ -59,48 +73,64 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Try with different p values if we have more data
         if (offset + 1 < Size) {
-            double p2 = static_cast<double>(Data[offset]) / 10.0;
-            torch::Tensor output2 = torch::pdist(input, p2);
+            try {
+                double p2 = 0.1 + static_cast<double>(Data[offset++]) / 25.5;
+                torch::Tensor output2 = torch::pdist(input, p2);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
         
         // Test edge cases with specific shapes if we have enough data
         if (offset + 2 < Size) {
             uint8_t shape_selector = Data[offset++];
             
-            // Create tensors with specific shapes for edge cases
             torch::Tensor edge_input;
             
             switch (shape_selector % 5) {
                 case 0:
-                    // Single row (should result in empty output)
-                    edge_input = torch::ones({1, 2});
+                    // Two rows (minimal for non-empty output)
+                    edge_input = torch::randn({2, 3}, torch::kFloat32);
                     break;
                 case 1:
                     // Two identical rows (should result in zero distances)
-                    edge_input = torch::ones({2, 3});
+                    edge_input = torch::ones({2, 3}, torch::kFloat32);
                     break;
                 case 2:
-                    // Large number of rows
-                    edge_input = torch::ones({100, 2});
+                    // Moderate number of rows
+                    edge_input = torch::randn({10, 4}, torch::kFloat32);
                     break;
                 case 3:
-                    // High dimensional features
-                    edge_input = torch::ones({5, 50});
+                    // Higher dimensional features
+                    edge_input = torch::randn({5, 20}, torch::kFloat32);
                     break;
                 case 4:
                     // Minimal valid case
-                    edge_input = torch::ones({2, 1});
+                    edge_input = torch::randn({2, 1}, torch::kFloat32);
                     break;
             }
             
-            // Apply pdist to the edge case
-            torch::Tensor edge_output = torch::pdist(edge_input, p);
+            try {
+                torch::Tensor edge_output = torch::pdist(edge_input, p);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
+        }
+        
+        // Test with contiguous vs non-contiguous tensors
+        if (offset < Size && (Data[offset] % 2 == 0)) {
+            try {
+                torch::Tensor transposed = input.t().contiguous().t();
+                torch::Tensor output_t = torch::pdist(transposed, p);
+            } catch (...) {
+                // Silently ignore
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

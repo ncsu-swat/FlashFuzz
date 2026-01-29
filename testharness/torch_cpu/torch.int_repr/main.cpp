@@ -1,12 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <algorithm>      // For std::max
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -52,14 +56,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     std::vector<int64_t> zero_points(num_channels, 0);
                     
                     // Vary scales and zero_points based on input data
-                    for (int64_t i = 0; i < num_channels && (offset + i < Size); i++) {
+                    for (int64_t i = 0; i < num_channels && (offset + static_cast<size_t>(i) < Size); i++) {
                         scales[i] = 0.01 + (Data[offset + i] % 100) * 0.001;
-                        if (offset + num_channels + i < Size) {
+                        if (offset + static_cast<size_t>(num_channels + i) < Size) {
                             zero_points[i] = Data[offset + num_channels + i] % 256;
                         }
                     }
                     
-                    offset += 2 * num_channels;
+                    offset += 2 * static_cast<size_t>(num_channels);
                     
                     // Create per-channel quantized tensor
                     quantized_tensor = torch::quantize_per_channel(
@@ -87,7 +91,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Perform some operations on the result to ensure it's used
             auto sum = int_repr_result.sum();
-            auto mean = int_repr_result.mean();
+            (void)sum; // Prevent unused variable warning
             
             // Check that int_repr returns a tensor with the same shape as the input
             if (int_repr_result.sizes() != quantized_tensor.sizes()) {
@@ -100,15 +104,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 int_repr_result.dtype() != torch::kInt64) {
                 throw std::runtime_error("int_repr result is not an integer tensor");
             }
-        } catch (const c10::Error& e) {
-            // PyTorch-specific exceptions are expected and should be caught
-            // We don't need to do anything special here
+        } catch (const std::exception& e) {
+            // Expected failures (shape mismatches, quantization errors, etc.)
+            // Silently catch - these are expected for invalid inputs
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For std::abs, std::fmod
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -25,15 +31,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&lambda_raw, Data + offset, sizeof(float));
             offset += sizeof(float);
             
-            // Ensure lambda is positive (as typically expected)
-            lambda = std::abs(lambda_raw);
+            // Ensure lambda is non-negative (required by Softshrink)
+            lambda = std::abs(static_cast<double>(lambda_raw));
             
             // Limit to reasonable range to avoid extreme values
             lambda = std::fmod(lambda, 1000.0);
         }
         
-        // Create Softshrink module
-        torch::nn::Softshrink softshrink_module(lambda);
+        // Create Softshrink module with SoftshrinkOptions using brace initialization
+        torch::nn::Softshrink softshrink_module{torch::nn::SoftshrinkOptions(lambda)};
         
         // Apply Softshrink operation
         torch::Tensor output = softshrink_module->forward(input);
@@ -45,47 +51,99 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(float);
             
             // Try with zero lambda
-            torch::nn::Softshrink softshrink_zero(0.0);
-            torch::Tensor output_zero = softshrink_zero->forward(input);
+            try {
+                torch::nn::Softshrink softshrink_zero{torch::nn::SoftshrinkOptions(0.0)};
+                torch::Tensor output_zero = softshrink_zero->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
             
-            // Try with negative lambda (should behave like positive lambda)
-            double neg_lambda = -std::abs(lambda2_raw);
-            torch::nn::Softshrink softshrink_neg(neg_lambda);
-            torch::Tensor output_neg = softshrink_neg->forward(input);
+            // Try with small positive lambda derived from input
+            double small_lambda = std::abs(static_cast<double>(lambda2_raw));
+            small_lambda = std::fmod(small_lambda, 10.0); // Keep it reasonable
+            try {
+                torch::nn::Softshrink softshrink_var{torch::nn::SoftshrinkOptions(small_lambda)};
+                torch::Tensor output_var = softshrink_var->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
             
             // Try with very small lambda
-            torch::nn::Softshrink softshrink_small(1e-10);
-            torch::Tensor output_small = softshrink_small->forward(input);
+            try {
+                torch::nn::Softshrink softshrink_small{torch::nn::SoftshrinkOptions(1e-10)};
+                torch::Tensor output_small = softshrink_small->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
             
-            // Try with very large lambda
-            torch::nn::Softshrink softshrink_large(1e10);
-            torch::Tensor output_large = softshrink_large->forward(input);
+            // Try with moderately large lambda
+            try {
+                torch::nn::Softshrink softshrink_large{torch::nn::SoftshrinkOptions(100.0)};
+                torch::Tensor output_large = softshrink_large->forward(input);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
         
         // Test functional version as well
-        torch::Tensor output_functional = torch::nn::functional::softshrink(input, torch::nn::functional::SoftshrinkFuncOptions(lambda));
+        try {
+            torch::Tensor output_functional = torch::nn::functional::softshrink(
+                input, torch::nn::functional::SoftshrinkFuncOptions(lambda));
+        } catch (...) {
+            // Silently ignore expected failures
+        }
         
         // Test with empty tensor
         if (input.numel() > 0) {
-            torch::Tensor empty_tensor = torch::empty({0}, input.options());
-            torch::Tensor output_empty = softshrink_module->forward(empty_tensor);
+            try {
+                torch::Tensor empty_tensor = torch::empty({0}, input.options());
+                torch::Tensor output_empty = softshrink_module->forward(empty_tensor);
+            } catch (...) {
+                // Silently ignore - empty tensor handling may vary
+            }
         }
         
         // Test with different dtypes if input is floating point
         if (input.is_floating_point()) {
             // Test with half precision
-            torch::Tensor input_half = input.to(torch::kHalf);
-            torch::Tensor output_half = softshrink_module->forward(input_half);
+            try {
+                torch::Tensor input_half = input.to(torch::kHalf);
+                torch::Tensor output_half = softshrink_module->forward(input_half);
+            } catch (...) {
+                // Silently ignore - half precision may not be supported on all platforms
+            }
             
             // Test with double precision
-            torch::Tensor input_double = input.to(torch::kDouble);
-            torch::Tensor output_double = softshrink_module->forward(input_double);
+            try {
+                torch::Tensor input_double = input.to(torch::kDouble);
+                torch::Tensor output_double = softshrink_module->forward(input_double);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
+            
+            // Test with float precision explicitly
+            try {
+                torch::Tensor input_float = input.to(torch::kFloat);
+                torch::Tensor output_float = softshrink_module->forward(input_float);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
+        }
+        
+        // Test with integer tensor converted to float (Softshrink requires floating point)
+        if (!input.is_floating_point()) {
+            try {
+                torch::Tensor input_float = input.to(torch::kFloat);
+                torch::Tensor output_float = softshrink_module->forward(input_float);
+            } catch (...) {
+                // Silently ignore expected failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

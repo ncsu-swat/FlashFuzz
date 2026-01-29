@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -34,111 +38,133 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&eps, Data + offset, sizeof(double));
             offset += sizeof(double);
-            // Ensure eps is positive
+            // Ensure eps is positive and reasonable
             eps = std::abs(eps);
-            if (eps == 0.0) eps = 1e-5;
+            if (eps < 1e-10 || std::isnan(eps) || std::isinf(eps)) eps = 1e-5;
         }
         
-        // Get the number of features from the input tensor
-        int64_t num_features = 1;
-        if (input.dim() >= 2) {
-            num_features = input.size(1);
-        } else if (input.dim() == 1) {
-            num_features = input.size(0);
+        // BatchNorm requires at least 2D input with batch dimension
+        if (input.dim() < 2) {
+            return 0;
         }
         
-        // Create BatchNorm modules for different dimensions
-        if (input.dim() >= 2) {
-            // Try BatchNorm1d
-            if (input.dim() == 2 || input.dim() == 3) {
+        // Get the number of features from the input tensor (channel dimension)
+        int64_t num_features = input.size(1);
+        
+        // Ensure num_features is valid
+        if (num_features <= 0 || num_features > 10000) {
+            return 0;
+        }
+        
+        // Try BatchNorm1d for 2D or 3D input
+        if (input.dim() == 2 || input.dim() == 3) {
+            try {
                 torch::nn::BatchNorm1d bn1d(torch::nn::BatchNorm1dOptions(num_features)
                                             .eps(eps)
                                             .momentum(momentum)
                                             .affine(affine)
                                             .track_running_stats(track_running_stats));
                 
-                // Apply BatchNorm1d
-                torch::Tensor output1d = bn1d->forward(input);
+                bn1d->train();
+                torch::Tensor output1d_train = bn1d->forward(input);
+                
+                bn1d->eval();
+                torch::Tensor output1d_eval = bn1d->forward(input);
+            } catch (...) {
+                // Expected failures for invalid shapes/sizes
             }
-            
-            // Try BatchNorm2d
-            if (input.dim() == 4) {
+        }
+        
+        // Try BatchNorm2d for 4D input
+        if (input.dim() == 4) {
+            try {
                 torch::nn::BatchNorm2d bn2d(torch::nn::BatchNorm2dOptions(num_features)
                                             .eps(eps)
                                             .momentum(momentum)
                                             .affine(affine)
                                             .track_running_stats(track_running_stats));
                 
-                // Apply BatchNorm2d
-                torch::Tensor output2d = bn2d->forward(input);
+                bn2d->train();
+                torch::Tensor output2d_train = bn2d->forward(input);
+                
+                bn2d->eval();
+                torch::Tensor output2d_eval = bn2d->forward(input);
+            } catch (...) {
+                // Expected failures for invalid shapes/sizes
             }
-            
-            // Try BatchNorm3d
-            if (input.dim() == 5) {
+        }
+        
+        // Try BatchNorm3d for 5D input
+        if (input.dim() == 5) {
+            try {
                 torch::nn::BatchNorm3d bn3d(torch::nn::BatchNorm3dOptions(num_features)
                                             .eps(eps)
                                             .momentum(momentum)
                                             .affine(affine)
                                             .track_running_stats(track_running_stats));
                 
-                // Apply BatchNorm3d
-                torch::Tensor output3d = bn3d->forward(input);
+                bn3d->train();
+                torch::Tensor output3d_train = bn3d->forward(input);
+                
+                bn3d->eval();
+                torch::Tensor output3d_eval = bn3d->forward(input);
+            } catch (...) {
+                // Expected failures for invalid shapes/sizes
             }
         }
         
-        // Try functional batch norm regardless of dimensions
-        torch::Tensor weight;
-        torch::Tensor bias;
-        torch::Tensor running_mean;
-        torch::Tensor running_var;
-        
-        if (affine) {
-            weight = torch::ones({num_features});
-            bias = torch::zeros({num_features});
-        }
-        
-        if (track_running_stats) {
+        // Try functional batch norm
+        try {
+            torch::Tensor weight;
+            torch::Tensor bias;
+            torch::Tensor running_mean;
+            torch::Tensor running_var;
+            
+            if (affine) {
+                weight = torch::ones({num_features});
+                bias = torch::zeros({num_features});
+            }
+            
             running_mean = torch::zeros({num_features});
             running_var = torch::ones({num_features});
-        }
-        
-        // Apply functional batch norm with options
-        auto options = torch::nn::functional::BatchNormFuncOptions()
-                          .weight(weight)
-                          .bias(bias)
-                          .training(!track_running_stats)
-                          .momentum(momentum)
-                          .eps(eps);
-        
-        torch::Tensor output_func = torch::nn::functional::batch_norm(
-            input,
-            running_mean,
-            running_var,
-            options
-        );
-        
-        // Test with different training modes
-        if (track_running_stats) {
-            // Create a BatchNorm module
-            torch::nn::BatchNorm1d bn(torch::nn::BatchNorm1dOptions(num_features)
-                                      .eps(eps)
-                                      .momentum(momentum)
-                                      .affine(affine)
-                                      .track_running_stats(true));
             
             // Test in training mode
-            bn->train();
-            torch::Tensor output_train = bn->forward(input);
+            auto options_train = torch::nn::functional::BatchNormFuncOptions()
+                              .weight(weight)
+                              .bias(bias)
+                              .training(true)
+                              .momentum(momentum)
+                              .eps(eps);
+            
+            torch::Tensor output_func_train = torch::nn::functional::batch_norm(
+                input,
+                running_mean,
+                running_var,
+                options_train
+            );
             
             // Test in eval mode
-            bn->eval();
-            torch::Tensor output_eval = bn->forward(input);
+            auto options_eval = torch::nn::functional::BatchNormFuncOptions()
+                              .weight(weight)
+                              .bias(bias)
+                              .training(false)
+                              .momentum(momentum)
+                              .eps(eps);
+            
+            torch::Tensor output_func_eval = torch::nn::functional::batch_norm(
+                input,
+                running_mean,
+                running_var,
+                options_eval
+            );
+        } catch (...) {
+            // Expected failures for invalid inputs
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

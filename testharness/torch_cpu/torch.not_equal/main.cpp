@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -29,27 +34,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Optionally modify tensor2 to make it different
             if (tensor2.numel() > 0) {
                 // Get a scalar value from the remaining data or use a default
-                float scalar_val = 1.0;
+                float scalar_val = 1.0f;
                 if (offset + sizeof(float) <= Size) {
                     std::memcpy(&scalar_val, Data + offset, sizeof(float));
                     offset += sizeof(float);
                 }
                 
                 // Apply the scalar to make tensor2 different
-                tensor2 = tensor2 + scalar_val;
+                tensor2 = tensor2.to(torch::kFloat) + scalar_val;
             }
         }
         
-        // Apply torch.not_equal operation
+        // Apply torch.not_equal operation (torch::ne is the C++ equivalent)
         torch::Tensor result = torch::ne(tensor1, tensor2);
         
         // Try the other variant of not_equal (operator overload)
         torch::Tensor result2 = tensor1 != tensor2;
         
         // Try element-wise not_equal with a scalar
-        float scalar_value = 0.0;
+        float scalar_value = 0.0f;
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&scalar_value, Data + offset, sizeof(float));
+            offset += sizeof(float);
         }
         torch::Tensor result3 = torch::ne(tensor1, scalar_value);
         
@@ -57,6 +63,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         int64_t int_scalar = 0;
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&int_scalar, Data + offset, sizeof(int64_t));
+            offset += sizeof(int64_t);
         }
         torch::Tensor result4 = torch::ne(tensor1, int_scalar);
         
@@ -64,13 +71,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         bool bool_scalar = false;
         if (offset < Size) {
             bool_scalar = Data[offset] & 0x1;
+            offset++;
         }
         torch::Tensor result5 = torch::ne(tensor1, bool_scalar);
         
         // Try with broadcasting - reshape tensor2 if possible
         if (tensor2.dim() > 0 && tensor2.numel() > 0) {
             std::vector<int64_t> new_shape;
-            for (int i = 0; i < tensor2.dim(); i++) {
+            for (int64_t i = 0; i < tensor2.dim(); i++) {
                 if (i < tensor2.dim() - 1) {
                     new_shape.push_back(tensor2.size(i));
                 } else {
@@ -81,6 +89,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             try {
                 torch::Tensor reshaped = tensor2.reshape(new_shape);
                 torch::Tensor result6 = torch::ne(tensor1, reshaped);
+                (void)result6;
             } catch (const std::exception&) {
                 // Reshape might fail, that's okay
             }
@@ -91,6 +100,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor tensor1_float = tensor1.to(torch::kFloat);
             torch::Tensor tensor2_int = tensor2.to(torch::kInt);
             torch::Tensor result7 = torch::ne(tensor1_float, tensor2_int);
+            (void)result7;
         } catch (const std::exception&) {
             // Type conversion might fail, that's okay
         }
@@ -99,9 +109,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         try {
             torch::Tensor empty_tensor = torch::empty({0});
             torch::Tensor result8 = torch::ne(tensor1, empty_tensor);
+            (void)result8;
         } catch (const std::exception&) {
             // This might fail due to shape mismatch, that's okay
         }
+        
+        // Suppress unused variable warnings
+        (void)result;
+        (void)result2;
+        (void)result3;
+        (void)result4;
+        (void)result5;
     }
     catch (const std::exception &e)
     {

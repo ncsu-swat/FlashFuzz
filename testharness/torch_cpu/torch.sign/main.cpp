@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -37,6 +42,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Create another tensor with different properties
             torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, offset);
             torch::Tensor result2 = torch::sign(input2);
+        }
+        
+        // Test with complex tensors (sign works differently for complex)
+        if (offset + 4 < Size) {
+            try {
+                torch::Tensor real_part = fuzzer_utils::createTensor(Data, Size, offset);
+                torch::Tensor imag_part = fuzzer_utils::createTensor(Data, Size, offset);
+                // Ensure same shape for complex tensor creation
+                if (real_part.sizes() == imag_part.sizes() && real_part.numel() > 0) {
+                    torch::Tensor complex_input = torch::complex(
+                        real_part.to(torch::kFloat32), 
+                        imag_part.to(torch::kFloat32)
+                    );
+                    torch::Tensor complex_result = torch::sign(complex_input);
+                }
+            } catch (...) {
+                // Silently ignore shape mismatches for complex tensor creation
+            }
         }
     }
     catch (const std::exception &e)

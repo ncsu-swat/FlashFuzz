@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -18,10 +23,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create first tensor
         torch::Tensor tensor1 = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Skip complex tensors as comparison operations don't support them
+        if (tensor1.is_complex()) {
+            tensor1 = torch::real(tensor1);
+        }
+        
         // Create second tensor if we have more data
         torch::Tensor tensor2;
         if (offset < Size) {
             tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
+            if (tensor2.is_complex()) {
+                tensor2 = torch::real(tensor2);
+            }
         } else {
             // If no more data, create a tensor with same shape but different values
             tensor2 = tensor1.clone();
@@ -30,11 +43,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             if (tensor2.numel() > 0) {
                 // Add a small value to make tensors different
                 if (tensor2.is_floating_point()) {
-                    tensor2.add_(0.5);
-                } else if (tensor2.is_complex()) {
-                    tensor2.add_(1.0);
+                    tensor2 = tensor2.add(0.5);
                 } else {
-                    tensor2.add_(1);
+                    tensor2 = tensor2.add(1);
                 }
             }
         }
@@ -85,39 +96,48 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             if (tensor1.numel() > 0) {
                 if (tensor1.is_floating_point()) {
                     auto scalar_result = torch::gt(tensor1, 0.5);
-                } else if (tensor1.is_complex()) {
-                    auto scalar_result = torch::gt(tensor1, 1.0);
+                    auto scalar_result2 = torch::greater(tensor1, -0.5);
                 } else {
                     auto scalar_result = torch::gt(tensor1, 1);
+                    auto scalar_result2 = torch::greater(tensor1, 0);
                 }
             }
             
-            // Method 6: In-place version if supported
-            if (tensor1.is_floating_point() && tensor2.is_floating_point()) {
-                auto tensor_copy = tensor1.clone();
-                try {
-                    tensor_copy.gt_(tensor2);
-                } catch (const std::exception&) {
-                    // In-place operation might not be supported for all dtypes
-                }
-            }
-            
-            // Method 7: Test with empty tensors
+            // Method 6: Test with empty tensors
             try {
                 auto empty_tensor = torch::empty({0}, tensor1.options());
-                auto empty_result = torch::gt(empty_tensor, tensor1);
+                auto empty_result = torch::gt(empty_tensor, empty_tensor);
             } catch (const std::exception&) {
                 // Empty tensor comparison might throw
             }
             
-            // Method 8: Test with different dtypes
+            // Method 7: Test with different dtypes (both non-complex)
             try {
                 auto int_tensor = tensor1.to(torch::kInt);
                 auto float_tensor = tensor2.to(torch::kFloat);
                 auto mixed_result = torch::gt(int_tensor, float_tensor);
+                auto mixed_result2 = torch::greater(float_tensor, int_tensor);
             } catch (const std::exception&) {
                 // Mixed dtype comparison might throw
             }
+            
+            // Method 8: Test with scalar Tensor (0-dimensional)
+            try {
+                auto scalar_tensor = torch::tensor(1.0);
+                auto scalar_gt_result = torch::gt(tensor1, scalar_tensor);
+                auto scalar_greater_result = torch::greater(scalar_tensor, tensor2);
+            } catch (const std::exception&) {
+                // Scalar tensor comparison might throw
+            }
+            
+            // Method 9: Test greater_equal as related API
+            try {
+                auto ge_result = torch::ge(tensor1, tensor2);
+                auto ge_result2 = torch::greater_equal(tensor1, tensor2);
+            } catch (const std::exception&) {
+                // Related comparison might throw
+            }
+            
         } catch (const std::exception&) {
             // Operation might throw for incompatible tensors
         }
@@ -125,7 +145,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

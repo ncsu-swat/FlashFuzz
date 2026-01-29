@@ -1,111 +1,116 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to proceed
-        if (Size < 4) {
+        // Need sufficient data
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract parameters from fuzz data
+        uint8_t batch_size = (Data[offset++] % 4) + 1;    // 1-4
+        uint8_t channels = (Data[offset++] % 4) + 1;      // 1-4
+        uint8_t height = (Data[offset++] % 8) + 2;        // 2-9
+        uint8_t width = (Data[offset++] % 8) + 2;         // 2-9
         
-        // Create indices tensor (same shape as input)
-        torch::Tensor indices = fuzzer_utils::createTensor(Data, Size, offset);
+        uint8_t kernel_h = (Data[offset++] % 3) + 2;      // 2-4
+        uint8_t kernel_w = (Data[offset++] % 3) + 2;      // 2-4
         
-        // Ensure indices are integers
-        indices = indices.to(torch::kInt64);
+        uint8_t stride_h = (Data[offset++] % 2) + 1;      // 1-2
+        uint8_t stride_w = (Data[offset++] % 2) + 1;      // 1-2
         
-        // Extract kernel size parameters
-        std::vector<int64_t> kernel_size;
-        if (offset + 2 <= Size) {
-            uint8_t kernel_h = Data[offset++] % 8 + 1; // 1-8
-            uint8_t kernel_w = Data[offset++] % 8 + 1; // 1-8
-            kernel_size = {static_cast<int64_t>(kernel_h), static_cast<int64_t>(kernel_w)};
-        } else {
-            kernel_size = {2, 2}; // Default
+        uint8_t padding_h = Data[offset++] % 2;           // 0-1
+        uint8_t padding_w = Data[offset++] % 2;           // 0-1
+        
+        bool use_output_size = Data[offset++] % 2;
+        
+        std::vector<int64_t> kernel_size = {kernel_h, kernel_w};
+        std::vector<int64_t> stride = {stride_h, stride_w};
+        std::vector<int64_t> padding = {padding_h, padding_w};
+        
+        // Create a proper input tensor and run MaxPool2d to get valid indices
+        // The pooled output dimensions
+        int64_t in_h = height;
+        int64_t in_w = width;
+        
+        // Create a larger tensor to pool from (reverse engineer the input size)
+        int64_t orig_h = (in_h - 1) * stride_h - 2 * padding_h + kernel_h;
+        int64_t orig_w = (in_w - 1) * stride_w - 2 * padding_w + kernel_w;
+        
+        if (orig_h <= 0 || orig_w <= 0) {
+            return 0;
         }
         
-        // Extract stride parameters
-        std::vector<int64_t> stride;
-        if (offset + 2 <= Size) {
-            uint8_t stride_h = Data[offset++] % 4 + 1; // 1-4
-            uint8_t stride_w = Data[offset++] % 4 + 1; // 1-4
-            stride = {static_cast<int64_t>(stride_h), static_cast<int64_t>(stride_w)};
-        } else {
-            stride = kernel_size; // Default to same as kernel_size
-        }
+        // Create original tensor for pooling
+        torch::Tensor original = torch::randn({batch_size, channels, orig_h, orig_w});
         
-        // Extract padding parameters
-        std::vector<int64_t> padding;
-        if (offset + 2 <= Size) {
-            uint8_t padding_h = Data[offset++] % 4; // 0-3
-            uint8_t padding_w = Data[offset++] % 4; // 0-3
-            padding = {static_cast<int64_t>(padding_h), static_cast<int64_t>(padding_w)};
-        } else {
-            padding = {0, 0}; // Default
-        }
-        
-        // Extract output_size parameters (optional)
-        std::vector<int64_t> output_size;
-        if (offset + 1 <= Size) {
-            uint8_t use_output_size = Data[offset++] % 2; // 0 or 1
-            
-            if (use_output_size && input.dim() >= 2) {
-                if (offset + 2 <= Size) {
-                    uint8_t out_h = Data[offset++] % 32 + 1; // 1-32
-                    uint8_t out_w = Data[offset++] % 32 + 1; // 1-32
-                    
-                    // Create output_size with batch and channel dimensions from input
-                    if (input.dim() == 4) {
-                        output_size = {input.size(0), input.size(1), 
-                                      static_cast<int64_t>(out_h), 
-                                      static_cast<int64_t>(out_w)};
-                    } else if (input.dim() == 3) {
-                        output_size = {input.size(0), 
-                                      static_cast<int64_t>(out_h), 
-                                      static_cast<int64_t>(out_w)};
-                    } else {
-                        output_size = {static_cast<int64_t>(out_h), 
-                                      static_cast<int64_t>(out_w)};
-                    }
-                }
+        // Use fuzz data to modify tensor values
+        if (offset < Size) {
+            torch::Tensor flattened = original.flatten();
+            size_t num_elements = std::min(flattened.numel(), static_cast<int64_t>(Size - offset));
+            auto accessor = flattened.accessor<float, 1>();
+            for (size_t i = 0; i < num_elements && offset < Size; i++, offset++) {
+                accessor[i] = static_cast<float>(Data[offset]) / 25.5f - 5.0f;
             }
         }
         
-        // Create MaxUnpool2d module
-        torch::nn::MaxUnpool2d unpool = torch::nn::MaxUnpool2d(
+        // Run MaxPool2d to get valid indices
+        torch::nn::MaxPool2d pool(
+            torch::nn::MaxPool2dOptions(kernel_size)
+                .stride(stride)
+                .padding(padding)
+        );
+        
+        auto [pooled, indices] = pool->forward_with_indices(original);
+        
+        // Create MaxUnpool2d module with same parameters
+        torch::nn::MaxUnpool2d unpool(
             torch::nn::MaxUnpool2dOptions(kernel_size)
                 .stride(stride)
                 .padding(padding)
         );
         
-        // Apply the operation
+        // Apply the unpooling operation
         torch::Tensor output;
-        if (!output_size.empty()) {
-            output = unpool->forward(input, indices, output_size);
-        } else {
-            output = unpool->forward(input, indices);
-        }
         
-        // Try to access output properties to ensure computation completed
-        auto sizes = output.sizes();
-        auto dtype = output.dtype();
+        try {
+            if (use_output_size) {
+                // Use explicit output size matching original
+                std::vector<int64_t> out_size = {batch_size, channels, orig_h, orig_w};
+                output = unpool->forward(pooled, indices, out_size);
+            } else {
+                output = unpool->forward(pooled, indices);
+            }
+            
+            // Verify output
+            auto sizes = output.sizes();
+            auto dtype = output.dtype();
+            
+            // Additional operation to exercise the output
+            torch::Tensor sum = output.sum();
+            (void)sum.item<float>();
+        }
+        catch (const c10::Error&) {
+            // Shape mismatch or other expected errors - silently ignore
+        }
         
         return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

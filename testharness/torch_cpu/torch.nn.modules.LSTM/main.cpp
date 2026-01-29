@@ -1,83 +1,44 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        // Need at least enough bytes for parameters
+        if (Size < 16) {
+            return 0;
+        }
+        
         size_t offset = 0;
         
-        // Need at least a few bytes for basic parameters
-        if (Size < 10) {
-            return 0;
-        }
+        // Extract LSTM parameters from fuzz data
+        // Use smaller, bounded values to avoid excessive memory usage
+        int64_t input_size = (Data[offset++] % 32) + 1;      // 1-32
+        int64_t hidden_size = (Data[offset++] % 32) + 1;     // 1-32
+        int64_t num_layers = (Data[offset++] % 3) + 1;       // 1-3
+        int64_t seq_len = (Data[offset++] % 16) + 1;         // 1-16
+        int64_t batch_size = (Data[offset++] % 8) + 1;       // 1-8
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        bool bias = Data[offset++] & 1;
+        bool batch_first = Data[offset++] & 1;
+        bool bidirectional = Data[offset++] & 1;
         
-        // Ensure we have at least some bytes left for LSTM parameters
-        if (offset + 8 >= Size) {
-            return 0;
-        }
-        
-        // Parse LSTM parameters from the input data
-        int64_t input_size = 0;
-        int64_t hidden_size = 0;
-        int64_t num_layers = 0;
-        bool bias = false;
-        bool batch_first = false;
+        // Dropout: only apply if num_layers > 1 (PyTorch requirement)
         double dropout = 0.0;
-        bool bidirectional = false;
-        
-        // Extract input_size (ensure it's positive)
-        if (offset + sizeof(int64_t) <= Size) {
-            memcpy(&input_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            input_size = std::abs(input_size) % 100 + 1; // Ensure positive and reasonable
-        } else {
-            input_size = 10; // Default
-        }
-        
-        // Extract hidden_size (ensure it's positive)
-        if (offset + sizeof(int64_t) <= Size) {
-            memcpy(&hidden_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            hidden_size = std::abs(hidden_size) % 100 + 1; // Ensure positive and reasonable
-        } else {
-            hidden_size = 20; // Default
-        }
-        
-        // Extract num_layers (ensure it's positive)
-        if (offset + sizeof(int64_t) <= Size) {
-            memcpy(&num_layers, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            num_layers = std::abs(num_layers) % 5 + 1; // Ensure positive and reasonable
-        } else {
-            num_layers = 1; // Default
-        }
-        
-        // Extract boolean parameters
-        if (offset < Size) {
-            bias = Data[offset++] & 1;
-        }
-        
-        if (offset < Size) {
-            batch_first = Data[offset++] & 1;
-        }
-        
-        // Extract dropout (ensure it's between 0 and 1)
-        if (offset + sizeof(double) <= Size) {
-            memcpy(&dropout, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            dropout = std::abs(dropout);
-            dropout = dropout - std::floor(dropout); // Get fractional part
-        }
-        
-        if (offset < Size) {
-            bidirectional = Data[offset++] & 1;
+        if (num_layers > 1 && offset < Size) {
+            dropout = static_cast<double>(Data[offset++] % 50) / 100.0; // 0.0-0.49
+        } else if (offset < Size) {
+            offset++; // consume the byte anyway
         }
         
         // Create LSTM module
@@ -90,73 +51,110 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 .bidirectional(bidirectional)
         );
         
-        // Reshape input tensor if needed to match LSTM expectations
-        // LSTM expects [seq_len, batch, input_size] or [batch, seq_len, input_size] if batch_first=true
-        auto input_sizes = input_tensor.sizes().vec();
+        // Set to eval mode to disable dropout during inference
+        lstm_module->eval();
         
-        // If tensor is empty or scalar, create a valid tensor
-        if (input_sizes.empty()) {
-            // Create a minimal valid input: [1, 1, input_size]
-            input_tensor = torch::ones({1, 1, input_size});
-        } else if (input_sizes.size() == 1) {
-            // 1D tensor: treat as single feature, add seq_len and batch dimensions
-            input_tensor = input_tensor.reshape({1, 1, input_sizes[0]});
-        } else if (input_sizes.size() == 2) {
-            // 2D tensor: add batch dimension
-            input_tensor = input_tensor.reshape({input_sizes[0], input_sizes[1], 1});
-            // Ensure last dimension is input_size
-            input_tensor = torch::nn::functional::pad(
-                input_tensor, 
-                torch::nn::functional::PadFuncOptions({0, input_size - 1, 0, 0, 0, 0})
-            );
-        } else if (input_sizes.size() >= 3) {
-            // 3D+ tensor: reshape to ensure last dimension is input_size
-            std::vector<int64_t> new_shape = {1, 1, input_size};
-            for (size_t i = 0; i < std::min(size_t(2), input_sizes.size()); ++i) {
-                new_shape[i] = input_sizes[i];
-            }
-            input_tensor = input_tensor.reshape(new_shape);
+        // Create input tensor with correct shape
+        // batch_first=true: [batch, seq_len, input_size]
+        // batch_first=false: [seq_len, batch, input_size]
+        torch::Tensor input_tensor;
+        if (batch_first) {
+            input_tensor = torch::randn({batch_size, seq_len, input_size});
+        } else {
+            input_tensor = torch::randn({seq_len, batch_size, input_size});
+        }
+        
+        // Use remaining fuzz data to modify tensor values
+        if (offset < Size) {
+            size_t remaining = Size - offset;
+            auto flat = input_tensor.flatten();
+            int64_t num_elements = flat.numel();
+            int64_t elements_to_modify = std::min(static_cast<int64_t>(remaining / sizeof(float)), num_elements);
             
-            // Ensure last dimension is input_size
-            if (new_shape[2] != input_size) {
-                input_tensor = torch::nn::functional::pad(
-                    input_tensor, 
-                    torch::nn::functional::PadFuncOptions({0, input_size - new_shape[2], 0, 0, 0, 0})
-                );
+            if (elements_to_modify > 0) {
+                auto accessor = flat.accessor<float, 1>();
+                for (int64_t i = 0; i < elements_to_modify && offset + sizeof(float) <= Size; ++i) {
+                    float val;
+                    std::memcpy(&val, Data + offset, sizeof(float));
+                    offset += sizeof(float);
+                    // Clamp to reasonable range to avoid NaN/Inf issues
+                    if (std::isfinite(val)) {
+                        accessor[i] = std::clamp(val, -10.0f, 10.0f);
+                    }
+                }
             }
         }
         
-        // Create initial hidden state (h0, c0)
-        // h0 and c0 shape: [num_layers * num_directions, batch, hidden_size]
+        // Create initial hidden states
         int64_t num_directions = bidirectional ? 2 : 1;
-        int64_t batch_size = batch_first ? input_tensor.size(0) : input_tensor.size(1);
-        
         torch::Tensor h0 = torch::zeros({num_layers * num_directions, batch_size, hidden_size});
         torch::Tensor c0 = torch::zeros({num_layers * num_directions, batch_size, hidden_size});
         
-        // Forward pass through LSTM
-        auto output = lstm_module->forward(input_tensor, std::make_tuple(h0, c0));
+        // Test forward pass with initial state
+        try {
+            auto output = lstm_module->forward(input_tensor, std::make_tuple(h0, c0));
+            
+            auto output_tensor = std::get<0>(output);
+            auto hidden_state = std::get<1>(output);
+            auto hn = std::get<0>(hidden_state);
+            auto cn = std::get<1>(hidden_state);
+            
+            // Verify output shapes
+            if (batch_first) {
+                assert(output_tensor.size(0) == batch_size);
+                assert(output_tensor.size(1) == seq_len);
+            } else {
+                assert(output_tensor.size(0) == seq_len);
+                assert(output_tensor.size(1) == batch_size);
+            }
+            assert(output_tensor.size(2) == hidden_size * num_directions);
+            
+            // Force computation
+            volatile float val1 = output_tensor.sum().item<float>();
+            volatile float val2 = hn.sum().item<float>();
+            volatile float val3 = cn.sum().item<float>();
+            (void)val1; (void)val2; (void)val3;
+        } catch (const c10::Error&) {
+            // Expected errors from shape mismatches, etc.
+        }
         
-        // Unpack output
-        auto output_tensor = std::get<0>(output);
-        auto hidden_state = std::get<1>(output);
+        // Test forward pass without initial state
+        try {
+            auto output2 = lstm_module->forward(input_tensor);
+            auto output_tensor2 = std::get<0>(output2);
+            volatile float val = output_tensor2.sum().item<float>();
+            (void)val;
+        } catch (const c10::Error&) {
+            // Expected errors
+        }
         
-        // Perform some operations on the output to ensure it's used
-        auto sum = output_tensor.sum();
-        auto h_sum = std::get<0>(hidden_state).sum();
-        auto c_sum = std::get<1>(hidden_state).sum();
+        // Test with different input (zeros)
+        try {
+            torch::Tensor zero_input;
+            if (batch_first) {
+                zero_input = torch::zeros({batch_size, seq_len, input_size});
+            } else {
+                zero_input = torch::zeros({seq_len, batch_size, input_size});
+            }
+            auto output3 = lstm_module->forward(zero_input);
+            volatile float val = std::get<0>(output3).sum().item<float>();
+            (void)val;
+        } catch (const c10::Error&) {
+            // Expected errors
+        }
         
-        // Combine all sums to prevent optimization from removing the computation
-        auto total_sum = sum + h_sum + c_sum;
-        
-        // Access a value to ensure the tensor is materialized
-        float value = total_sum.item<float>();
-        (void)value; // Suppress unused variable warning
+        // Test flatten_parameters (for RNN efficiency)
+        try {
+            lstm_module->flatten_parameters();
+        } catch (const c10::Error&) {
+            // May fail in certain configurations
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    
+    return 0;
 }

@@ -1,11 +1,14 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -38,61 +41,91 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Test different variants of prod
+        // Parse dtype for later use
+        torch::ScalarType dtype = fuzzer_utils::parseDataType(offset < Size ? Data[offset++] : 0);
         
-        // Variant 1: prod over all dimensions
+        // Variant 1: prod over all dimensions (reduces to scalar)
         torch::Tensor result1 = torch::prod(input_tensor);
         
         // Variant 2: prod over specific dimension with keepdim option
-        torch::Tensor result2;
-        if (input_tensor.dim() > 0) {
-            result2 = torch::prod(input_tensor, dim, keepdim);
-        }
-        
-        // Variant 3: prod with dtype specified
-        torch::ScalarType dtype = fuzzer_utils::parseDataType(offset < Size ? Data[offset++] : 0);
-        torch::Tensor result3;
-        try {
-            result3 = torch::prod(input_tensor, dtype);
-        } catch (...) {
-            // Some dtype combinations might not be supported
-        }
-        
-        // Variant 4: prod with dimension, keepdim, and dtype
-        torch::Tensor result4;
         if (input_tensor.dim() > 0) {
             try {
-                result4 = torch::prod(input_tensor, dim, keepdim, dtype);
+                torch::Tensor result2 = torch::prod(input_tensor, dim, keepdim);
+            } catch (...) {
+                // Invalid dimension might throw
+            }
+        }
+        
+        // Variant 3: prod with dimension, keepdim, and dtype
+        if (input_tensor.dim() > 0) {
+            try {
+                torch::Tensor result3 = torch::prod(input_tensor, dim, keepdim, dtype);
             } catch (...) {
                 // Some dtype combinations might not be supported
             }
         }
         
-        // Variant 5: out variant
+        // Variant 4: out variant - need to create output with correct shape
         if (input_tensor.dim() > 0) {
             try {
-                torch::Tensor out = torch::empty_like(input_tensor);
-                torch::prod_out(out, input_tensor, dim, keepdim);
+                // Compute expected output shape
+                std::vector<int64_t> out_shape;
+                int64_t normalized_dim = dim;
+                if (normalized_dim < 0) {
+                    normalized_dim += input_tensor.dim();
+                }
+                
+                if (normalized_dim >= 0 && normalized_dim < input_tensor.dim()) {
+                    for (int64_t i = 0; i < input_tensor.dim(); i++) {
+                        if (i == normalized_dim) {
+                            if (keepdim) {
+                                out_shape.push_back(1);
+                            }
+                        } else {
+                            out_shape.push_back(input_tensor.size(i));
+                        }
+                    }
+                    
+                    torch::Tensor out = torch::empty(out_shape, input_tensor.options());
+                    torch::prod_out(out, input_tensor, dim, keepdim);
+                }
             } catch (...) {
                 // Out variant might have shape compatibility requirements
             }
         }
         
-        // Variant 6: Test with empty tensor
-        if (offset + 1 < Size) {
-            try {
-                std::vector<int64_t> empty_shape = {0};
-                torch::Tensor empty_tensor = torch::empty(empty_shape);
-                torch::Tensor empty_result = torch::prod(empty_tensor);
-            } catch (...) {
-                // Empty tensor might cause issues
+        // Variant 5: Test with empty tensor
+        try {
+            std::vector<int64_t> empty_shape = {0};
+            torch::Tensor empty_tensor = torch::empty(empty_shape);
+            torch::Tensor empty_result = torch::prod(empty_tensor);
+        } catch (...) {
+            // Empty tensor might cause issues
+        }
+        
+        // Variant 6: Test with scalar tensor (0-dimensional)
+        try {
+            torch::Tensor scalar_tensor = torch::tensor(42.0);
+            torch::Tensor scalar_result = torch::prod(scalar_tensor);
+        } catch (...) {
+            // Scalar tensor edge case
+        }
+        
+        // Variant 7: Test with multi-dimensional tensor and different dimensions
+        if (input_tensor.dim() > 1) {
+            for (int64_t d = 0; d < input_tensor.dim(); d++) {
+                try {
+                    torch::Tensor result = torch::prod(input_tensor, d, false);
+                } catch (...) {
+                    // Some dimensions might fail
+                }
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

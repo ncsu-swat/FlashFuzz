@@ -1,6 +1,5 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // Define a simple C++ class to register with torch.classes
 class MyStackClass : public torch::CustomClassHolder {
@@ -30,31 +29,41 @@ public:
     int64_t size() {
         return stack_.size();
     }
+
+    void clear() {
+        stack_.clear();
+    }
 };
+
+// Register the custom C++ class with torch.classes at static initialization time
+static auto registered = torch::class_<MyStackClass>("_TorchScriptTesting", "MyStackClass")
+    .def(torch::init<>())
+    .def("push", &MyStackClass::push)
+    .def("pop", &MyStackClass::pop)
+    .def("getStack", &MyStackClass::getStack)
+    .def("size", &MyStackClass::size)
+    .def("clear", &MyStackClass::clear);
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Register the custom C++ class with torch.classes
-        static auto registered = torch::class_<MyStackClass>("_TorchScriptTesting", "MyStackClass")
-            .def(torch::init<>())
-            .def("push", &MyStackClass::push)
-            .def("pop", &MyStackClass::pop)
-            .def("getStack", &MyStackClass::getStack)
-            .def("size", &MyStackClass::size);
-        
-        // Create an instance of our custom class
-        auto stack_instance = c10::make_intrusive<MyStackClass>();
-        
-        // Ensure we have enough data to create at least one tensor
+        // Ensure we have enough data
         if (Size < 4) {
             return 0;
         }
+        
+        // Create an instance of our custom class
+        auto stack_instance = c10::make_intrusive<MyStackClass>();
         
         // Determine how many tensors to create and push to the stack
         uint8_t num_tensors = Data[offset++] % 5 + 1; // 1-5 tensors
@@ -64,7 +73,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             try {
                 auto tensor = fuzzer_utils::createTensor(Data, Size, offset);
                 stack_instance->push(tensor);
-            } catch (const std::exception& e) {
+            } catch (const std::exception&) {
                 // Continue with the next tensor if one fails
                 continue;
             }
@@ -80,48 +89,60 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Push a tensor with different properties
             if (offset + 2 < Size) {
-                auto another_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                stack_instance->push(another_tensor);
+                try {
+                    auto another_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                    stack_instance->push(another_tensor);
+                } catch (const std::exception&) {
+                    // Ignore tensor creation failures
+                }
             }
             
-            // Test edge case: pop until empty and then try to pop again
+            // Test edge case: pop until empty
             while (stack_instance->size() > 0) {
                 stack_instance->pop();
             }
             
-            // This should throw an exception which we catch in the outer try-catch
-            if (Data[0] % 2 == 0) { // Only do this sometimes to avoid always throwing
+            // Test expected exception on empty stack pop
+            if (Data[0] % 2 == 0) {
                 try {
-                    stack_instance->pop();
+                    stack_instance->pop(); // Should throw
                 } catch (const std::runtime_error&) {
                     // Expected exception, continue
                 }
             }
         }
         
-        // Create a new instance and test with potentially problematic tensors
+        // Create a new instance and test with potentially different tensor configurations
         auto another_instance = c10::make_intrusive<MyStackClass>();
         
         if (offset < Size) {
             try {
-                // Try to create a tensor with extreme values
-                auto extreme_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                another_instance->push(extreme_tensor);
+                auto tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                another_instance->push(tensor);
                 
-                // Try operations with the extreme tensor
+                // Verify size tracking
+                if (another_instance->size() != 1) {
+                    return 0; // Sanity check
+                }
+                
+                // Get stack and verify
                 auto stack = another_instance->getStack();
-                if (another_instance->size() > 0) {
-                    another_instance->pop();
+                
+                // Test clear operation
+                another_instance->clear();
+                
+                if (another_instance->size() != 0) {
+                    return 0; // Sanity check
                 }
             } catch (const std::exception&) {
-                // Continue execution
+                // Continue execution for inner exceptions
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

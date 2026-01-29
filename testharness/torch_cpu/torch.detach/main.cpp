@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -21,74 +25,65 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply torch.detach operation
         torch::Tensor detached_tensor = input_tensor.detach();
         
-        // Verify detached tensor properties
-        if (detached_tensor.requires_grad()) {
-            throw std::runtime_error("Detached tensor should not require gradients");
-        }
+        // Verify detached tensor does not require gradients
+        assert(!detached_tensor.requires_grad());
         
-        // Verify that detached tensor has the same data as the original
-        if (!torch::allclose(input_tensor, detached_tensor)) {
-            throw std::runtime_error("Detached tensor data differs from original tensor");
-        }
+        // Verify that detached tensor shares data with the original
+        assert(torch::equal(input_tensor, detached_tensor));
         
-        // Test detach on tensor that requires gradients
+        // Test detach on tensor that requires gradients (only floating point can have gradients)
         if (input_tensor.is_floating_point()) {
             auto grad_tensor = input_tensor.clone().set_requires_grad(true);
             auto detached_grad_tensor = grad_tensor.detach();
             
             // Verify detached tensor doesn't require gradients
-            if (detached_grad_tensor.requires_grad()) {
-                throw std::runtime_error("Detached tensor from grad tensor should not require gradients");
-            }
+            assert(!detached_grad_tensor.requires_grad());
             
             // Verify data is the same
-            if (!torch::allclose(grad_tensor, detached_grad_tensor)) {
-                throw std::runtime_error("Detached tensor data differs from original tensor with gradients");
-            }
+            assert(torch::allclose(grad_tensor, detached_grad_tensor));
         }
         
         // Test detach_() in-place operation
-        if (offset + 1 < Size && Data[offset] % 2 == 0) {
-            auto clone_tensor = input_tensor.clone();
-            if (clone_tensor.is_floating_point()) {
-                clone_tensor.set_requires_grad(true);
+        if (Size > offset && Data[offset % Size] % 2 == 0) {
+            if (input_tensor.is_floating_point()) {
+                auto clone_tensor = input_tensor.clone().set_requires_grad(true);
                 clone_tensor.detach_();
                 
                 // Verify in-place detached tensor doesn't require gradients
-                if (clone_tensor.requires_grad()) {
-                    throw std::runtime_error("In-place detached tensor should not require gradients");
-                }
+                assert(!clone_tensor.requires_grad());
                 
                 // Verify data is the same as original
-                if (!torch::allclose(input_tensor, clone_tensor)) {
-                    throw std::runtime_error("In-place detached tensor data differs from original tensor");
-                }
+                assert(torch::allclose(input_tensor, clone_tensor));
             }
         }
         
-        // Test detach on view
-        if (offset + 1 < Size && input_tensor.numel() > 0 && input_tensor.dim() > 0) {
-            auto view_tensor = input_tensor;
-            if (view_tensor.is_floating_point()) {
-                view_tensor.set_requires_grad(true);
+        // Test detach on a view
+        if (Size > offset && input_tensor.numel() > 0 && input_tensor.dim() > 0) {
+            if (input_tensor.is_floating_point()) {
+                auto base_tensor = input_tensor.clone().set_requires_grad(true);
                 
-                // Create a view
-                auto view = view_tensor.slice(0, 0, view_tensor.size(0));
+                // Create a view via slice
+                auto view = base_tensor.slice(0, 0, base_tensor.size(0));
                 
                 // Detach the view
                 auto detached_view = view.detach();
                 
                 // Verify detached view doesn't require gradients
-                if (detached_view.requires_grad()) {
-                    throw std::runtime_error("Detached view should not require gradients");
-                }
+                assert(!detached_view.requires_grad());
             }
+        }
+        
+        // Test detach on contiguous tensor
+        if (Size > offset + 1 && Data[(offset + 1) % Size] % 3 == 0) {
+            auto contiguous_tensor = input_tensor.contiguous();
+            auto detached_contiguous = contiguous_tensor.detach();
+            assert(torch::equal(contiguous_tensor, detached_contiguous));
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

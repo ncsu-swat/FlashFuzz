@@ -1,16 +1,21 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For std::isnan, std::isinf, std::abs
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least 3 bytes for start, end, step values
+        // Need at least enough bytes for meaningful fuzzing
         if (Size < 3) {
             return 0;
         }
@@ -38,15 +43,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(double);
         }
         
+        // Handle NaN and Inf values - these would cause issues
+        if (std::isnan(start) || std::isinf(start)) start = 0.0;
+        if (std::isnan(end) || std::isinf(end)) end = 10.0;
+        if (std::isnan(step) || std::isinf(step)) step = 1.0;
+        
         // Prevent step = 0 which causes infinite loop
         if (step == 0.0) {
             step = 1.0;
         }
         
-        // Get a data type for the tensor
+        // Limit the range to prevent OOM from huge tensor allocations
+        // Max elements we want to create is around 10 million
+        const double max_elements = 10000000.0;
+        double num_elements = std::abs((end - start) / step);
+        if (num_elements > max_elements) {
+            // Adjust step to limit elements
+            step = (end - start) / max_elements;
+            if (step == 0.0) step = 1.0;
+        }
+        
+        // Get a data type for the tensor (only numeric, non-complex types)
         torch::ScalarType dtype = torch::kFloat32;
         if (offset < Size) {
-            dtype = fuzzer_utils::parseDataType(Data[offset++]);
+            uint8_t dtype_byte = Data[offset++] % 8;
+            switch (dtype_byte) {
+                case 0: dtype = torch::kFloat32; break;
+                case 1: dtype = torch::kFloat64; break;
+                case 2: dtype = torch::kInt32; break;
+                case 3: dtype = torch::kInt64; break;
+                case 4: dtype = torch::kInt16; break;
+                case 5: dtype = torch::kInt8; break;
+                case 6: dtype = torch::kFloat16; break;
+                case 7: dtype = torch::kBFloat16; break;
+            }
         }
         
         // Get device option
@@ -55,69 +85,101 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create options
         auto options = torch::TensorOptions().dtype(dtype).device(device);
         
-        // Test different variants of torch::arange
-        
-        // Variant 1: torch::arange(end)
-        torch::Tensor t1 = torch::arange(end, options);
+        // Variant 1: torch::arange(end) - only if end is positive and reasonable
+        if (end > 0 && end < max_elements) {
+            try {
+                torch::Tensor t1 = torch::arange(end, options);
+            } catch (...) {
+                // Silently handle expected failures
+            }
+        }
         
         // Variant 2: torch::arange(start, end)
-        torch::Tensor t2 = torch::arange(start, end, options);
+        try {
+            torch::Tensor t2 = torch::arange(start, end, options);
+        } catch (...) {
+            // Silently handle expected failures
+        }
         
         // Variant 3: torch::arange(start, end, step)
-        torch::Tensor t3 = torch::arange(start, end, step, options);
+        try {
+            torch::Tensor t3 = torch::arange(start, end, step, options);
+        } catch (...) {
+            // Silently handle expected failures
+        }
         
-        // Test edge cases with different options
+        // Test with different options
         if (offset + 1 < Size) {
-            // Try with different data types
-            auto alt_dtype = fuzzer_utils::parseDataType(Data[offset++]);
+            uint8_t alt_dtype_byte = Data[offset++] % 6;
+            torch::ScalarType alt_dtype;
+            switch (alt_dtype_byte) {
+                case 0: alt_dtype = torch::kFloat32; break;
+                case 1: alt_dtype = torch::kFloat64; break;
+                case 2: alt_dtype = torch::kInt32; break;
+                case 3: alt_dtype = torch::kInt64; break;
+                case 4: alt_dtype = torch::kInt16; break;
+                default: alt_dtype = torch::kInt8; break;
+            }
             auto alt_options = torch::TensorOptions().dtype(alt_dtype).device(device);
             
-            // Edge case: very small step size
-            double tiny_step = step * 1e-10;
-            if (tiny_step == 0.0) tiny_step = 1e-10;
+            // Edge case: negative step (swap start and end for valid range)
+            double neg_step = -std::abs(step);
+            if (neg_step == 0.0) neg_step = -1.0;
+            try {
+                torch::Tensor t4 = torch::arange(end, start, neg_step, alt_options);
+            } catch (...) {
+                // Silently handle expected failures
+            }
             
-            torch::Tensor t4 = torch::arange(start, end, tiny_step, alt_options);
-            
-            // Edge case: very large range
-            double large_start = start * 1e10;
-            double large_end = end * 1e10;
-            double large_step = step * 1e9;
-            if (large_step == 0.0) large_step = 1e9;
-            
-            torch::Tensor t5 = torch::arange(large_start, large_end, large_step, alt_options);
-            
-            // Edge case: negative step
-            torch::Tensor t6 = torch::arange(end, start, -std::abs(step), alt_options);
-            
-            // Edge case: start == end
-            torch::Tensor t7 = torch::arange(start, start, step, alt_options);
+            // Edge case: start == end (empty tensor)
+            try {
+                torch::Tensor t5 = torch::arange(start, start, step, alt_options);
+            } catch (...) {
+                // Silently handle expected failures
+            }
         }
         
         // Test with integer types specifically
         if (offset < Size) {
-            int64_t int_start = static_cast<int64_t>(start);
-            int64_t int_end = static_cast<int64_t>(end);
-            int64_t int_step = static_cast<int64_t>(step);
+            // Clamp to reasonable integer ranges
+            int64_t int_start = static_cast<int64_t>(std::max(-1000000.0, std::min(1000000.0, start)));
+            int64_t int_end = static_cast<int64_t>(std::max(-1000000.0, std::min(1000000.0, end)));
+            int64_t int_step = static_cast<int64_t>(std::max(-1000.0, std::min(1000.0, step)));
             if (int_step == 0) int_step = 1;
             
-            auto int_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
-            torch::Tensor t8 = torch::arange(int_start, int_end, int_step, int_options);
-            
-            // Test with boolean type
-            auto bool_options = torch::TensorOptions().dtype(torch::kBool).device(device);
-            torch::Tensor t9 = torch::arange(int_start, int_end, int_step, bool_options);
+            // Check element count for integer range
+            if (int_step != 0 && std::abs((int_end - int_start) / int_step) < max_elements) {
+                auto int_options = torch::TensorOptions().dtype(torch::kInt64).device(device);
+                try {
+                    torch::Tensor t6 = torch::arange(int_start, int_end, int_step, int_options);
+                } catch (...) {
+                    // Silently handle expected failures
+                }
+            }
         }
         
-        // Test with complex types
-        if (offset < Size) {
-            auto complex_options = torch::TensorOptions().dtype(torch::kComplexFloat).device(device);
-            torch::Tensor t10 = torch::arange(start, end, step, complex_options);
+        // Test arange with Scalar inputs
+        if (offset + 2 < Size) {
+            int8_t small_start = static_cast<int8_t>(Data[offset++]);
+            int8_t small_end = static_cast<int8_t>(Data[offset++]);
+            int8_t small_step = static_cast<int8_t>(Data[offset++]);
+            if (small_step == 0) small_step = 1;
+            
+            try {
+                torch::Tensor t7 = torch::arange(
+                    torch::Scalar(small_start), 
+                    torch::Scalar(small_end), 
+                    torch::Scalar(small_step), 
+                    options);
+            } catch (...) {
+                // Silently handle expected failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

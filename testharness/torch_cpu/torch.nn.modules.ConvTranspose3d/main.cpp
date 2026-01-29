@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -100,12 +105,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             padding_w = Data[offset++] % 3;
         }
         
-        // Parse output_padding
+        // Parse dilation
+        uint8_t dilation_d = 1, dilation_h = 1, dilation_w = 1;
+        if (offset + 3 <= Size) {
+            dilation_d = (Data[offset++] % 2) + 1;
+            dilation_h = (Data[offset++] % 2) + 1;
+            dilation_w = (Data[offset++] % 2) + 1;
+        }
+        
+        // Parse output_padding - must be less than max(stride, dilation)
         uint8_t output_padding_d = 0, output_padding_h = 0, output_padding_w = 0;
         if (offset + 3 <= Size) {
-            output_padding_d = Data[offset++] % 2;
-            output_padding_h = Data[offset++] % 2;
-            output_padding_w = Data[offset++] % 2;
+            uint8_t max_d = std::max(stride_d, dilation_d);
+            uint8_t max_h = std::max(stride_h, dilation_h);
+            uint8_t max_w = std::max(stride_w, dilation_w);
+            
+            output_padding_d = (max_d > 1) ? (Data[offset++] % (max_d - 1)) : 0;
+            if (offset <= Size) output_padding_h = (max_h > 1) ? (Data[offset++] % (max_h - 1)) : 0;
+            if (offset <= Size) output_padding_w = (max_w > 1) ? (Data[offset++] % (max_w - 1)) : 0;
         }
         
         // Parse groups
@@ -118,14 +135,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         bool bias = true;
         if (offset < Size) {
             bias = Data[offset++] % 2 == 0;
-        }
-        
-        // Parse dilation
-        uint8_t dilation_d = 1, dilation_h = 1, dilation_w = 1;
-        if (offset + 3 <= Size) {
-            dilation_d = (Data[offset++] % 2) + 1;
-            dilation_h = (Data[offset++] % 2) + 1;
-            dilation_w = (Data[offset++] % 2) + 1;
         }
         
         // Get input channels from the input tensor
@@ -152,11 +161,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         torch::nn::ConvTranspose3d conv_transpose = torch::nn::ConvTranspose3d(options);
         
-        // Apply the ConvTranspose3d operation
-        torch::Tensor output = conv_transpose->forward(input);
-        
-        // Perform some operations on the output to ensure it's used
-        auto sum = output.sum();
+        // Inner try-catch for expected runtime failures (shape mismatches, etc.)
+        try {
+            // Apply the ConvTranspose3d operation
+            torch::Tensor output = conv_transpose->forward(input);
+            
+            // Perform some operations on the output to ensure it's used
+            auto sum = output.sum();
+            (void)sum;
+        } catch (const c10::Error&) {
+            // Expected failures due to shape constraints - silently ignore
+        }
         
         return 0; // keep the input
     }
@@ -165,5 +180,4 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         std::cerr << "Exception caught: " << e.what() << std::endl;
         return -1; // discard the input
     }
-    return 0; // keep the input
 }

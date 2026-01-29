@@ -1,11 +1,38 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstdint>        // For uint64_t
+
+// Custom autograd function defined outside the fuzzer entry point
+class CustomFunction : public torch::autograd::Function<CustomFunction> {
+public:
+    static torch::Tensor forward(
+        torch::autograd::AutogradContext *ctx,
+        const torch::Tensor& input) {
+        
+        ctx->save_for_backward({input});
+        return input.clone();
+    }
+    
+    static torch::autograd::tensor_list backward(
+        torch::autograd::AutogradContext *ctx,
+        torch::autograd::tensor_list grad_outputs) {
+        
+        auto saved = ctx->get_saved_variables();
+        auto input = saved[0];
+        
+        return {grad_outputs[0].clone()};
+    }
+};
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -108,26 +135,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test autograd::Function API
         if (offset < Size) {
-            class CustomFunction : public torch::autograd::Function<CustomFunction> {
-            public:
-                static torch::Tensor forward(
-                    torch::autograd::AutogradContext *ctx,
-                    const torch::Tensor& input) {
-                    
-                    ctx->save_for_backward({input});
-                    return input.clone();
-                }
-                
-                static torch::autograd::tensor_list backward(
-                    torch::autograd::AutogradContext *ctx,
-                    torch::autograd::tensor_list grad_outputs) {
-                    
-                    auto saved = ctx->get_saved_variables();
-                    auto input = saved[0];
-                    
-                    return {grad_outputs[0].clone()};
-                }
-            };
+            // Zero out gradients before using custom function
+            if (input_tensor.grad().defined()) {
+                input_tensor.grad().zero_();
+            }
             
             auto result = CustomFunction::apply(input_tensor);
             auto output = result.sum();
@@ -137,7 +148,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

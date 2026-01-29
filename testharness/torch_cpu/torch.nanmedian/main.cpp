@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -33,72 +38,103 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset++;
         }
         
-        // Test different variants of nanmedian
-        
-        // Variant 1: Basic nanmedian (no arguments)
-        torch::Tensor result1 = torch::nanmedian(input);
+        // Variant 1: Basic nanmedian (no arguments) - returns scalar tensor
+        try {
+            torch::Tensor result1 = torch::nanmedian(input);
+            (void)result1;
+        } catch (...) {
+            // Silently catch expected failures (e.g., empty tensor)
+        }
         
         // Variant 2: nanmedian with dimension
         if (input.dim() > 0) {
-            // Ensure dim is within valid range for the tensor
-            dim = dim % std::max<int64_t>(1, input.dim());
-            
-            // Handle negative dim values
-            if (dim < 0) {
-                dim += input.dim();
-            }
-            
-            // Call nanmedian with dimension
-            auto result2 = torch::nanmedian(input, dim, keepdim);
-            
-            // Unpack the values and indices
-            torch::Tensor values = std::get<0>(result2);
-            torch::Tensor indices = std::get<1>(result2);
-        }
-        
-        // Variant 3: nanmedian with named dimension
-        if (input.dim() > 0 && !input.names().empty()) {
             try {
-                // Get the first named dimension if available
-                auto dimname = input.names()[0];
-                auto result3 = torch::nanmedian(input, dimname, keepdim);
+                // Ensure dim is within valid range for the tensor
+                int64_t valid_dim = dim % input.dim();
                 
-                // Unpack the values and indices
-                torch::Tensor values = std::get<0>(result3);
-                torch::Tensor indices = std::get<1>(result3);
+                // Handle negative dim values properly
+                if (valid_dim < 0) {
+                    valid_dim += input.dim();
+                }
+                
+                // Call nanmedian with dimension - returns tuple of (values, indices)
+                auto result2 = torch::nanmedian(input, valid_dim, keepdim);
+                
+                // Access the values and indices to ensure they're computed
+                torch::Tensor values = std::get<0>(result2);
+                torch::Tensor indices = std::get<1>(result2);
+                (void)values;
+                (void)indices;
             } catch (...) {
-                // Ignore errors with named dimensions
+                // Silently catch expected failures (shape issues, etc.)
             }
         }
         
-        // Variant 4: Test with out parameter
+        // Variant 3: Test with out parameter
+        if (input.dim() > 0 && input.numel() > 0) {
+            try {
+                int64_t valid_dim = dim % input.dim();
+                if (valid_dim < 0) {
+                    valid_dim += input.dim();
+                }
+                
+                // Create output tensors with correct shapes
+                std::vector<int64_t> out_shape;
+                auto in_sizes = input.sizes().vec();
+                
+                if (keepdim) {
+                    out_shape = in_sizes;
+                    out_shape[valid_dim] = 1;
+                } else {
+                    for (int64_t i = 0; i < static_cast<int64_t>(in_sizes.size()); i++) {
+                        if (i != valid_dim) {
+                            out_shape.push_back(in_sizes[i]);
+                        }
+                    }
+                    // Handle scalar case when reducing 1D tensor
+                    if (out_shape.empty()) {
+                        out_shape.push_back(1);
+                    }
+                }
+                
+                // Create output tensors - values should match input dtype, indices are Long
+                torch::Tensor values_out = torch::empty(out_shape, input.options());
+                torch::Tensor indices_out = torch::empty(out_shape, input.options().dtype(torch::kLong));
+                
+                // Call nanmedian_out
+                torch::nanmedian_out(values_out, indices_out, input, valid_dim, keepdim);
+                (void)values_out;
+                (void)indices_out;
+            } catch (...) {
+                // Silently catch expected failures
+            }
+        }
+        
+        // Variant 4: Test with different tensor types
         if (input.dim() > 0) {
-            dim = dim % std::max<int64_t>(1, input.dim());
-            if (dim < 0) {
-                dim += input.dim();
+            try {
+                // Try with float tensor explicitly
+                torch::Tensor float_input = input.to(torch::kFloat);
+                torch::Tensor result = torch::nanmedian(float_input);
+                (void)result;
+            } catch (...) {
+                // Silently catch
             }
             
-            // Create output tensors
-            std::vector<int64_t> out_shape;
-            if (keepdim) {
-                out_shape = input.sizes().vec();
-                out_shape[dim] = 1;
-            } else {
-                out_shape = input.sizes().vec();
-                out_shape.erase(out_shape.begin() + dim);
+            try {
+                // Try with double tensor
+                torch::Tensor double_input = input.to(torch::kDouble);
+                torch::Tensor result = torch::nanmedian(double_input);
+                (void)result;
+            } catch (...) {
+                // Silently catch
             }
-            
-            torch::Tensor values_out = torch::empty(out_shape, input.options());
-            torch::Tensor indices_out = torch::empty(out_shape, torch::kLong);
-            
-            // Call nanmedian with out parameter
-            torch::nanmedian_out(values_out, indices_out, input, dim, keepdim);
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

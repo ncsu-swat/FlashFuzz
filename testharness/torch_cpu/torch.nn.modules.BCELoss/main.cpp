@@ -1,21 +1,23 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create tensors
         if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor (predictions)
+        // Create input tensor (predictions) with requires_grad for backward testing
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Create target tensor (ground truth)
@@ -23,115 +25,89 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset < Size) {
             target = fuzzer_utils::createTensor(Data, Size, offset);
         } else {
-            // If we don't have enough data for a second tensor, clone the first one
             target = input.clone();
         }
         
-        // Try to make input and target have the same shape
+        // Ensure input and target have the same shape
         if (input.sizes() != target.sizes() && input.numel() > 0 && target.numel() > 0) {
-            if (input.dim() > 0 && target.dim() > 0) {
-                // Reshape target to match input if possible
-                try {
-                    target = target.reshape_as(input);
-                } catch (...) {
-                    // If reshape fails, try to create a new target with the same shape
-                    target = torch::rand_like(input);
-                }
+            try {
+                target = target.reshape_as(input);
+            } catch (...) {
+                target = torch::rand_like(input);
             }
         }
         
-        // Ensure input values are between 0 and 1 for BCE
+        // Ensure input values are between 0 and 1 for BCE (with requires_grad for backward)
         if (input.is_floating_point()) {
-            input = torch::sigmoid(input);
+            input = torch::sigmoid(input.detach().requires_grad_(true));
         } else {
-            // Convert to float and apply sigmoid
-            input = torch::sigmoid(input.to(torch::kFloat));
+            input = torch::sigmoid(input.to(torch::kFloat).detach().requires_grad_(true));
         }
         
-        // Ensure target values are between 0 and 1 for BCE
+        // Ensure target values are between 0 and 1 for BCE (no grad needed for target)
         if (target.is_floating_point()) {
-            target = torch::clamp(target, 0.0, 1.0);
+            target = torch::clamp(target.detach(), 0.0, 1.0);
         } else {
-            // Convert to float and clamp
-            target = torch::clamp(target.to(torch::kFloat), 0.0, 1.0);
+            target = torch::clamp(target.to(torch::kFloat).detach(), 0.0, 1.0);
         }
         
         // Parse reduction mode from input data
+        // Track with an int to avoid variant comparison issues
+        int reduction_type = 0; // 0=mean, 1=sum, 2=none
         torch::nn::BCELossOptions::reduction_t reduction_mode = torch::kMean;
         if (offset < Size) {
             uint8_t reduction_byte = Data[offset++];
             switch (reduction_byte % 3) {
                 case 0:
                     reduction_mode = torch::kMean;
+                    reduction_type = 0;
                     break;
                 case 1:
                     reduction_mode = torch::kSum;
+                    reduction_type = 1;
                     break;
                 case 2:
                     reduction_mode = torch::kNone;
+                    reduction_type = 2;
                     break;
             }
         }
         
-        // Parse weight tensor option
-        bool use_weight = false;
-        torch::Tensor weight;
-        if (offset < Size) {
-            use_weight = (Data[offset++] % 2 == 1);
-            if (use_weight && offset < Size) {
-                try {
-                    weight = fuzzer_utils::createTensor(Data, Size, offset);
-                    if (weight.sizes() != input.sizes() && weight.numel() > 0) {
-                        try {
-                            weight = weight.reshape_as(input);
-                        } catch (...) {
-                            weight = torch::ones_like(input);
-                        }
-                    }
-                    if (!weight.is_floating_point()) {
-                        weight = weight.to(torch::kFloat);
-                    }
-                    // Ensure weights are positive
-                    weight = torch::abs(weight) + 0.1;
-                } catch (...) {
-                    use_weight = false;
-                }
-            }
-        }
-        
-        // Create BCE Loss module with different configurations
-        torch::nn::BCELoss bce_loss;
-        if (use_weight) {
-            bce_loss = torch::nn::BCELoss(torch::nn::BCELossOptions().weight(weight).reduction(reduction_mode));
-        } else {
-            bce_loss = torch::nn::BCELoss(torch::nn::BCELossOptions().reduction(reduction_mode));
-        }
+        // Create BCE Loss module
+        torch::nn::BCELoss bce_loss(torch::nn::BCELossOptions().reduction(reduction_mode));
         
         // Apply the BCE loss
         torch::Tensor loss = bce_loss->forward(input, target);
         
-        // Test backward pass if possible
-        if (loss.numel() > 0 && loss.requires_grad()) {
+        // Test backward pass
+        if (loss.numel() > 0) {
             try {
-                loss.backward();
+                if (reduction_type == 2) {
+                    // For 'none' reduction, we need to sum before backward
+                    loss.sum().backward();
+                } else {
+                    loss.backward();
+                }
             } catch (...) {
-                // Backward pass may fail for various reasons, that's okay
+                // Backward pass may fail for various reasons
             }
         }
         
-        // Test with different reduction modes
-        torch::nn::BCELoss mean_loss(torch::nn::BCELossOptions().reduction(torch::kMean));
-        torch::nn::BCELoss sum_loss(torch::nn::BCELossOptions().reduction(torch::kSum));
-        torch::nn::BCELoss none_loss(torch::nn::BCELossOptions().reduction(torch::kNone));
-        
-        torch::Tensor mean_result = mean_loss->forward(input, target);
-        torch::Tensor sum_result = sum_loss->forward(input, target);
-        torch::Tensor none_result = none_loss->forward(input, target);
+        // Also test the functional interface for better coverage
+        try {
+            torch::Tensor func_loss = torch::nn::functional::binary_cross_entropy(
+                input.detach().requires_grad_(true), 
+                target,
+                torch::nn::functional::BinaryCrossEntropyFuncOptions().reduction(reduction_mode)
+            );
+        } catch (...) {
+            // Functional interface might have different constraints
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

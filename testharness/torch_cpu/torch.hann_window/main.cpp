@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -16,10 +21,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Parse window_length from input data
+        // Use a reasonable range to avoid excessive rejections
         int64_t window_length = 0;
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&window_length, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
+            // Limit to reasonable range to improve fuzzing efficiency
+            window_length = window_length % 10000;
         } else {
             // If not enough data, use a single byte
             window_length = static_cast<int64_t>(Data[offset++]);
@@ -31,32 +39,29 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             periodic = static_cast<bool>(Data[offset++] & 0x01);
         }
         
-        // Parse dtype
+        // Parse dtype - limit to floating point types that hann_window supports
         torch::ScalarType dtype = torch::kFloat;
         if (offset < Size) {
-            dtype = fuzzer_utils::parseDataType(Data[offset++]);
+            uint8_t dtype_selector = Data[offset++] % 4;
+            switch (dtype_selector) {
+                case 0: dtype = torch::kFloat; break;
+                case 1: dtype = torch::kDouble; break;
+                case 2: dtype = torch::kHalf; break;
+                case 3: dtype = torch::kBFloat16; break;
+            }
         }
         
-        // Parse layout
-        torch::Layout layout = torch::kStrided;
-        if (offset < Size) {
-            layout = (Data[offset++] % 2 == 0) ? torch::kStrided : torch::kSparse;
-        }
-        
-        // Parse device
-        torch::Device device = torch::kCPU;
-        
-        // Parse requires_grad
+        // Parse requires_grad - only valid for floating point types
         bool requires_grad = false;
         if (offset < Size) {
             requires_grad = static_cast<bool>(Data[offset++] & 0x01);
         }
         
-        // Create options
+        // Create options - hann_window only supports strided layout
         auto options = torch::TensorOptions()
             .dtype(dtype)
-            .layout(layout)
-            .device(device)
+            .layout(torch::kStrided)
+            .device(torch::kCPU)
             .requires_grad(requires_grad);
         
         // Call hann_window with different combinations of parameters
@@ -64,58 +69,95 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Basic call with just window_length
             torch::Tensor result1 = torch::hann_window(window_length);
             
-            // Call with window_length and periodic flag
-            torch::Tensor result2 = torch::hann_window(window_length, periodic);
-            
-            // Call with window_length, periodic flag, and options
-            torch::Tensor result3 = torch::hann_window(window_length, periodic, options);
+            // Verify the result has expected properties
+            if (window_length > 0) {
+                (void)result1.size(0);
+                (void)result1.dtype();
+            }
         } catch (const c10::Error &e) {
-            // PyTorch-specific exceptions are expected and handled
+            // Expected for invalid window_length (e.g., negative)
         }
         
-        // Try with a tensor input for window_length - convert to scalar
         try {
-            if (offset < Size) {
-                torch::Tensor window_length_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+            // Call with window_length and periodic flag
+            torch::Tensor result2 = torch::hann_window(window_length, periodic);
+        } catch (const c10::Error &e) {
+            // Expected for invalid parameters
+        }
+        
+        try {
+            // Call with window_length, periodic flag, and options
+            torch::Tensor result3 = torch::hann_window(window_length, periodic, options);
+            
+            // Access result to ensure computation happened
+            if (window_length > 0) {
+                (void)result3.sum();
+            }
+        } catch (const c10::Error &e) {
+            // Expected for invalid parameter combinations
+        }
+        
+        // Try with different specific window lengths to improve coverage
+        try {
+            // Edge cases
+            torch::Tensor result_zero = torch::hann_window(0);
+            torch::Tensor result_one = torch::hann_window(1);
+            torch::Tensor result_two = torch::hann_window(2);
+        } catch (const c10::Error &e) {
+            // Edge cases may throw
+        }
+        
+        // Try with different dtypes explicitly
+        try {
+            if (window_length >= 0) {
+                auto float_options = torch::TensorOptions().dtype(torch::kFloat);
+                torch::Tensor result_float = torch::hann_window(window_length, periodic, float_options);
+            }
+        } catch (const c10::Error &e) {
+            // Expected for some parameter combinations
+        }
+        
+        try {
+            if (window_length >= 0) {
+                auto double_options = torch::TensorOptions().dtype(torch::kDouble);
+                torch::Tensor result_double = torch::hann_window(window_length, periodic, double_options);
+            }
+        } catch (const c10::Error &e) {
+            // Expected for some parameter combinations
+        }
+        
+        // Test with requires_grad enabled for gradient computation paths
+        try {
+            if (window_length > 0) {
+                auto grad_options = torch::TensorOptions()
+                    .dtype(torch::kFloat)
+                    .requires_grad(true);
+                torch::Tensor result_grad = torch::hann_window(window_length, periodic, grad_options);
                 
-                // Only proceed if the tensor can be interpreted as a scalar
-                if (window_length_tensor.numel() == 1) {
-                    int64_t scalar_window_length = window_length_tensor.item<int64_t>();
-                    
-                    torch::Tensor result4 = torch::hann_window(scalar_window_length);
-                    
-                    // With periodic flag
-                    torch::Tensor result5 = torch::hann_window(scalar_window_length, periodic);
-                    
-                    // With options
-                    torch::Tensor result6 = torch::hann_window(scalar_window_length, periodic, options);
+                // Trigger backward path if requires_grad
+                if (result_grad.requires_grad()) {
+                    auto sum = result_grad.sum();
+                    sum.backward();
                 }
             }
         } catch (const c10::Error &e) {
-            // PyTorch-specific exceptions are expected and handled
+            // Expected for some cases
         }
         
-        // Try with different dtypes
+        // Test both periodic modes explicitly
         try {
-            auto float_options = torch::TensorOptions().dtype(torch::kFloat);
-            torch::Tensor result7 = torch::hann_window(window_length, periodic, float_options);
-            
-            auto double_options = torch::TensorOptions().dtype(torch::kDouble);
-            torch::Tensor result8 = torch::hann_window(window_length, periodic, double_options);
-            
-            auto half_options = torch::TensorOptions().dtype(torch::kHalf);
-            torch::Tensor result9 = torch::hann_window(window_length, periodic, half_options);
-            
-            auto complex_options = torch::TensorOptions().dtype(torch::kComplexFloat);
-            torch::Tensor result10 = torch::hann_window(window_length, periodic, complex_options);
+            if (window_length > 0) {
+                torch::Tensor result_periodic = torch::hann_window(window_length, true);
+                torch::Tensor result_symmetric = torch::hann_window(window_length, false);
+            }
         } catch (const c10::Error &e) {
-            // PyTorch-specific exceptions are expected and handled
+            // Expected for some parameter combinations
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

@@ -1,13 +1,20 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <fstream>        // For file operations
 #include <string>         // For string operations
 #include <torch/script.h> // For torch::jit functions
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
+    // Use a fixed temporary filename to avoid filesystem pollution
+    std::string filename = "/tmp/jit_save_fuzzer_test.pt";
+    
     try
     {
         size_t offset = 0;
@@ -24,9 +31,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Register the tensor as a parameter in the module
         module.register_parameter("test_param", tensor, false);
-        
-        // Create a temporary filename for saving
-        std::string filename = "/tmp/jit_save_fuzzer_" + std::to_string(reinterpret_cast<uintptr_t>(Data));
         
         // Try different save options based on remaining data
         if (offset < Size) {
@@ -85,6 +89,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Try to load the saved module to verify it works
         try {
             torch::jit::Module loaded_module = torch::jit::load(filename);
+            (void)loaded_module; // Suppress unused variable warning
         } catch (...) {
             // Ignore load errors - we're testing save functionality
         }
@@ -94,8 +99,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     }
     catch (const std::exception &e)
     {
+        // Clean up the temporary file on exception
+        std::remove(filename.c_str());
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

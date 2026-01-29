@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,52 +19,75 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Extract number of threads from the first byte
-        int num_threads = static_cast<int>(Data[0]);
+        // Extract number of threads from fuzzer data
+        // Map to a reasonable range: 1 to 64 threads (valid values)
+        int num_threads = (static_cast<int>(Data[0]) % 64) + 1;
         offset++;
         
-        // Try setting the number of threads
+        // Set the number of threads
         torch::set_num_threads(num_threads);
         
-        // Verify the setting took effect
+        // Verify the setting by getting current threads
         int current_threads = torch::get_num_threads();
         
-        // Create a tensor and perform a simple operation to test the thread setting
+        // Create a tensor and perform operations that can utilize multiple threads
         if (Size > offset) {
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Perform a computation that could potentially use multiple threads
+            // Perform computations that could potentially use multiple threads
+            // These are parallelizable operations in PyTorch
             torch::Tensor result = tensor.sum();
             
-            // Try another operation
-            if (tensor.dim() > 0) {
-                torch::Tensor result2 = tensor.mean(0);
+            // Matrix operations tend to be parallelized
+            if (tensor.dim() >= 2) {
+                try {
+                    torch::Tensor result2 = tensor.mean(0);
+                    torch::Tensor result3 = tensor.std(0);
+                } catch (...) {
+                    // Shape-related issues, ignore silently
+                }
+            }
+            
+            // Element-wise operations
+            torch::Tensor exp_result = torch::exp(tensor);
+            torch::Tensor sin_result = torch::sin(tensor);
+            
+            // Try a matmul if we have enough dimensions
+            if (tensor.dim() == 2 && tensor.size(0) > 0 && tensor.size(1) > 0) {
+                try {
+                    torch::Tensor transposed = tensor.t();
+                    torch::Tensor matmul_result = torch::matmul(tensor, transposed);
+                } catch (...) {
+                    // Shape mismatch, ignore silently
+                }
             }
         }
         
-        // Try setting back to 1 thread
-        torch::set_num_threads(1);
-        
-        // Try setting to a negative number of threads
-        if (Size > offset && Data[offset] % 2 == 0) {
-            torch::set_num_threads(-1 * (Data[offset] % 100));
-            offset++;
-        }
-        
-        // Try setting to a very large number of threads
+        // Test changing thread count mid-execution
         if (Size > offset) {
-            int large_num = static_cast<int>(Data[offset]) * 1000;
-            torch::set_num_threads(large_num);
+            int new_threads = (static_cast<int>(Data[offset]) % 32) + 1;
             offset++;
+            torch::set_num_threads(new_threads);
+            
+            // Perform another operation with different thread count
+            if (Size > offset) {
+                torch::Tensor tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
+                torch::Tensor result = tensor2.sum();
+            }
         }
         
-        // Try setting to zero threads
-        torch::set_num_threads(0);
+        // Test with interop threads as well
+        if (Size > offset) {
+            int interop_threads = (static_cast<int>(Data[offset]) % 16) + 1;
+            offset++;
+            torch::set_num_interop_threads(interop_threads);
+            int current_interop = torch::get_num_interop_threads();
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

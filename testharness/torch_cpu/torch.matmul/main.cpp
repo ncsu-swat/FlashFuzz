@@ -1,16 +1,21 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least 2 bytes for each tensor (dtype and rank)
+        // Need at least 4 bytes for minimal tensor creation
         if (Size < 4) {
             return 0;
         }
@@ -23,31 +28,43 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
             
             // Try to perform matmul operation
-            torch::Tensor result = torch::matmul(tensor1, tensor2);
-            
-            // Optional: do something with the result to ensure it's computed
-            if (result.defined()) {
-                volatile float sum = result.sum().item<float>();
+            try {
+                torch::Tensor result = torch::matmul(tensor1, tensor2);
+                
+                // Force computation
+                if (result.defined()) {
+                    volatile float sum = result.to(torch::kFloat32).sum().item<float>();
+                    (void)sum;
+                }
+            } catch (...) {
+                // Shape mismatch or dtype incompatibility - expected
             }
         } else {
             // If only one tensor was created, try matmul with itself
-            torch::Tensor result = torch::matmul(tensor1, tensor1);
-            
-            // Optional: do something with the result to ensure it's computed
-            if (result.defined()) {
-                volatile float sum = result.sum().item<float>();
+            try {
+                torch::Tensor result = torch::matmul(tensor1, tensor1);
+                
+                // Force computation
+                if (result.defined()) {
+                    volatile float sum = result.to(torch::kFloat32).sum().item<float>();
+                    (void)sum;
+                }
+            } catch (...) {
+                // Shape mismatch - expected
             }
         }
         
         // Try some edge cases if we have enough data
         if (Size > 8 && offset < Size - 4) {
-            // Try with a 1D tensor
-            std::vector<int64_t> shape1 = {3};
-            torch::Tensor vec1 = torch::ones(shape1);
-            
-            // Try matmul with our fuzzed tensor
+            // Try vector-matrix multiplication
             try {
-                torch::Tensor result = torch::matmul(vec1, tensor1);
+                std::vector<int64_t> shape1 = {3};
+                torch::Tensor vec1 = torch::ones(shape1, torch::kFloat32);
+                torch::Tensor result = torch::matmul(vec1, tensor1.to(torch::kFloat32));
+                if (result.defined()) {
+                    volatile float sum = result.sum().item<float>();
+                    (void)sum;
+                }
             } catch (...) {
                 // Ignore exceptions from this edge case
             }
@@ -55,18 +72,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Try matmul with transposed tensor
             try {
                 if (tensor1.dim() >= 2) {
-                    torch::Tensor transposed = tensor1.transpose(0, tensor1.dim()-1);
-                    torch::Tensor result = torch::matmul(tensor1, transposed);
+                    torch::Tensor t1_float = tensor1.to(torch::kFloat32);
+                    torch::Tensor transposed = t1_float.transpose(-2, -1);
+                    torch::Tensor result = torch::matmul(t1_float, transposed);
+                    if (result.defined()) {
+                        volatile float sum = result.sum().item<float>();
+                        (void)sum;
+                    }
                 }
             } catch (...) {
                 // Ignore exceptions from this edge case
+            }
+            
+            // Try batch matmul
+            try {
+                if (tensor1.dim() >= 2) {
+                    int64_t m = tensor1.size(-2);
+                    int64_t n = tensor1.size(-1);
+                    torch::Tensor batch1 = torch::randn({2, m, n});
+                    torch::Tensor batch2 = torch::randn({2, n, m});
+                    torch::Tensor result = torch::matmul(batch1, batch2);
+                    if (result.defined()) {
+                        volatile float sum = result.sum().item<float>();
+                        (void)sum;
+                    }
+                }
+            } catch (...) {
+                // Ignore exceptions from batch matmul edge case
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

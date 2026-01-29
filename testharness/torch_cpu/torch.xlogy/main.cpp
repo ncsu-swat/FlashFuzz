@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <limits>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -52,7 +57,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Create a tensor with different shape
             torch::Tensor z = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Try broadcasting if possible
+            // Try broadcasting if possible (may fail due to incompatible shapes)
             try {
                 torch::Tensor result_broadcast = torch::xlogy(x, z);
             } catch (const std::exception&) {
@@ -62,9 +67,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Try with special values that might cause issues
         try {
-            // Create tensors with special values
-            auto options = torch::TensorOptions().dtype(x.dtype());
-            
             // Test with zeros in x
             torch::Tensor zeros = torch::zeros_like(x);
             torch::Tensor result_zeros_x = torch::xlogy(zeros, y);
@@ -98,7 +100,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

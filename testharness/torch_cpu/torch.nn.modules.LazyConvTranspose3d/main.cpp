@@ -1,130 +1,129 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        if (Size < 10) {
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Ensure input has at least 5 dimensions (N, C, D, H, W)
-        if (input.dim() < 3) {
-            input = input.reshape({1, 1, 
-                                  std::max<int64_t>(1, input.numel() > 0 ? input.size(0) : 1),
-                                  std::max<int64_t>(1, input.numel() > 1 ? input.size(-1) : 1),
-                                  std::max<int64_t>(1, input.numel() > 2 ? input.size(-2) : 1)});
-        } else if (input.dim() < 5) {
-            std::vector<int64_t> new_shape;
-            // Add batch dimension if needed
-            if (input.dim() == 3) {
-                new_shape = {1, 1, input.size(0), input.size(1), input.size(2)};
-            } else if (input.dim() == 4) {
-                new_shape = {1, input.size(0), input.size(1), input.size(2), input.size(3)};
-            }
-            input = input.reshape(new_shape);
-        }
-        
-        // Extract parameters for ConvTranspose3d from the input data
-        int64_t in_channels = input.size(1);
-        int64_t out_channels = 1;
-        int64_t kernel_size = 1;
-        int64_t stride = 1;
-        int64_t padding = 0;
+        // Extract parameters for ConvTranspose3d from input data
+        int64_t in_channels = (Data[offset++] % 8) + 1;
+        int64_t out_channels = (Data[offset++] % 8) + 1;
+        int64_t kernel_d = (Data[offset++] % 3) + 1;
+        int64_t kernel_h = (Data[offset++] % 3) + 1;
+        int64_t kernel_w = (Data[offset++] % 3) + 1;
+        int64_t stride = (Data[offset++] % 2) + 1;
+        int64_t padding = Data[offset++] % 2;
         int64_t output_padding = 0;
-        int64_t groups = 1;
-        bool bias = true;
-        int64_t dilation = 1;
-        
-        // Parse additional parameters if data is available
-        if (offset + 8 <= Size) {
-            out_channels = (Data[offset] % 8) + 1;
-            kernel_size = (Data[offset + 1] % 5) + 1;
-            stride = (Data[offset + 2] % 3) + 1;
-            padding = Data[offset + 3] % 3;
-            output_padding = Data[offset + 4] % 2;
-            
-            // Ensure groups divides both in_channels and out_channels
-            groups = (Data[offset + 5] % std::min(in_channels, out_channels)) + 1;
-            if (groups > 1) {
-                // Adjust in_channels and out_channels to be divisible by groups
-                in_channels = in_channels - (in_channels % groups);
-                if (in_channels == 0) in_channels = groups;
-                out_channels = out_channels - (out_channels % groups);
-                if (out_channels == 0) out_channels = groups;
-                
-                // Reshape input tensor to match adjusted in_channels
-                auto old_shape = input.sizes().vec();
-                old_shape[1] = in_channels;
-                input = input.reshape(old_shape);
-            }
-            
-            bias = (Data[offset + 6] % 2) == 0;
-            dilation = (Data[offset + 7] % 3) + 1;
-            offset += 8;
+        if (stride > 1) {
+            output_padding = Data[offset++] % stride;
+        } else {
+            offset++;
         }
+        bool use_bias = (Data[offset++] % 2) == 0;
+        int64_t dilation = (Data[offset++] % 2) + 1;
+        
+        // Determine input dimensions
+        int64_t batch_size = (Data[offset++] % 4) + 1;
+        int64_t depth = (Data[offset++] % 4) + 2;
+        int64_t height = (Data[offset++] % 4) + 2;
+        int64_t width = (Data[offset++] % 4) + 2;
         
         // Create ConvTranspose3d module
+        // ConvTranspose3d(in_channels, out_channels, kernel_size)
         torch::nn::ConvTranspose3d conv_transpose(
-            torch::nn::ConvTranspose3dOptions(in_channels, out_channels, kernel_size)
+            torch::nn::ConvTranspose3dOptions(in_channels, out_channels, {kernel_d, kernel_h, kernel_w})
                 .stride(stride)
                 .padding(padding)
                 .output_padding(output_padding)
-                .groups(groups)
-                .bias(bias)
+                .bias(use_bias)
                 .dilation(dilation)
         );
         
-        // Apply the module to the input tensor
-        torch::Tensor output = conv_transpose->forward(input);
+        // Create input tensor with shape (N, C_in, D, H, W)
+        torch::Tensor input = torch::randn({batch_size, in_channels, depth, height, width});
         
-        // Perform some operations on the output to ensure it's used
+        // Use fuzzer data to modify input values if available
+        if (offset + 4 <= Size) {
+            size_t temp_offset = 0;
+            torch::Tensor fuzz_tensor = fuzzer_utils::createTensor(Data + offset, Size - offset, temp_offset);
+            if (fuzz_tensor.numel() > 0) {
+                // Flatten and use as much as we can
+                auto flat_input = input.flatten();
+                auto flat_fuzz = fuzz_tensor.flatten().to(flat_input.dtype());
+                int64_t copy_size = std::min(flat_input.numel(), flat_fuzz.numel());
+                flat_input.slice(0, 0, copy_size).copy_(flat_fuzz.slice(0, 0, copy_size));
+                input = flat_input.reshape(input.sizes());
+            }
+        }
+        
+        // Forward pass
+        torch::Tensor output;
+        try {
+            output = conv_transpose->forward(input);
+        } catch (const c10::Error&) {
+            // Shape mismatch or other PyTorch-specific errors
+            return 0;
+        }
+        
+        // Verify output was computed
         auto sum = output.sum();
         
-        // Try different input shapes if there's more data
-        if (offset + 10 < Size) {
-            // Create another input tensor with different shape
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+        // Test with another input of different spatial dimensions
+        if (Size > offset + 8) {
+            int64_t new_depth = (Data[offset % Size] % 4) + 2;
+            int64_t new_height = (Data[(offset + 1) % Size] % 4) + 2;
+            int64_t new_width = (Data[(offset + 2) % Size] % 4) + 2;
             
-            // Reshape to match expected input dimensions
-            if (input2.dim() < 3) {
-                input2 = input2.reshape({1, in_channels, 
-                                       std::max<int64_t>(1, input2.numel() > 0 ? input2.size(0) : 1),
-                                       std::max<int64_t>(1, input2.numel() > 1 ? input2.size(-1) : 1),
-                                       std::max<int64_t>(1, input2.numel() > 2 ? input2.size(-2) : 1)});
-            } else if (input2.dim() < 5) {
-                std::vector<int64_t> new_shape;
-                if (input2.dim() == 3) {
-                    new_shape = {1, in_channels, input2.size(0), input2.size(1), input2.size(2)};
-                } else if (input2.dim() == 4) {
-                    new_shape = {1, in_channels, input2.size(1), input2.size(2), input2.size(3)};
-                }
-                input2 = input2.reshape(new_shape);
-            } else {
-                // Ensure channel dimension matches in_channels
-                auto shape = input2.sizes().vec();
-                shape[1] = in_channels;
-                input2 = input2.reshape(shape);
+            torch::Tensor input2 = torch::randn({batch_size, in_channels, new_depth, new_height, new_width});
+            
+            try {
+                torch::Tensor output2 = conv_transpose->forward(input2);
+                sum = sum + output2.sum();
+            } catch (const c10::Error&) {
+                // Ignore shape errors on second input
             }
-            
-            // Apply the module to the second input
-            torch::Tensor output2 = conv_transpose->forward(input2);
-            sum += output2.sum();
         }
+        
+        // Test with different batch size
+        if (Size > offset + 12) {
+            int64_t new_batch = (Data[(offset + 3) % Size] % 4) + 1;
+            torch::Tensor input3 = torch::randn({new_batch, in_channels, depth, height, width});
+            
+            try {
+                torch::Tensor output3 = conv_transpose->forward(input3);
+                sum = sum + output3.sum();
+            } catch (const c10::Error&) {
+                // Ignore errors
+            }
+        }
+        
+        // Test backward pass
+        try {
+            output.sum().backward();
+        } catch (const c10::Error&) {
+            // Ignore backward errors
+        }
+        
+        // Ensure sum is used
+        (void)sum.item<float>();
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

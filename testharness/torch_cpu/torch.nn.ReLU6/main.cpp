@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -27,9 +32,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Alternative way to apply ReLU6 using functional API
         torch::Tensor output2 = torch::nn::functional::relu6(input);
         
-        // Try with inplace version using clamp_
-        torch::Tensor input_copy = input.clone();
-        input_copy.clamp_(0, 6);
+        // Try with inplace version using clamp_ (silent catch for dtype issues)
+        try {
+            torch::Tensor input_copy = input.clone();
+            input_copy.clamp_(0, 6);
+        } catch (...) {
+            // Silently ignore - some dtypes may not support inplace clamp
+        }
         
         // Try with different configurations
         if (offset + 1 < Size) {
@@ -42,7 +51,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Try with different tensor types
         if (offset + 1 < Size) {
-            // Create a tensor with a different dtype
             size_t new_offset = offset;
             torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, new_offset);
             
@@ -51,24 +59,59 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Try with empty tensor
-        torch::Tensor empty_tensor = torch::empty({0});
-        torch::Tensor empty_output = relu6(empty_tensor);
+        try {
+            torch::Tensor empty_tensor = torch::empty({0});
+            torch::Tensor empty_output = relu6(empty_tensor);
+        } catch (...) {
+            // Silently ignore - empty tensor edge case
+        }
         
-        // Try with scalar tensor
-        if (offset + 1 < Size) {
-            float scalar_value = *reinterpret_cast<const float*>(Data + offset);
-            torch::Tensor scalar_tensor = torch::tensor(scalar_value);
-            torch::Tensor scalar_output = relu6(scalar_tensor);
+        // Try with scalar tensor (safe float reading)
+        if (offset + sizeof(float) <= Size) {
+            float scalar_value;
+            std::memcpy(&scalar_value, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            
+            // Handle NaN/Inf cases
+            if (std::isfinite(scalar_value)) {
+                torch::Tensor scalar_tensor = torch::tensor(scalar_value);
+                torch::Tensor scalar_output = relu6(scalar_tensor);
+            }
         }
         
         // Try with extreme values
         torch::Tensor extreme_values = torch::tensor({-1000.0f, -6.0f, -1.0f, 0.0f, 1.0f, 6.0f, 1000.0f});
         torch::Tensor extreme_output = relu6(extreme_values);
+        
+        // Try functional API with inplace option
+        if (offset < Size) {
+            bool func_inplace = Data[offset++] % 2 == 0;
+            torch::Tensor func_input = input.clone();
+            torch::Tensor func_output = torch::nn::functional::relu6(
+                func_input, 
+                torch::nn::functional::ReLU6FuncOptions().inplace(func_inplace)
+            );
+        }
+        
+        // Test with different dtypes
+        try {
+            torch::Tensor double_input = input.to(torch::kDouble);
+            torch::Tensor double_output = relu6(double_input);
+        } catch (...) {
+            // Silently ignore dtype conversion issues
+        }
+        
+        try {
+            torch::Tensor half_input = input.to(torch::kHalf);
+            torch::Tensor half_output = relu6(half_input);
+        } catch (...) {
+            // Silently ignore - half precision may not be supported
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

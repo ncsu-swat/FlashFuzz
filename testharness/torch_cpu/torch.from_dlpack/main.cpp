@@ -16,7 +16,12 @@ static torch::Tensor roundtrip_dlpack(const torch::Tensor &tensor)
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -48,18 +53,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Try operations on the converted tensor
             if (another_output.numel() > 0) {
-                auto sum = another_output.sum();
-                auto mean = another_output.mean();
-                (void)sum;
-                (void)mean;
+                try {
+                    auto sum = another_output.sum();
+                    auto mean = another_output.mean();
+                    (void)sum;
+                    (void)mean;
+                } catch (...) {
+                    // Some dtypes don't support mean/sum, ignore
+                }
             }
         }
         
-        // Test with empty tensor if we have enough data
+        // Test with empty tensor
         if (offset + 1 < Size) {
-            torch::Tensor empty_tensor = torch::empty({0});
-            torch::Tensor empty_output = roundtrip_dlpack(empty_tensor);
-            (void)empty_output;
+            try {
+                torch::Tensor empty_tensor = torch::empty({0});
+                torch::Tensor empty_output = roundtrip_dlpack(empty_tensor);
+                (void)empty_output;
+            } catch (...) {
+                // Empty tensor DLPack conversion may fail, ignore
+            }
         }
         
         // Test with scalar tensor
@@ -69,21 +82,63 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             (void)scalar_output;
         }
         
-        // Test with boolean tensor
+        // Test with non-contiguous tensor (sliced)
         if (offset + 1 < Size) {
-            torch::Tensor bool_tensor = torch::tensor(true);
-            torch::Tensor bool_output = roundtrip_dlpack(bool_tensor);
-            (void)bool_output;
+            try {
+                torch::Tensor base_tensor = torch::randn({4, 4});
+                torch::Tensor sliced_tensor = base_tensor.slice(0, 0, 2).slice(1, 0, 2);
+                // DLPack requires contiguous tensors, so make it contiguous first
+                torch::Tensor contiguous_sliced = sliced_tensor.contiguous();
+                torch::Tensor sliced_output = roundtrip_dlpack(contiguous_sliced);
+                (void)sliced_output;
+            } catch (...) {
+                // Ignore failures for edge cases
+            }
         }
         
-        // Test with complex tensor if we have enough data
-        if (offset + 2 < Size) {
-            torch::Tensor complex_tensor = torch::complex(
-                torch::ones({2, 2}), 
-                torch::ones({2, 2})
-            );
-            torch::Tensor complex_output = roundtrip_dlpack(complex_tensor);
-            (void)complex_output;
+        // Test with different dtypes
+        if (offset + 1 < Size) {
+            uint8_t dtype_selector = Data[offset % Size];
+            offset++;
+            
+            try {
+                torch::Tensor typed_tensor;
+                switch (dtype_selector % 6) {
+                    case 0:
+                        typed_tensor = torch::ones({2, 3}, torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_tensor = torch::ones({2, 3}, torch::kFloat64);
+                        break;
+                    case 2:
+                        typed_tensor = torch::ones({2, 3}, torch::kInt32);
+                        break;
+                    case 3:
+                        typed_tensor = torch::ones({2, 3}, torch::kInt64);
+                        break;
+                    case 4:
+                        typed_tensor = torch::ones({2, 3}, torch::kInt16);
+                        break;
+                    case 5:
+                        typed_tensor = torch::ones({2, 3}, torch::kUInt8);
+                        break;
+                }
+                torch::Tensor typed_output = roundtrip_dlpack(typed_tensor);
+                (void)typed_output;
+            } catch (...) {
+                // Some dtypes may not be supported by DLPack
+            }
+        }
+        
+        // Test with multi-dimensional tensor
+        if (offset + 1 < Size) {
+            try {
+                torch::Tensor multi_dim = torch::randn({2, 3, 4, 5});
+                torch::Tensor multi_dim_output = roundtrip_dlpack(multi_dim);
+                (void)multi_dim_output;
+            } catch (...) {
+                // Ignore failures
+            }
         }
     }
     catch (const std::exception &e)

@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -19,7 +24,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::ModuleDict moduleDict;
         
         // Determine number of modules to add (1-10)
-        uint8_t numModules = (Size > 0) ? (Data[offset] % 10) + 1 : 1;
+        uint8_t numModules = (Data[offset] % 10) + 1;
         offset++;
         
         // Add modules to the ModuleDict
@@ -28,7 +33,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::string key = "module_" + std::to_string(i);
             
             // Determine module type based on data
-            uint8_t moduleType = (offset < Size) ? Data[offset] % 5 : 0;
+            uint8_t moduleType = Data[offset] % 5;
             offset++;
             
             // Create different types of modules based on the data
@@ -39,7 +44,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     offset++;
                     int64_t outFeatures = (offset < Size) ? (Data[offset] % 100) + 1 : 5;
                     offset++;
-                    moduleDict[key] = torch::nn::Linear(inFeatures, outFeatures);
+                    auto linear = torch::nn::Linear(inFeatures, outFeatures);
+                    moduleDict->insert(key, linear);
                     break;
                 }
                 case 1: {
@@ -50,32 +56,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     offset++;
                     int64_t kernelSize = (offset < Size) ? (Data[offset] % 7) + 1 : 3;
                     offset++;
-                    moduleDict[key] = torch::nn::Conv2d(
+                    auto conv = torch::nn::Conv2d(
                         torch::nn::Conv2dOptions(inChannels, outChannels, kernelSize));
+                    moduleDict->insert(key, conv);
                     break;
                 }
                 case 2: {
                     // ReLU module
                     bool inplace = (offset < Size) ? (Data[offset] % 2 == 0) : false;
                     offset++;
-                    moduleDict[key] = torch::nn::ReLU(torch::nn::ReLUOptions().inplace(inplace));
+                    auto relu = torch::nn::ReLU(torch::nn::ReLUOptions().inplace(inplace));
+                    moduleDict->insert(key, relu);
                     break;
                 }
                 case 3: {
                     // Dropout module
                     double prob = (offset < Size) ? static_cast<double>(Data[offset]) / 255.0 : 0.5;
                     offset++;
-                    moduleDict[key] = torch::nn::Dropout(torch::nn::DropoutOptions(prob));
+                    auto dropout = torch::nn::Dropout(torch::nn::DropoutOptions(prob));
+                    moduleDict->insert(key, dropout);
                     break;
                 }
                 case 4: {
-                    // Sequential module with a few layers
-                    auto seq = torch::nn::Sequential(
-                        torch::nn::Linear(10, 5),
-                        torch::nn::ReLU(),
-                        torch::nn::Linear(5, 1)
-                    );
-                    moduleDict[key] = seq;
+                    // BatchNorm1d module
+                    int64_t numFeatures = (offset < Size) ? (Data[offset] % 64) + 1 : 10;
+                    offset++;
+                    auto bn = torch::nn::BatchNorm1d(numFeatures);
+                    moduleDict->insert(key, bn);
                     break;
                 }
             }
@@ -86,101 +93,138 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // 1. Test size and empty
         size_t dictSize = moduleDict->size();
         bool isEmpty = moduleDict->empty();
+        (void)dictSize;
+        (void)isEmpty;
         
         // 2. Test contains
         bool containsFirst = moduleDict->contains("module_0");
+        (void)containsFirst;
         
         // 3. Test keys
         auto keys = moduleDict->keys();
         
         // 4. Test values
         auto values = moduleDict->values();
+        (void)values;
         
         // 5. Test items
         auto items = moduleDict->items();
+        (void)items;
         
-        // 6. Test clear
-        if (offset < Size && Data[offset] % 2 == 0) {
-            moduleDict->clear();
+        // 6. Test clear based on data
+        bool shouldClear = false;
+        if (offset < Size) {
+            shouldClear = (Data[offset] % 4 == 0); // 25% chance
+            offset++;
         }
-        offset++;
         
-        // 7. Test pop
-        if (!moduleDict->empty() && offset < Size) {
+        // 7. Test pop before clear
+        if (!moduleDict->empty() && offset < Size && !shouldClear) {
             std::string keyToPop = "module_" + std::to_string(Data[offset] % numModules);
+            offset++;
             if (moduleDict->contains(keyToPop)) {
-                auto poppedModule = moduleDict->pop(keyToPop);
-            }
-        }
-        offset++;
-        
-        // 8. Test update with another ModuleDict
-        torch::nn::ModuleDict anotherDict;
-        anotherDict["extra_module"] = torch::nn::Linear(5, 3);
-        moduleDict->update(anotherDict);
-        
-        // 9. Test forward pass with a tensor if we have any modules
-        if (!moduleDict->empty()) {
-            // Create a test tensor
-            torch::Tensor testTensor;
-            try {
-                testTensor = fuzzer_utils::createTensor(Data, Size, offset);
-            } catch (const std::exception& e) {
-                // If tensor creation fails, create a simple one
-                testTensor = torch::ones({10, 10});
-            }
-            
-            // Try to forward through a module if it exists
-            for (const auto& key : moduleDict->keys()) {
                 try {
-                    // Reshape tensor if needed for the specific module
-                    torch::Tensor inputTensor = testTensor;
-                    auto& module = moduleDict->at<torch::nn::AnyModule>(key);
-                    
-                    // Adapt tensor shape based on module type
-                    if (auto linear = module.try_get<torch::nn::Linear>()) {
-                        // For Linear, ensure last dimension matches in_features
-                        int64_t inFeatures = linear->options.in_features();
-                        if (testTensor.dim() == 0) {
-                            inputTensor = torch::ones({inFeatures});
-                        } else if (testTensor.dim() == 1 && testTensor.size(0) != inFeatures) {
-                            inputTensor = torch::ones({inFeatures});
-                        } else if (testTensor.dim() > 1 && testTensor.size(-1) != inFeatures) {
-                            std::vector<int64_t> newShape(testTensor.dim());
-                            for (int i = 0; i < testTensor.dim() - 1; i++) {
-                                newShape[i] = testTensor.size(i);
-                            }
-                            newShape[testTensor.dim() - 1] = inFeatures;
-                            inputTensor = torch::ones(newShape);
-                        }
-                        auto output = module.forward(inputTensor);
-                    } else if (auto conv = module.try_get<torch::nn::Conv2d>()) {
-                        // For Conv2d, ensure NCHW format with matching channels
-                        int64_t inChannels = conv->options.in_channels();
-                        inputTensor = torch::ones({1, inChannels, 28, 28});
-                        auto output = module.forward(inputTensor);
-                    } else if (module.try_get<torch::nn::ReLU>() || 
-                               module.try_get<torch::nn::Dropout>()) {
-                        // For ReLU and Dropout, any tensor shape works
-                        if (testTensor.dim() == 0) {
-                            inputTensor = torch::ones({1, 1});
-                        }
-                        auto output = module.forward(inputTensor);
-                    } else {
-                        // For other modules, try with the original tensor
-                        // This might throw if incompatible
-                        auto output = module.forward(inputTensor);
-                    }
-                } catch (const std::exception& e) {
-                    // Ignore exceptions from forward pass - they're expected for incompatible shapes
+                    auto poppedModule = moduleDict->pop(keyToPop);
+                    (void)poppedModule;
+                } catch (...) {
+                    // Silent catch for expected failures
                 }
             }
+        }
+        
+        // 8. Test update with another ModuleDict
+        if (!shouldClear) {
+            torch::nn::ModuleDict anotherDict;
+            auto extraLinear = torch::nn::Linear(5, 3);
+            anotherDict->insert("extra_linear", extraLinear);
+            moduleDict->update(*anotherDict);
+        }
+        
+        // 9. Now perform clear if selected
+        if (shouldClear) {
+            moduleDict->clear();
+        }
+        
+        // 10. Test iteration over modules
+        if (!moduleDict->empty()) {
+            for (const auto& item : moduleDict->items()) {
+                auto key = item.key();
+                auto module = item.value();
+                (void)key;
+                (void)module;
+            }
+        }
+        
+        // 11. Test forward pass through modules
+        if (!moduleDict->empty()) {
+            torch::NoGradGuard no_grad;
+            
+            for (const auto& key : moduleDict->keys()) {
+                try {
+                    auto module = moduleDict[key];
+                    
+                    // Try different forward patterns based on module type
+                    torch::Tensor inputTensor;
+                    torch::Tensor output;
+                    
+                    // Create appropriate input based on fuzzer data
+                    if (offset + 2 < Size) {
+                        int64_t dim1 = (Data[offset] % 32) + 1;
+                        int64_t dim2 = (Data[offset + 1] % 64) + 1;
+                        offset += 2;
+                        
+                        // Try as Linear input
+                        try {
+                            inputTensor = torch::randn({dim1, dim2});
+                            output = module->as<torch::nn::Linear>()->forward(inputTensor);
+                        } catch (...) {}
+                        
+                        // Try as Conv2d input
+                        try {
+                            int64_t channels = (Data[offset % Size] % 16) + 1;
+                            inputTensor = torch::randn({1, channels, 28, 28});
+                            output = module->as<torch::nn::Conv2d>()->forward(inputTensor);
+                        } catch (...) {}
+                        
+                        // Try as ReLU/Dropout input
+                        try {
+                            inputTensor = torch::randn({dim1, dim2});
+                            output = module->as<torch::nn::ReLU>()->forward(inputTensor);
+                        } catch (...) {}
+                        
+                        try {
+                            inputTensor = torch::randn({dim1, dim2});
+                            output = module->as<torch::nn::Dropout>()->forward(inputTensor);
+                        } catch (...) {}
+                        
+                        // Try as BatchNorm1d input
+                        try {
+                            int64_t features = (Data[offset % Size] % 64) + 1;
+                            inputTensor = torch::randn({dim1, features});
+                            output = module->as<torch::nn::BatchNorm1d>()->forward(inputTensor);
+                        } catch (...) {}
+                        
+                        (void)output;
+                    }
+                } catch (...) {
+                    // Silent catch for expected failures during forward
+                }
+            }
+        }
+        
+        // 12. Test re-adding modules after operations
+        if (offset < Size && moduleDict->size() < 5) {
+            std::string newKey = "late_module_" + std::to_string(Data[offset] % 100);
+            offset++;
+            int64_t features = (offset < Size) ? (Data[offset] % 50) + 1 : 10;
+            auto lateLinear = torch::nn::Linear(features, features);
+            moduleDict->insert(newKey, lateLinear);
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

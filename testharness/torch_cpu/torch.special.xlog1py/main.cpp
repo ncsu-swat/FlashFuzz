@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -16,7 +21,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Create input tensors for torch.special.xlog1py
-        // This function requires two tensors: x and y
+        // This function computes x * log1p(y) with special handling for x=0, y=-1
         torch::Tensor x = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Check if we have enough data left for the second tensor
@@ -36,55 +41,66 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create the second tensor
         torch::Tensor y = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Apply the operation
-        // xlog1py(x, y) = x * log(1 + y) where x = 0 and y = -1 is defined as 0
+        // Apply the operation - broadcasting is handled automatically by PyTorch
         torch::Tensor result = torch::special::xlog1py(x, y);
         
         // Force evaluation of the tensor
         result.sum().item<float>();
         
-        // Try broadcasting version if tensors have different shapes
-        if (x.sizes() != y.sizes()) {
-            // Try broadcasting in both directions
-            try {
-                torch::Tensor broadcast_result = torch::special::xlog1py(x, y);
-                broadcast_result.sum().item<float>();
-            } catch (...) {
-                // Ignore errors from broadcasting
-            }
-            
-            try {
-                torch::Tensor broadcast_result2 = torch::special::xlog1py(y, x);
-                broadcast_result2.sum().item<float>();
-            } catch (...) {
-                // Ignore errors from broadcasting
-            }
+        // Test with output tensor (out parameter version)
+        try {
+            torch::Tensor out = torch::empty_like(result);
+            torch::special::xlog1py_out(out, x, y);
+            out.sum().item<float>();
+        } catch (...) {
+            // Shape mismatch or other expected errors - ignore silently
         }
         
-        // Try scalar versions if we have enough data
-        if (offset + 1 < Size) {
-            float scalar_value = static_cast<float>(Data[offset]) / 255.0f;
+        // Try with swapped arguments to explore different code paths
+        try {
+            torch::Tensor swapped_result = torch::special::xlog1py(y, x);
+            swapped_result.sum().item<float>();
+        } catch (...) {
+            // Shape mismatch possible - ignore silently
+        }
+        
+        // Test tensor-scalar operation if we have extra data
+        if (offset < Size) {
+            // Use data byte to create a scalar value
+            float scalar_value = static_cast<float>(Data[offset]) / 255.0f * 10.0f - 5.0f;
             
-            // Try tensor-scalar operations
+            // Try with scalar as second argument
             try {
-                torch::Tensor scalar_result1 = torch::special::xlog1py(x, scalar_value);
-                scalar_result1.sum().item<float>();
+                torch::Tensor scalar_result = torch::special::xlog1py(x, torch::scalar_tensor(scalar_value));
+                scalar_result.sum().item<float>();
             } catch (...) {
                 // Ignore errors
             }
             
+            // Try with scalar as first argument (as scalar tensor)
             try {
-                torch::Tensor scalar_result2 = torch::special::xlog1py(scalar_value, y);
+                torch::Tensor scalar_x = torch::scalar_tensor(scalar_value);
+                torch::Tensor scalar_result2 = torch::special::xlog1py(scalar_x, y);
                 scalar_result2.sum().item<float>();
             } catch (...) {
                 // Ignore errors
             }
         }
+        
+        // Test with different dtypes
+        try {
+            torch::Tensor x_double = x.to(torch::kDouble);
+            torch::Tensor y_double = y.to(torch::kDouble);
+            torch::Tensor double_result = torch::special::xlog1py(x_double, y_double);
+            double_result.sum().item<double>();
+        } catch (...) {
+            // Dtype conversion issues - ignore silently
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
+    return 0;
 }

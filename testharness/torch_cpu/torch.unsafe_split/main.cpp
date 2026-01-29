@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstdint>        // For uint64_t
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,16 +24,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Extract parameters for unsafe_split
-        // We need at least 2 bytes for sections and dim
+        // Need at least 2 bytes for split_size and dim
         if (offset + 2 > Size) {
             return 0;
         }
         
-        // Get number of sections
-        int64_t sections = static_cast<int64_t>(Data[offset++]);
-        if (sections == 0) {
-            sections = 1; // Ensure at least 1 section
+        // Get split_size (size of each chunk, NOT number of sections)
+        // torch::unsafe_split(tensor, split_size, dim) splits tensor into chunks of size split_size
+        int64_t split_size = static_cast<int64_t>(Data[offset++]);
+        if (split_size == 0) {
+            split_size = 1; // Ensure at least size 1
         }
         
         // Get dimension to split along
@@ -35,69 +41,120 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (tensor.dim() > 0) {
             // Use the byte to select a dimension
             dim = static_cast<int64_t>(Data[offset++]) % tensor.dim();
+        } else {
+            offset++; // Consume the byte anyway
         }
         
-        // Apply torch.unsafe_split
-        std::vector<torch::Tensor> result;
+        // Apply torch::unsafe_split
+        // Note: unsafe_split is "unsafe" because it may return tensors that share storage
+        // and the last chunk may be smaller than split_size
         try {
-            result = torch::unsafe_split(tensor, sections, dim);
+            std::vector<torch::Tensor> result = torch::unsafe_split(tensor, split_size, dim);
+            
+            // Verify the result
+            if (!result.empty()) {
+                // Access elements to ensure they're valid
+                for (const auto& t : result) {
+                    (void)t.sizes();
+                    (void)t.numel();
+                }
+                
+                // Try to concatenate the split tensors back
+                try {
+                    torch::Tensor reconstructed = torch::cat(result, dim);
+                    (void)reconstructed.sizes();
+                } catch (const c10::Error& e) {
+                    // Concatenation failed due to shape issues, continue
+                }
+            }
         } catch (const c10::Error& e) {
-            // Catch PyTorch-specific errors but don't discard the input
+            // Catch PyTorch-specific errors (e.g., invalid dim, empty tensor issues)
             return 0;
         }
         
-        // Verify the result (optional)
-        if (!result.empty()) {
-            // Check if we can concatenate the split tensors back
-            try {
-                torch::Tensor reconstructed = torch::cat(result, dim);
+        // Try unsafe_split_with_sizes if we have more data
+        if (offset + 1 < Size && tensor.dim() > 0) {
+            int64_t dim_for_sizes = static_cast<int64_t>(Data[offset++]) % tensor.dim();
+            int64_t dim_size = tensor.size(dim_for_sizes);
+            
+            if (dim_size > 0) {
+                // Create a vector of split sizes
+                std::vector<int64_t> split_sizes;
+                int64_t remaining_size = dim_size;
                 
-                // Verify sizes match
-                if (reconstructed.sizes() != tensor.sizes()) {
-                    // This is a potential issue, but we'll continue
+                // Determine how many splits to make (limit to avoid excessive splits)
+                size_t num_splits = std::min(static_cast<size_t>(Data[offset++] % 16 + 1), 
+                                              static_cast<size_t>(dim_size));
+                
+                for (size_t i = 0; i < num_splits && offset < Size && remaining_size > 0; ++i) {
+                    int64_t max_split = std::min(remaining_size, static_cast<int64_t>(255));
+                    int64_t split_sz = static_cast<int64_t>(Data[offset++] % max_split) + 1;
+                    
+                    if (split_sz > remaining_size) {
+                        split_sz = remaining_size;
+                    }
+                    
+                    split_sizes.push_back(split_sz);
+                    remaining_size -= split_sz;
                 }
-            } catch (const c10::Error& e) {
-                // Concatenation failed, but we'll continue
+                
+                // Add the remaining size as the last split if needed
+                if (remaining_size > 0) {
+                    split_sizes.push_back(remaining_size);
+                }
+                
+                // Apply torch::unsafe_split_with_sizes
+                if (!split_sizes.empty()) {
+                    try {
+                        std::vector<torch::Tensor> result_sizes = 
+                            torch::unsafe_split_with_sizes(tensor, split_sizes, dim_for_sizes);
+                        
+                        // Access results to ensure they're valid
+                        for (const auto& t : result_sizes) {
+                            (void)t.sizes();
+                        }
+                    } catch (const c10::Error& e) {
+                        // Catch PyTorch-specific errors
+                    }
+                }
             }
         }
         
-        // Try another variant with split_with_sizes if we have more data
-        if (offset + 1 < Size && tensor.dim() > 0) {
-            // Create a vector of split sizes
-            std::vector<int64_t> split_sizes;
-            int64_t dim_size = tensor.size(dim);
-            
-            // Use remaining bytes to determine split sizes
-            int64_t remaining_size = dim_size;
-            size_t max_splits_value = static_cast<size_t>(Data[offset++]);
-            size_t max_splits = std::min(max_splits_value, Size - offset);
-            
-            for (size_t i = 0; i < max_splits && offset < Size && remaining_size > 0; ++i) {
-                // Get a size between 0 and remaining_size
-                int64_t split_size = static_cast<int64_t>(Data[offset++] % (remaining_size + 1));
-                if (split_size == 0) split_size = 1; // Avoid zero-sized splits
-                
-                split_sizes.push_back(split_size);
-                remaining_size -= split_size;
-            }
-            
-            // Add the remaining size as the last split if needed
-            if (remaining_size > 0) {
-                split_sizes.push_back(remaining_size);
-            }
-            
-            // Apply torch.unsafe_split_with_sizes
+        // Test with different tensor types
+        if (offset + 4 < Size) {
             try {
-                std::vector<torch::Tensor> result_sizes = torch::unsafe_split_with_sizes(tensor, split_sizes, dim);
+                // Test with a float tensor
+                torch::Tensor float_tensor = torch::randn({4, 8, 6});
+                int64_t float_split_size = (Data[offset++] % 4) + 1;
+                int64_t float_dim = Data[offset++] % 3;
+                
+                auto float_result = torch::unsafe_split(float_tensor, float_split_size, float_dim);
+                for (const auto& t : float_result) {
+                    (void)t.sum();
+                }
             } catch (const c10::Error& e) {
-                // Catch PyTorch-specific errors but don't discard the input
+                // Expected for invalid configurations
+            }
+        }
+        
+        // Test with 1D tensor
+        if (offset + 2 < Size) {
+            try {
+                int64_t len = (Data[offset++] % 32) + 1;
+                torch::Tensor tensor_1d = torch::arange(len);
+                int64_t split_1d = (Data[offset++] % len) + 1;
+                
+                auto result_1d = torch::unsafe_split(tensor_1d, split_1d, 0);
+                (void)result_1d.size();
+            } catch (const c10::Error& e) {
+                // Expected for edge cases
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

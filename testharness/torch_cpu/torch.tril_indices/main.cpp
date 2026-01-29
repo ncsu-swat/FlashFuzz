@@ -1,71 +1,75 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least 4 bytes for row, col, offset, and dtype
-        if (Size < 4) {
+        // Need at least enough bytes for two int16_t (row, col), one int8_t (tril_offset), and one byte (dtype)
+        if (Size < 6) {
             return 0;
         }
         
-        // Parse row and column dimensions
-        int64_t row = 0;
-        int64_t col = 0;
+        // Parse row and column dimensions using smaller types to avoid extreme values
+        // Use int16_t and constrain to reasonable range to avoid memory issues
+        int16_t row_raw = 0;
+        int16_t col_raw = 0;
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&row, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
+        std::memcpy(&row_raw, Data + offset, sizeof(int16_t));
+        offset += sizeof(int16_t);
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&col, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
+        std::memcpy(&col_raw, Data + offset, sizeof(int16_t));
+        offset += sizeof(int16_t);
         
-        // Parse offset parameter
-        int64_t tril_offset = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&tril_offset, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
+        // Constrain row and col to reasonable range [0, 1000] to avoid OOM
+        int64_t row = static_cast<int64_t>(std::abs(row_raw)) % 1001;
+        int64_t col = static_cast<int64_t>(std::abs(col_raw)) % 1001;
         
-        // Parse dtype
-        torch::ScalarType dtype = torch::kInt64;
-        if (offset < Size) {
-            dtype = fuzzer_utils::parseDataType(Data[offset++]);
-        }
+        // Parse offset parameter - can be negative
+        int8_t tril_offset_raw = 0;
+        std::memcpy(&tril_offset_raw, Data + offset, sizeof(int8_t));
+        offset += sizeof(int8_t);
+        int64_t tril_offset = static_cast<int64_t>(tril_offset_raw);
         
-        // Call tril_indices with various combinations
+        // Parse dtype - tril_indices only supports integer types (kInt32, kInt64)
+        torch::ScalarType dtype = (Data[offset++] % 2 == 0) ? torch::kInt32 : torch::kInt64;
+        
+        // Call tril_indices with basic parameters
         try {
             auto result = torch::tril_indices(row, col, tril_offset);
             
-            // Try to access elements of the result to ensure it's valid
+            // Access elements of the result to ensure it's valid
             if (result.numel() > 0) {
                 auto first_element = result[0][0];
+                (void)first_element;
             }
         } catch (const c10::Error& e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
         
-        // Try with different device
+        // Try with explicit device
         try {
             auto result = torch::tril_indices(row, col, tril_offset, 
                                              torch::TensorOptions().device(torch::kCPU));
+            (void)result;
         } catch (const c10::Error& e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
         
-        // Try with different dtype
+        // Try with explicit dtype
         try {
             auto result = torch::tril_indices(row, col, tril_offset, 
                                              torch::TensorOptions().dtype(dtype));
+            (void)result;
         } catch (const c10::Error& e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
@@ -74,36 +78,47 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         try {
             auto result = torch::tril_indices(row, col, tril_offset, 
                                              torch::TensorOptions().device(torch::kCPU).dtype(dtype));
+            (void)result;
         } catch (const c10::Error& e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
         
-        // Try with extreme values
+        // Try with zero row
         try {
-            auto result = torch::tril_indices(std::numeric_limits<int64_t>::max() / 2, 
-                                             std::numeric_limits<int64_t>::max() / 2, 
-                                             std::numeric_limits<int64_t>::max() / 2);
+            auto result = torch::tril_indices(0, col, tril_offset);
+            (void)result;
         } catch (const c10::Error& e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
         
-        // Try with negative values
+        // Try with zero col
         try {
-            auto result = torch::tril_indices(-row, -col, -tril_offset);
+            auto result = torch::tril_indices(row, 0, tril_offset);
+            (void)result;
         } catch (const c10::Error& e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
         
-        // Try with mixed positive/negative values
-        try {
-            auto result = torch::tril_indices(row, -col, tril_offset);
-        } catch (const c10::Error& e) {
-            // PyTorch-specific exceptions are expected for invalid inputs
-        }
-        
-        // Try with zero values
+        // Try with zero dimensions
         try {
             auto result = torch::tril_indices(0, 0, tril_offset);
+            (void)result;
+        } catch (const c10::Error& e) {
+            // PyTorch-specific exceptions are expected for invalid inputs
+        }
+        
+        // Try with large positive offset (larger than matrix dimensions)
+        try {
+            auto result = torch::tril_indices(row, col, row + col);
+            (void)result;
+        } catch (const c10::Error& e) {
+            // PyTorch-specific exceptions are expected for invalid inputs
+        }
+        
+        // Try with large negative offset
+        try {
+            auto result = torch::tril_indices(row, col, -(row + col));
+            (void)result;
         } catch (const c10::Error& e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
@@ -111,7 +126,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

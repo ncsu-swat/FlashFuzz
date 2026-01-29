@@ -1,89 +1,112 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <ATen/ops/linalg_ldl_factor.h>
+#include <ATen/ops/linalg_ldl_solve.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create the LD tensor (triangular matrix)
-        torch::Tensor LD = fuzzer_utils::createTensor(Data, Size, offset);
+        // Read parameters from fuzzer data
+        bool hermitian = Data[offset++] & 0x1;
+        uint8_t size_hint = Data[offset++];
         
-        // Create the pivots tensor (integer tensor)
-        torch::Tensor pivots;
-        if (offset < Size) {
-            pivots = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure pivots is integer type
-            if (pivots.scalar_type() != torch::kInt64 && pivots.scalar_type() != torch::kInt32) {
-                pivots = pivots.to(torch::kInt64);
-            }
-        } else {
-            // Create default pivots if we don't have enough data
-            if (LD.dim() >= 2) {
-                int64_t n = LD.size(-1);
-                pivots = torch::arange(n, torch::TensorOptions().dtype(torch::kInt64));
-            } else {
-                // Default for scalar or 1D tensor
-                pivots = torch::tensor({0}, torch::kInt64);
-            }
+        // Determine matrix size (keep it small for performance: 1-8)
+        int64_t n = (size_hint % 8) + 1;
+        
+        // Determine batch dimensions
+        uint8_t batch_hint = Data[offset++];
+        std::vector<int64_t> batch_dims;
+        if (batch_hint & 0x1) {
+            batch_dims.push_back((batch_hint >> 1) % 3 + 1);
         }
         
-        // Create the B tensor (right-hand side)
-        torch::Tensor B;
-        if (offset < Size) {
-            B = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // Create a default B tensor with compatible shape
-            if (LD.dim() >= 2) {
-                int64_t n = LD.size(-1);
-                std::vector<int64_t> b_shape = LD.sizes().vec();
-                b_shape.back() = 1; // Make last dimension 1 for single RHS
-                B = torch::ones(b_shape, LD.options());
-            } else {
-                // Default for scalar or 1D tensor
-                B = torch::ones_like(LD);
-            }
+        // Build shape for matrix A
+        std::vector<int64_t> a_shape = batch_dims;
+        a_shape.push_back(n);
+        a_shape.push_back(n);
+        
+        // Determine number of right-hand sides
+        uint8_t nrhs_hint = Data[offset++];
+        int64_t nrhs = (nrhs_hint % 4) + 1;
+        
+        // Build shape for B
+        std::vector<int64_t> b_shape = batch_dims;
+        b_shape.push_back(n);
+        b_shape.push_back(nrhs);
+        
+        // Determine dtype
+        uint8_t dtype_hint = Data[offset++];
+        torch::Dtype dtype;
+        switch (dtype_hint % 4) {
+            case 0: dtype = torch::kFloat32; break;
+            case 1: dtype = torch::kFloat64; break;
+            case 2: dtype = torch::kComplexFloat; break;
+            default: dtype = torch::kComplexDouble; break;
         }
         
-        // Create the hermitian flag
-        bool hermitian = false;
-        if (offset < Size) {
-            hermitian = Data[offset++] & 0x1;
-        }
+        auto options = torch::TensorOptions().dtype(dtype);
         
-        // Try to call ldl_solve
-        torch::Tensor result;
-        
-        // Attempt to solve the system
-        result = torch::ldl_solve(LD, pivots, B, hermitian);
-        
-        // Optional: Verify result by computing residual
-        if (LD.dim() >= 2 && B.dim() >= 1) {
-            // Compute residual for verification (Ax - b)
-            // This is just to use the result and ensure it's computed
-            auto residual = torch::matmul(LD, result) - B;
+        // Inner try-catch for expected failures
+        try {
+            // Create a symmetric/hermitian positive definite matrix A
+            // A = X @ X^H + I to ensure positive definiteness
+            torch::Tensor X = torch::randn(a_shape, options);
+            torch::Tensor A;
             
-            // Use residual to prevent it from being optimized away
-            if (residual.numel() > 0) {
-                volatile float dummy = residual.sum().item<float>();
-                (void)dummy;
+            if (hermitian && (dtype == torch::kComplexFloat || dtype == torch::kComplexDouble)) {
+                // Hermitian case
+                A = torch::matmul(X, X.conj().transpose(-2, -1));
+            } else {
+                // Symmetric case
+                A = torch::matmul(X, X.transpose(-2, -1));
             }
+            // Add identity to ensure positive definiteness
+            A = A + torch::eye(n, options).expand_as(A);
+            
+            // Create B tensor
+            torch::Tensor B = torch::randn(b_shape, options);
+            
+            // Perform LDL factorization first using ATen function
+            torch::Tensor LD, pivots;
+            std::tie(LD, pivots) = at::linalg_ldl_factor(A, hermitian);
+            
+            // Now solve using ldl_solve via ATen function
+            torch::Tensor result = at::linalg_ldl_solve(LD, pivots, B, hermitian);
+            
+            // Verify result shape
+            if (result.sizes() != B.sizes()) {
+                std::cerr << "Shape mismatch in result" << std::endl;
+            }
+            
+            // Use the result to prevent optimization
+            volatile float dummy = result.abs().sum().item<float>();
+            (void)dummy;
+            
+        } catch (const c10::Error&) {
+            // Expected for invalid inputs - silently ignore
+        } catch (const std::runtime_error&) {
+            // Expected for invalid configurations - silently ignore
         }
         
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

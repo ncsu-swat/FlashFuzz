@@ -1,157 +1,127 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
+        // torch::miopen_convolution_transpose requires AMD GPU with MIOpen/ROCm
+        // This API is not available on CPU - skip if no MIOpen support
         
-        // Need at least some data to proceed
-        if (Size < 10) {
+        // Check if MIOpen is available (requires CUDA/HIP device)
+        if (!torch::cuda::is_available()) {
+            // MIOpen requires AMD GPU, silently skip on CPU-only systems
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Create weight tensor
-        torch::Tensor weight;
-        if (offset < Size) {
-            weight = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a compatible weight tensor
-            auto options = torch::TensorOptions().dtype(input.dtype());
-            weight = torch::ones({1, input.size(0), 3, 3}, options);
+        // Need sufficient data for tensor creation and parameters
+        if (Size < 20) {
+            return 0;
         }
         
-        // Create bias tensor (optional)
-        torch::Tensor bias;
-        bool use_bias = offset < Size && Data[offset++] % 2 == 0;
-        if (use_bias && offset < Size) {
-            bias = fuzzer_utils::createTensor(Data, Size, offset);
+        // Parse convolution dimensions (1D, 2D, or 3D)
+        int spatial_dims = (Data[offset++] % 3) + 1; // 1, 2, or 3
+        
+        // Create batch size and channels from fuzz data
+        int64_t batch_size = (Data[offset++] % 4) + 1;      // 1-4
+        int64_t in_channels = (Data[offset++] % 8) + 1;     // 1-8
+        int64_t out_channels = (Data[offset++] % 8) + 1;    // 1-8
+        
+        // Parse groups - must divide both in_channels and out_channels
+        int64_t groups = (Data[offset++] % 4) + 1;
+        // Adjust channels to be divisible by groups
+        in_channels = ((in_channels + groups - 1) / groups) * groups;
+        out_channels = ((out_channels + groups - 1) / groups) * groups;
+        
+        // Build input shape: [N, C_in, *spatial_dims]
+        std::vector<int64_t> input_shape = {batch_size, in_channels};
+        for (int i = 0; i < spatial_dims && offset < Size; i++) {
+            int64_t dim_size = (Data[offset++] % 8) + 4; // 4-11
+            input_shape.push_back(dim_size);
+        }
+        while (input_shape.size() < static_cast<size_t>(2 + spatial_dims)) {
+            input_shape.push_back(4);
         }
         
-        // Parse convolution parameters
+        // Build kernel size
+        std::vector<int64_t> kernel_size;
+        for (int i = 0; i < spatial_dims && offset < Size; i++) {
+            kernel_size.push_back((Data[offset++] % 3) + 1); // 1-3
+        }
+        while (kernel_size.size() < static_cast<size_t>(spatial_dims)) {
+            kernel_size.push_back(3);
+        }
+        
+        // Build weight shape: [C_in, C_out/groups, *kernel_size]
+        std::vector<int64_t> weight_shape = {in_channels, out_channels / groups};
+        weight_shape.insert(weight_shape.end(), kernel_size.begin(), kernel_size.end());
+        
+        // Parse stride, padding, output_padding, dilation
         std::vector<int64_t> stride, padding, output_padding, dilation;
-        int64_t groups = 1;
+        for (int i = 0; i < spatial_dims; i++) {
+            stride.push_back(offset < Size ? (Data[offset++] % 2) + 1 : 1);
+            padding.push_back(offset < Size ? Data[offset++] % 2 : 0);
+            output_padding.push_back(offset < Size ? Data[offset++] % 2 : 0);
+            dilation.push_back(offset < Size ? (Data[offset++] % 2) + 1 : 1);
+        }
         
-        // Parse stride
-        if (offset + 1 < Size) {
-            uint8_t stride_size = Data[offset++] % 3 + 1;
-            for (int i = 0; i < stride_size && offset < Size; i++) {
-                stride.push_back((Data[offset++] % 3) + 1);
+        // Ensure output_padding < stride (required by convolution transpose)
+        for (size_t i = 0; i < output_padding.size(); i++) {
+            if (output_padding[i] >= stride[i]) {
+                output_padding[i] = stride[i] - 1;
             }
-        } else {
-            stride = {1, 1};
         }
         
-        // Parse padding
-        if (offset + 1 < Size) {
-            uint8_t padding_size = Data[offset++] % 3 + 1;
-            for (int i = 0; i < padding_size && offset < Size; i++) {
-                padding.push_back(Data[offset++] % 3);
-            }
-        } else {
-            padding = {0, 0};
-        }
-        
-        // Parse output_padding
-        if (offset + 1 < Size) {
-            uint8_t output_padding_size = Data[offset++] % 3 + 1;
-            for (int i = 0; i < output_padding_size && offset < Size; i++) {
-                output_padding.push_back(Data[offset++] % 3);
-            }
-        } else {
-            output_padding = {0, 0};
-        }
-        
-        // Parse dilation
-        if (offset + 1 < Size) {
-            uint8_t dilation_size = Data[offset++] % 3 + 1;
-            for (int i = 0; i < dilation_size && offset < Size; i++) {
-                dilation.push_back((Data[offset++] % 2) + 1);
-            }
-        } else {
-            dilation = {1, 1};
-        }
-        
-        // Parse groups
-        if (offset < Size) {
-            groups = (Data[offset++] % 4) + 1;
-        }
-        
-        // Parse benchmark flag
+        // Parse flags
+        bool use_bias = offset < Size && Data[offset++] % 2 == 0;
         bool benchmark = offset < Size && Data[offset++] % 2 == 0;
-        
-        // Parse deterministic flag
         bool deterministic = offset < Size && Data[offset++] % 2 == 0;
         
-        // Ensure tensors are on the same device (CPU for fuzzing)
-        input = input.to(torch::kCPU);
-        weight = weight.to(torch::kCPU);
+        // Create tensors on GPU (required for MIOpen)
+        auto options = torch::TensorOptions()
+            .dtype(torch::kFloat32)
+            .device(torch::kCUDA);
+        
+        torch::Tensor input = torch::randn(input_shape, options);
+        torch::Tensor weight = torch::randn(weight_shape, options);
+        torch::Tensor bias;
         if (use_bias) {
-            bias = bias.to(torch::kCPU);
+            bias = torch::randn({out_channels}, options);
         }
         
-        // Ensure input and weight have compatible dimensions for convolution
-        if (input.dim() < 3 || weight.dim() < 3) {
-            // Reshape tensors to have at least 3 dimensions
-            if (input.dim() < 3) {
-                std::vector<int64_t> new_shape(3, 1);
-                for (int i = 0; i < input.dim(); i++) {
-                    new_shape[i] = input.size(i);
-                }
-                input = input.reshape(new_shape);
-            }
-            
-            if (weight.dim() < 3) {
-                std::vector<int64_t> new_shape(4, 1);
-                for (int i = 0; i < weight.dim(); i++) {
-                    new_shape[i] = weight.size(i);
-                }
-                weight = weight.reshape(new_shape);
-            }
-        }
-        
-        // Ensure weight has proper shape for convolution
-        if (weight.dim() != 4) {
-            weight = weight.reshape({1, 1, 3, 3});
-        }
-        
-        // Ensure bias has proper shape if used
-        if (use_bias) {
-            if (bias.dim() != 1 || bias.size(0) != weight.size(1)) {
-                bias = torch::ones({weight.size(1)}, bias.options());
-            }
-        }
-        
-        // Apply miopen_convolution_transpose
+        // Call miopen_convolution_transpose
         torch::Tensor output;
         try {
             output = torch::miopen_convolution_transpose(
-                input, weight, bias, padding, output_padding, stride, dilation, groups,
-                benchmark, deterministic
+                input, weight, bias,
+                padding, output_padding, stride, dilation,
+                groups, benchmark, deterministic
             );
         } catch (const c10::Error& e) {
-            // Catch PyTorch-specific errors
+            // Expected failures due to invalid parameter combinations
             return 0;
         }
         
-        // Perform some operation on the output to ensure it's used
+        // Use the output to prevent optimization
         auto sum = output.sum();
+        volatile float result = sum.item<float>();
+        (void)result;
         
-        // Prevent compiler from optimizing away the computation
-        if (sum.item<float>() == -1.0f) {
-            return 1;
-        }
+        return 0;
     }
     catch (const std::exception &e)
     {
-        return 0; // discard the input
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return -1;
     }
-    return 0; // keep the input
 }

@@ -3,13 +3,17 @@
 #include <c10/core/Device.h>          // c10::Device
 #include <c10/core/Stream.h>          // c10::Stream helpers
 #include <iostream>                   // For cerr
-#include <tuple>                      // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing torch.accelerator" << std::endl; // keep target keyword
-    (void) "torch.accelerator"; // ensure keyword is present for harness checks
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -30,6 +34,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Query accelerator availability and exercise basic APIs
+        // getAccelerator(false) returns nullopt if no accelerator is available (doesn't throw)
         auto maybe_accelerator = at::accelerator::getAccelerator(false);
         if (maybe_accelerator.has_value()) {
             c10::DeviceType acc_type = maybe_accelerator.value();
@@ -50,9 +55,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
 
-        // Always touch a CPU path
+        // Always exercise CPU path to ensure fuzzer makes progress even without accelerator
         auto cpu_tensor = tensor.to(torch::kCPU, tensor.scalar_type(), /*non_blocking=*/false, /*copy=*/false);
         (void)cpu_tensor.sum();
+
+        // Exercise getAccelerator with check=true path as well (may throw if no accelerator)
+        // This is wrapped in inner try-catch since it's expected to fail without accelerator
+        try {
+            auto acc_with_check = at::accelerator::getAccelerator(true);
+            (void)acc_with_check;
+        } catch (...) {
+            // Expected when no accelerator is available
+        }
     }
     catch (const std::exception &e)
     {

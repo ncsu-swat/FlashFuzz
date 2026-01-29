@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -30,36 +34,61 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor result = torch::xlogy(x, y);
         
         // Verify that in-place and out-of-place versions produce the same result
-        if (x_copy.sizes() == result.sizes() && x_copy.dtype() == result.dtype()) {
-            // Only compare if shapes and dtypes match
-            // This is a basic check to ensure in-place operation works correctly
-            bool all_close = torch::allclose(x_copy, result, 1e-5, 1e-8);
-            if (!all_close) {
-                // This is not an error, just interesting information
-                // The fuzzer will continue running
+        try {
+            if (x_copy.sizes() == result.sizes() && x_copy.dtype() == result.dtype()) {
+                // Only compare if shapes and dtypes match
+                torch::allclose(x_copy, result, 1e-5, 1e-8);
             }
+        } catch (...) {
+            // Comparison may fail for various reasons, silently ignore
         }
         
         // Test edge cases with scalar inputs
-        if (offset + 2 < Size) {
-            // Create scalar tensors
-            torch::Scalar scalar_x = x.item();
-            torch::Scalar scalar_y = y.item();
-            
-            // Test scalar overloads
-            torch::Tensor scalar_result = torch::xlogy(scalar_x, y);
-            torch::Tensor scalar_result2 = torch::xlogy(x, scalar_y);
-            
-            // Test with scalar tensor instead of scalar-scalar combination
-            torch::Tensor scalar_tensor_x = torch::tensor(scalar_x);
-            torch::Tensor scalar_tensor_y = torch::tensor(scalar_y);
-            torch::Tensor scalar_scalar_result = torch::xlogy(scalar_tensor_x, scalar_tensor_y);
+        // Wrap in try-catch since item() requires scalar tensor
+        try {
+            if (x.numel() == 1 && y.numel() == 1) {
+                // Create scalar tensors
+                torch::Scalar scalar_x = x.item();
+                torch::Scalar scalar_y = y.item();
+                
+                // Test scalar overloads
+                torch::Tensor scalar_result = torch::xlogy(scalar_x, y);
+                torch::Tensor scalar_result2 = torch::xlogy(x, scalar_y);
+                
+                // Test with scalar tensor by reshaping the original tensors
+                torch::Tensor scalar_tensor_x = x.reshape({});
+                torch::Tensor scalar_tensor_y = y.reshape({});
+                torch::Tensor scalar_scalar_result = torch::xlogy(scalar_tensor_x, scalar_tensor_y);
+            }
+        } catch (...) {
+            // Scalar operations may fail, silently ignore
         }
         
         // Test with zero tensor
-        torch::Tensor zeros = torch::zeros_like(x);
-        torch::Tensor zeros_result = torch::xlogy(zeros, y);
-        zeros.xlogy_(y);
+        try {
+            torch::Tensor zeros = torch::zeros_like(x);
+            torch::Tensor zeros_result = torch::xlogy(zeros, y);
+            zeros.xlogy_(y);
+        } catch (...) {
+            // May fail due to dtype issues, silently ignore
+        }
+        
+        // Test with positive values to ensure log is valid
+        try {
+            torch::Tensor pos_y = torch::abs(y) + 1e-6;  // Ensure positive for log
+            torch::Tensor x_clone = x.clone();
+            x_clone.xlogy_(pos_y);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Test with out parameter variant if available
+        try {
+            torch::Tensor out = torch::empty_like(x);
+            torch::xlogy_out(out, x, y);
+        } catch (...) {
+            // May not match shapes, silently ignore
+        }
     }
     catch (const std::exception &e)
     {

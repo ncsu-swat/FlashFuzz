@@ -1,12 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <algorithm>      // For std::max
+#include <algorithm>      // For std::max, std::swap
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -38,7 +43,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     // torch::nn::functional::softmax
                     if (input.dim() > 0 && offset < Size) {
                         int64_t dim = static_cast<int64_t>(Data[offset++]) % std::max(static_cast<int64_t>(1), input.dim());
-                        torch::Tensor result = torch::nn::functional::softmax(input, torch::nn::functional::SoftmaxFuncOptions(dim));
+                        try {
+                            torch::Tensor result = torch::nn::functional::softmax(input, torch::nn::functional::SoftmaxFuncOptions(dim));
+                        } catch (...) {
+                            // Shape/dtype issues - ignore
+                        }
                     }
                     break;
                 }
@@ -46,7 +55,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     // torch::nn::functional::log_softmax
                     if (input.dim() > 0 && offset < Size) {
                         int64_t dim = static_cast<int64_t>(Data[offset++]) % std::max(static_cast<int64_t>(1), input.dim());
-                        torch::Tensor result = torch::nn::functional::log_softmax(input, torch::nn::functional::LogSoftmaxFuncOptions(dim));
+                        try {
+                            torch::Tensor result = torch::nn::functional::log_softmax(input, torch::nn::functional::LogSoftmaxFuncOptions(dim));
+                        } catch (...) {
+                            // Shape/dtype issues - ignore
+                        }
                     }
                     break;
                 }
@@ -100,9 +113,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Create a second tensor if there's enough data left
+        // Create a second tensor with matching shape for binary operations
         if (offset + 3 < Size) {
-            torch::Tensor second_input = fuzzer_utils::createTensor(Data, Size, offset);
+            // Clone input and modify it to ensure compatible shapes
+            torch::Tensor second_input = input.clone();
+            
+            // Add some variation based on fuzzer data
+            if (offset < Size) {
+                float scale = static_cast<float>(Data[offset++]) / 128.0f;
+                second_input = second_input * scale;
+            }
             
             // Test binary operations
             if (offset < Size) {
@@ -111,16 +131,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 switch (bin_op_selector % 5) {
                     case 0: {
                         // torch::nn::functional::mse_loss
-                        torch::Tensor result = torch::nn::functional::mse_loss(input, second_input);
+                        try {
+                            torch::Tensor result = torch::nn::functional::mse_loss(input, second_input);
+                        } catch (...) {
+                            // Shape mismatch - ignore
+                        }
                         break;
                     }
                     case 1: {
                         // torch::nn::functional::binary_cross_entropy
-                        if (input.dtype() == torch::kFloat || input.dtype() == torch::kDouble) {
-                            // Clamp input and target to [0, 1] for BCE
-                            torch::Tensor clamped_input = torch::clamp(input, 0.0, 1.0);
-                            torch::Tensor clamped_target = torch::clamp(second_input, 0.0, 1.0);
-                            torch::Tensor result = torch::nn::functional::binary_cross_entropy(clamped_input, clamped_target);
+                        try {
+                            // Convert to float and clamp to [eps, 1-eps] for BCE
+                            torch::Tensor float_input = input.to(torch::kFloat);
+                            torch::Tensor float_target = second_input.to(torch::kFloat);
+                            float_input = torch::clamp(torch::sigmoid(float_input), 1e-7, 1.0 - 1e-7);
+                            float_target = torch::clamp(torch::sigmoid(float_target), 0.0, 1.0);
+                            torch::Tensor result = torch::nn::functional::binary_cross_entropy(float_input, float_target);
+                        } catch (...) {
+                            // Expected failures - ignore
                         }
                         break;
                     }
@@ -128,21 +156,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         // torch::nn::functional::cosine_similarity
                         if (input.dim() > 0 && offset < Size) {
                             int64_t dim = static_cast<int64_t>(Data[offset++]) % std::max(static_cast<int64_t>(1), input.dim());
-                            torch::Tensor result = torch::nn::functional::cosine_similarity(input, second_input, torch::nn::functional::CosineSimilarityFuncOptions().dim(dim));
+                            try {
+                                torch::Tensor result = torch::nn::functional::cosine_similarity(input, second_input, torch::nn::functional::CosineSimilarityFuncOptions().dim(dim));
+                            } catch (...) {
+                                // Shape mismatch - ignore
+                            }
                         }
                         break;
                     }
                     case 3: {
                         // torch::nn::functional::pairwise_distance
-                        if (input.dim() > 0 && offset < Size) {
-                            double p = 2.0 + (static_cast<double>(Data[offset++]) / 64.0);
-                            torch::Tensor result = torch::nn::functional::pairwise_distance(input, second_input, torch::nn::functional::PairwiseDistanceFuncOptions().p(p));
+                        try {
+                            if (input.dim() >= 2 && offset < Size) {
+                                double p = 2.0 + (static_cast<double>(Data[offset++]) / 64.0);
+                                torch::Tensor result = torch::nn::functional::pairwise_distance(input, second_input, torch::nn::functional::PairwiseDistanceFuncOptions().p(p));
+                            }
+                        } catch (...) {
+                            // Shape mismatch - ignore
                         }
                         break;
                     }
                     case 4: {
                         // torch::nn::functional::kl_div
-                        torch::Tensor result = torch::nn::functional::kl_div(input, second_input);
+                        try {
+                            torch::Tensor result = torch::nn::functional::kl_div(input, second_input);
+                        } catch (...) {
+                            // Shape mismatch - ignore
+                        }
                         break;
                     }
                 }
@@ -152,7 +192,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -19,15 +23,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         torch::Tensor target = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Ensure both tensors are float type for loss computation
+        input = input.to(torch::kFloat32);
+        target = target.to(torch::kFloat32);
+        
         // Extract delta parameter from the input data
         double delta = 1.0;
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&delta, Data + offset, sizeof(double));
             offset += sizeof(double);
             
-            // Ensure delta is positive
-            delta = std::abs(delta);
-            if (delta == 0.0) {
+            // Ensure delta is positive and finite
+            if (!std::isfinite(delta) || delta <= 0.0) {
                 delta = 1.0;
             }
         }
@@ -61,62 +68,81 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::HuberLoss huber_loss(options);
         
         // Apply the HuberLoss operation
+        // This may throw if input and target have incompatible shapes
         torch::Tensor loss = huber_loss->forward(input, target);
         
-        // Ensure the loss is valid
-        if (loss.defined() && !loss.isnan().any().item<bool>() && !loss.isinf().any().item<bool>()) {
-            // Optionally perform additional operations with the loss
-            auto loss_item = loss.item<double>();
+        // Ensure the loss is computed (force evaluation)
+        if (loss.defined()) {
+            // Use sum() to get a scalar regardless of reduction mode
+            auto loss_sum = loss.sum().item<double>();
+            (void)loss_sum;
         }
         
-        // Try with different delta values
-        if (offset + sizeof(double) <= Size) {
-            double new_delta;
-            std::memcpy(&new_delta, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            
-            // Try with a very small delta
-            torch::nn::HuberLossOptions small_options;
-            small_options.delta(std::abs(new_delta) * 1e-5 + 1e-10);
-            small_options.reduction(reduction);
-            torch::nn::HuberLoss small_huber_loss(small_options);
-            torch::Tensor small_loss = small_huber_loss->forward(input, target);
-            
-            // Try with a very large delta
-            torch::nn::HuberLossOptions large_options;
-            large_options.delta(std::abs(new_delta) * 1e5 + 1.0);
-            large_options.reduction(reduction);
-            torch::nn::HuberLoss large_huber_loss(large_options);
-            torch::Tensor large_loss = large_huber_loss->forward(input, target);
+        // Try with different delta values (silent catch for expected failures)
+        try {
+            if (offset + sizeof(double) <= Size) {
+                double new_delta;
+                std::memcpy(&new_delta, Data + offset, sizeof(double));
+                offset += sizeof(double);
+                
+                // Sanitize new_delta
+                if (!std::isfinite(new_delta)) {
+                    new_delta = 1.0;
+                }
+                
+                // Try with a very small delta
+                double small_delta = std::abs(new_delta) * 1e-5 + 1e-10;
+                torch::nn::HuberLossOptions small_options;
+                small_options.delta(small_delta);
+                small_options.reduction(reduction);
+                torch::nn::HuberLoss small_huber_loss(small_options);
+                torch::Tensor small_loss = small_huber_loss->forward(input, target);
+                (void)small_loss.sum().item<double>();
+                
+                // Try with a very large delta
+                double large_delta = std::abs(new_delta) * 1e5 + 1.0;
+                if (large_delta > 1e10) large_delta = 1e10; // Cap to avoid overflow
+                torch::nn::HuberLossOptions large_options;
+                large_options.delta(large_delta);
+                large_options.reduction(reduction);
+                torch::nn::HuberLoss large_huber_loss(large_options);
+                torch::Tensor large_loss = large_huber_loss->forward(input, target);
+                (void)large_loss.sum().item<double>();
+            }
+        } catch (...) {
+            // Silently ignore - these are expected failures
         }
         
-        // Try with different reduction modes
-        if (offset < Size) {
-            uint8_t new_reduction_byte = Data[offset++];
-            
+        // Try with different reduction modes (silent catch for expected failures)
+        try {
             torch::nn::HuberLossOptions none_options;
             none_options.delta(delta);
             none_options.reduction(torch::kNone);
             torch::nn::HuberLoss none_huber_loss(none_options);
             torch::Tensor none_loss = none_huber_loss->forward(input, target);
+            (void)none_loss.sum().item<double>();
             
             torch::nn::HuberLossOptions sum_options;
             sum_options.delta(delta);
             sum_options.reduction(torch::kSum);
             torch::nn::HuberLoss sum_huber_loss(sum_options);
             torch::Tensor sum_loss = sum_huber_loss->forward(input, target);
+            (void)sum_loss.item<double>();
             
             torch::nn::HuberLossOptions mean_options;
             mean_options.delta(delta);
             mean_options.reduction(torch::kMean);
             torch::nn::HuberLoss mean_huber_loss(mean_options);
             torch::Tensor mean_loss = mean_huber_loss->forward(input, target);
+            (void)mean_loss.item<double>();
+        } catch (...) {
+            // Silently ignore - these are expected failures
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

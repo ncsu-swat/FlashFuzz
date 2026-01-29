@@ -1,68 +1,69 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Get the number of interop threads
+        // This is a simple getter that returns the current thread pool size
         int num_threads = torch::get_num_interop_threads();
         
-        // Try setting the number of interop threads to different values
-        if (Size > 0) {
-            int new_threads = static_cast<int>(Data[offset++]) % 16;
-            torch::set_num_interop_threads(new_threads);
-            
-            // Verify the change took effect
-            int updated_threads = torch::get_num_interop_threads();
-            
-            // Try setting to negative value (should be handled by PyTorch)
-            if (Size > offset) {
-                int negative_threads = -static_cast<int>(Data[offset++]);
-                torch::set_num_interop_threads(negative_threads);
-                
-                // Get the value again after attempting to set negative
-                int after_negative = torch::get_num_interop_threads();
-            }
-            
-            // Try setting to a very large value
-            if (Size > offset + sizeof(int)) {
-                int large_value;
-                std::memcpy(&large_value, Data + offset, sizeof(int));
-                offset += sizeof(int);
-                
-                // Make it a large positive value
-                large_value = std::abs(large_value);
-                if (large_value < 1000) {
-                    large_value += 1000;
-                }
-                
-                torch::set_num_interop_threads(large_value);
-                int after_large = torch::get_num_interop_threads();
-            }
-            
-            // Try setting back to original value
-            torch::set_num_interop_threads(num_threads);
-            int restored_threads = torch::get_num_interop_threads();
+        // Verify the returned value is sane (should be >= 1)
+        if (num_threads < 1) {
+            std::cerr << "Unexpected: num_interop_threads < 1: " << num_threads << std::endl;
         }
         
-        // Create a tensor and perform an operation to see if thread settings affect it
-        if (Size > offset) {
-            torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Note: torch::set_num_interop_threads() can only be called ONCE
+        // before any inter-op parallel work is done. It cannot be meaningfully
+        // fuzzed as calling it multiple times throws an exception by design.
+        // Therefore, we only test the getter here.
+        
+        // Use the fuzz data to create tensors and exercise operations that
+        // may use the interop thread pool internally
+        if (Size > 0) {
+            size_t offset = 0;
             
-            // Perform some operation that might use interop threads
-            torch::Tensor result = tensor + 1;
+            try {
+                torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                
+                // Perform operations that may use interop threads internally
+                // Matrix multiplication can use multiple threads
+                if (tensor.dim() >= 2 && tensor.size(-1) > 0 && tensor.size(-2) > 0) {
+                    auto t = tensor.select(0, 0).unsqueeze(0);
+                    if (t.dim() == 2) {
+                        torch::mm(t, t.transpose(0, 1));
+                    }
+                }
+                
+                // Reduction operations may also use threading
+                torch::sum(tensor);
+                torch::mean(tensor.to(torch::kFloat));
+                
+            } catch (const std::exception &) {
+                // Shape/type mismatches are expected with random data
+            }
+        }
+        
+        // Call get_num_interop_threads again to ensure it's stable
+        int num_threads_after = torch::get_num_interop_threads();
+        
+        // Sanity check: thread count shouldn't change during execution
+        if (num_threads != num_threads_after) {
+            std::cerr << "Thread count changed unexpectedly: " 
+                      << num_threads << " -> " << num_threads_after << std::endl;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -20,14 +26,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Ensure input has at least 4 dimensions (N, C, H, W) for UpsamplingNearest2d
         if (input.dim() < 4) {
-            // Add dimensions if needed
             while (input.dim() < 4) {
                 input = input.unsqueeze(0);
             }
         }
         
-        // Extract parameters for UpsamplingNearest2d
-        // We need at least 4 bytes for scale_factor or output_size
+        // Limit input spatial dimensions to avoid OOM
+        if (input.size(2) > 64 || input.size(3) > 64) {
+            input = input.slice(2, 0, std::min(input.size(2), (int64_t)64));
+            input = input.slice(3, 0, std::min(input.size(3), (int64_t)64));
+        }
+        
+        // Ensure float type for interpolation
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Need parameters
         if (offset + 4 > Size) {
             return 0;
         }
@@ -35,72 +50,92 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Decide whether to use scale_factor or output_size
         bool use_scale_factor = (Data[offset++] % 2 == 0);
         
+        // Helper lambda to sanitize scale factor
+        auto sanitize_scale = [](float val) -> double {
+            if (std::isnan(val) || std::isinf(val) || val <= 0.0f) {
+                return 1.0;
+            }
+            // Limit scale factor to avoid OOM (max 10x upscale)
+            return std::min(std::max(static_cast<double>(val), 0.1), 10.0);
+        };
+        
+        volatile float result_sum = 0.0f;  // Prevent optimization
+        
         if (use_scale_factor) {
-            // Parse scale_factor (float value)
             float scale_factor = 1.0f;
             if (offset + sizeof(float) <= Size) {
                 std::memcpy(&scale_factor, Data + offset, sizeof(float));
                 offset += sizeof(float);
-                scale_factor = std::abs(scale_factor);
-                if (scale_factor == 0.0f) scale_factor = 1.0f;
             }
             
-            // Apply upsampling using functional API
-            torch::Tensor output = torch::nn::functional::upsample_nearest2d(
-                input, 
-                torch::nn::functional::UpsampleNearest2dFuncOptions().scale_factor(std::vector<double>{scale_factor, scale_factor})
-            );
+            double safe_scale = sanitize_scale(scale_factor);
+            
+            try {
+                // Use torch::nn::Upsample module with nearest mode
+                auto upsample = torch::nn::Upsample(
+                    torch::nn::UpsampleOptions()
+                        .scale_factor(std::vector<double>{safe_scale, safe_scale})
+                        .mode(torch::kNearest)
+                );
+                torch::Tensor output = upsample->forward(input);
+                result_sum += output.numel();
+            } catch (const c10::Error&) {
+                // Expected for invalid configurations
+            }
         } 
         else {
-            // Parse output_size (two int values for height and width)
             int64_t output_height = 1;
             int64_t output_width = 1;
             
             if (offset + sizeof(int64_t) <= Size) {
                 std::memcpy(&output_height, Data + offset, sizeof(int64_t));
                 offset += sizeof(int64_t);
-                
-                // Make output_height positive
-                output_height = std::abs(output_height) % 100 + 1;
+                output_height = std::abs(output_height) % 256 + 1;
             }
             
             if (offset + sizeof(int64_t) <= Size) {
                 std::memcpy(&output_width, Data + offset, sizeof(int64_t));
                 offset += sizeof(int64_t);
-                
-                // Make output_width positive
-                output_width = std::abs(output_width) % 100 + 1;
+                output_width = std::abs(output_width) % 256 + 1;
             }
             
-            // Apply upsampling using functional API
-            torch::Tensor output = torch::nn::functional::upsample_nearest2d(
-                input,
-                torch::nn::functional::UpsampleNearest2dFuncOptions().size(std::vector<int64_t>{output_height, output_width})
-            );
+            try {
+                auto upsample = torch::nn::Upsample(
+                    torch::nn::UpsampleOptions()
+                        .size(std::vector<int64_t>{output_height, output_width})
+                        .mode(torch::kNearest)
+                );
+                torch::Tensor output = upsample->forward(input);
+                result_sum += output.numel();
+            } catch (const c10::Error&) {
+                // Expected for invalid configurations
+            }
         }
         
-        // Try alternative forms
+        // Try alternative forms - using functional::interpolate
         if (offset + 1 < Size) {
             uint8_t alt_mode = Data[offset++];
             
             if (alt_mode % 3 == 0) {
-                // Test with just a scale factor value
                 float scale = 1.5f;
                 if (offset + sizeof(float) <= Size) {
                     std::memcpy(&scale, Data + offset, sizeof(float));
                     offset += sizeof(float);
-                    scale = std::abs(scale);
-                    if (scale == 0.0f) scale = 1.0f;
                 }
                 
-                torch::Tensor output = torch::nn::functional::upsample_nearest2d(
-                    input,
-                    torch::nn::functional::UpsampleNearest2dFuncOptions().scale_factor(std::vector<double>{scale, scale})
-                );
+                double safe_scale = sanitize_scale(scale);
+                
+                try {
+                    auto options = torch::nn::functional::InterpolateFuncOptions()
+                        .scale_factor(std::vector<double>{safe_scale, safe_scale})
+                        .mode(torch::kNearest);
+                    torch::Tensor output = torch::nn::functional::interpolate(input, options);
+                    result_sum += output.numel();
+                } catch (const c10::Error&) {
+                    // Expected for invalid configurations
+                }
             }
             else if (alt_mode % 3 == 1) {
-                // Test with a vector of scale factors
-                std::vector<double> scales;
                 float scale1 = 1.0f, scale2 = 1.0f;
                 
                 if (offset + sizeof(float) <= Size) {
@@ -113,17 +148,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     offset += sizeof(float);
                 }
                 
-                scales.push_back(std::abs(scale1) + 0.1);
-                scales.push_back(std::abs(scale2) + 0.1);
+                double safe_scale1 = sanitize_scale(scale1);
+                double safe_scale2 = sanitize_scale(scale2);
                 
-                torch::Tensor output = torch::nn::functional::upsample_nearest2d(
-                    input,
-                    torch::nn::functional::UpsampleNearest2dFuncOptions().scale_factor(scales)
-                );
+                try {
+                    auto options = torch::nn::functional::InterpolateFuncOptions()
+                        .scale_factor(std::vector<double>{safe_scale1, safe_scale2})
+                        .mode(torch::kNearest);
+                    torch::Tensor output = torch::nn::functional::interpolate(input, options);
+                    result_sum += output.numel();
+                } catch (const c10::Error&) {
+                    // Expected for invalid configurations
+                }
             }
             else {
-                // Test with a vector for output size
-                std::vector<int64_t> sizes;
                 int64_t size1 = 1, size2 = 1;
                 
                 if (offset + sizeof(int64_t) <= Size) {
@@ -136,20 +174,46 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     offset += sizeof(int64_t);
                 }
                 
-                sizes.push_back(std::abs(size1) % 100 + 1);
-                sizes.push_back(std::abs(size2) % 100 + 1);
+                size1 = std::abs(size1) % 256 + 1;
+                size2 = std::abs(size2) % 256 + 1;
                 
-                torch::Tensor output = torch::nn::functional::upsample_nearest2d(
-                    input,
-                    torch::nn::functional::UpsampleNearest2dFuncOptions().size(sizes)
-                );
+                try {
+                    auto options = torch::nn::functional::InterpolateFuncOptions()
+                        .size(std::vector<int64_t>{size1, size2})
+                        .mode(torch::kNearest);
+                    torch::Tensor output = torch::nn::functional::interpolate(input, options);
+                    result_sum += output.numel();
+                } catch (const c10::Error&) {
+                    // Expected for invalid configurations
+                }
             }
         }
+        
+        // Also test the UpsamplingNearest2d module directly (alias for Upsample with nearest mode)
+        if (offset + 2 < Size) {
+            int64_t h = (Data[offset++] % 64) + 1;
+            int64_t w = (Data[offset++] % 64) + 1;
+            
+            try {
+                // UpsamplingNearest2d is essentially Upsample with mode=nearest
+                auto upsample_nearest = torch::nn::Upsample(
+                    torch::nn::UpsampleOptions()
+                        .size(std::vector<int64_t>{h, w})
+                        .mode(torch::kNearest)
+                );
+                torch::Tensor output = upsample_nearest->forward(input);
+                result_sum += output.numel();
+            } catch (const c10::Error&) {
+                // Expected for invalid configurations
+            }
+        }
+        
+        (void)result_sum;  // Suppress unused warning
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

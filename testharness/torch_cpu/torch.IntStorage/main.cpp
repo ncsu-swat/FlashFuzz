@@ -7,7 +7,12 @@
 // Target API: torch.IntStorage
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -25,9 +30,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         storage_elems = std::abs(storage_elems % 256) + 1;
 
+        // Create IntStorage by creating an int tensor and getting its storage
         torch::Tensor int_tensor = torch::zeros({storage_elems}, torch::kInt);
         torch::Storage storage = int_tensor.storage();
 
+        // Fill storage with fuzzed data
         int64_t copy_elems = std::min<int64_t>(seed.numel(), storage_elems);
         if (copy_elems > 0) {
             auto seed_contiguous = seed.contiguous();
@@ -43,6 +50,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
 
+        // Exercise storage properties
         size_t nbytes = storage.nbytes();
         if (nbytes > 0) {
             const int32_t *data_ptr = static_cast<const int32_t *>(storage.data());
@@ -52,6 +60,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             (void)last;
         }
 
+        // Create a view through from_blob sharing the storage
         int64_t view_elems = std::max<int64_t>(1, std::min<int64_t>(storage_elems, 32));
         torch::Tensor view_tensor = torch::from_blob(
             storage.mutable_data(),
@@ -63,6 +72,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             view_ptr[0] = static_cast<int32_t>(view_storage.nbytes());
         }
 
+        // Test storage copy behavior
         torch::Tensor copy_tensor = torch::zeros({storage_elems}, torch::kInt);
         torch::Storage copy_storage = copy_tensor.storage();
         size_t bytes_to_copy = std::min<size_t>(copy_storage.nbytes(), nbytes);
@@ -70,6 +80,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(copy_storage.mutable_data(), storage.data(), bytes_to_copy);
         }
 
+        // Create storage from raw fuzz data via from_blob
         if (offset < Size) {
             int64_t blob_elems = std::min<int64_t>(
                 static_cast<int64_t>((Size - offset) / sizeof(int32_t)),
@@ -88,6 +99,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
 
+        // Access tensor backed by storage
         if (storage_elems > 0) {
             torch::Tensor tensor_from_storage = torch::from_blob(
                 storage.mutable_data(),
@@ -100,7 +112,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

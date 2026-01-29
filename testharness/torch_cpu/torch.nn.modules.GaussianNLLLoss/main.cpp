@@ -1,147 +1,133 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input, variance, and target tensors
+        // Parse options first to ensure deterministic tensor creation
+        bool full = Data[offset++] % 2 == 0;
+        uint8_t red_val = Data[offset++] % 3;
+        torch::nn::GaussianNLLLossOptions::reduction_t reduction;
+        switch (red_val) {
+            case 0: reduction = torch::kNone; break;
+            case 1: reduction = torch::kSum; break;
+            case 2: 
+            default: reduction = torch::kMean; break;
+        }
+        
+        // Determine batch size and feature size from data
+        int64_t batch_size = 1 + (Data[offset++] % 8);  // 1-8
+        int64_t feature_size = 1 + (Data[offset++] % 8); // 1-8
+        
+        // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Ensure we have enough data for the next tensor
-        if (offset >= Size) {
+        if (!input.defined() || input.numel() == 0) {
             return 0;
         }
         
-        torch::Tensor variance = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Ensure we have enough data for the next tensor
-        if (offset >= Size) {
-            return 0;
-        }
-        
-        torch::Tensor target = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Ensure input, variance, and target have the same shape
-        // If not, we'll reshape them to match the smallest one
-        std::vector<int64_t> common_shape;
-        if (input.dim() > 0 && variance.dim() > 0 && target.dim() > 0) {
-            // Find the tensor with the smallest number of dimensions
-            int min_dim = std::min({input.dim(), variance.dim(), target.dim()});
-            
-            // Get the shape of the tensor with the smallest dimensions
-            if (input.dim() == min_dim) {
-                common_shape = input.sizes().vec();
-            } else if (variance.dim() == min_dim) {
-                common_shape = variance.sizes().vec();
-            } else {
-                common_shape = target.sizes().vec();
-            }
-            
-            // Reshape tensors if needed
-            if (input.dim() != min_dim || input.sizes() != common_shape) {
-                if (input.numel() > 0) {
-                    input = input.reshape(common_shape);
-                } else {
-                    input = torch::zeros(common_shape);
-                }
-            }
-            
-            if (variance.dim() != min_dim || variance.sizes() != common_shape) {
-                if (variance.numel() > 0) {
-                    variance = variance.reshape(common_shape);
-                } else {
-                    variance = torch::ones(common_shape);
-                }
-            }
-            
-            if (target.dim() != min_dim || target.sizes() != common_shape) {
-                if (target.numel() > 0) {
-                    target = target.reshape(common_shape);
-                } else {
-                    target = torch::zeros(common_shape);
-                }
-            }
+        // Reshape input to a consistent shape
+        int64_t total_elements = batch_size * feature_size;
+        input = input.flatten();
+        if (input.numel() < total_elements) {
+            // Pad with zeros if needed
+            torch::Tensor padding = torch::zeros({total_elements - input.numel()}, input.options());
+            input = torch::cat({input, padding});
         } else {
-            // Handle the case where at least one tensor has 0 dimensions
-            if (input.dim() == 0) {
-                input = torch::tensor(1.0f);
+            input = input.slice(0, 0, total_elements);
+        }
+        input = input.reshape({batch_size, feature_size}).to(torch::kFloat32);
+        
+        // Create target tensor with same shape
+        torch::Tensor target = fuzzer_utils::createTensor(Data, Size, offset);
+        if (!target.defined() || target.numel() == 0) {
+            target = torch::zeros({batch_size, feature_size}, torch::kFloat32);
+        } else {
+            target = target.flatten();
+            if (target.numel() < total_elements) {
+                torch::Tensor padding = torch::zeros({total_elements - target.numel()}, target.options());
+                target = torch::cat({target, padding});
+            } else {
+                target = target.slice(0, 0, total_elements);
             }
-            if (variance.dim() == 0) {
-                variance = torch::tensor(1.0f);
+            target = target.reshape({batch_size, feature_size}).to(torch::kFloat32);
+        }
+        
+        // Create variance tensor - can be same shape as input or just feature_size
+        torch::Tensor variance = fuzzer_utils::createTensor(Data, Size, offset);
+        if (!variance.defined() || variance.numel() == 0) {
+            variance = torch::ones({batch_size, feature_size}, torch::kFloat32);
+        } else {
+            variance = variance.flatten();
+            if (variance.numel() < total_elements) {
+                torch::Tensor padding = torch::ones({total_elements - variance.numel()}, variance.options());
+                variance = torch::cat({variance, padding});
+            } else {
+                variance = variance.slice(0, 0, total_elements);
             }
-            if (target.dim() == 0) {
-                target = torch::tensor(0.0f);
-            }
-            
-            // Ensure all tensors have the same shape
-            common_shape = {1};
-            input = input.reshape(common_shape);
-            variance = variance.reshape(common_shape);
-            target = target.reshape(common_shape);
+            variance = variance.reshape({batch_size, feature_size}).to(torch::kFloat32);
         }
         
         // Ensure variance is positive (required by GaussianNLLLoss)
-        variance = torch::abs(variance) + 1e-6;
-        
-        // Parse options for GaussianNLLLoss
-        bool full = false;
         double eps = 1e-6;
-        torch::Reduction::Reduction reduction = torch::Reduction::Mean;
+        variance = torch::abs(variance) + eps;
         
-        // Use remaining data to set options if available
-        if (offset < Size) {
-            full = Data[offset++] % 2 == 0;
+        // Create the GaussianNLLLoss module
+        auto options = torch::nn::GaussianNLLLossOptions()
+            .full(full)
+            .eps(eps)
+            .reduction(reduction);
+        torch::nn::GaussianNLLLoss loss_fn(options);
+        
+        // Apply the Gaussian NLL loss function
+        torch::Tensor loss = loss_fn(input, target, variance);
+        
+        // Access the result to ensure computation happens
+        if (loss.defined()) {
+            volatile float check = loss.sum().item<float>();
+            (void)check;
         }
         
-        if (offset < Size) {
-            uint8_t red_val = Data[offset++] % 3;
-            switch (red_val) {
-                case 0: reduction = torch::Reduction::None; break;
-                case 1: reduction = torch::Reduction::Sum; break;
-                case 2: 
-                default: reduction = torch::Reduction::Mean; break;
-            }
-        }
+        // Test with requires_grad for backward pass coverage
+        torch::Tensor input_grad = input.clone().detach().requires_grad_(true);
+        torch::Tensor target_no_grad = target.clone().detach();
+        torch::Tensor variance_no_grad = variance.clone().detach();
         
-        // Apply the Gaussian NLL loss function directly
-        torch::Tensor loss = torch::nn::functional::gaussian_nll_loss(
-            input, target, variance,
-            torch::nn::functional::GaussianNLLLossFuncOptions()
+        try {
+            // For backward pass, use mean reduction to get a scalar
+            auto grad_options = torch::nn::GaussianNLLLossOptions()
                 .full(full)
                 .eps(eps)
-                .reduction(reduction)
-        );
-        
-        // Ensure the loss is finite
-        if (loss.defined() && !loss.isfinite().all().item<bool>()) {
-            // This is not an error, just a case we want to note
-            return 0;
-        }
-        
-        // Test backward pass if possible
-        if (input.requires_grad() && loss.numel() > 0 && loss.scalar_type() != torch::kHalf) {
-            try {
-                loss.backward();
-            } catch (const std::exception& e) {
-                // Backward pass failed, but this is not an error for the fuzzer
+                .reduction(reduction == torch::kNone ? torch::kMean : reduction);
+            torch::nn::GaussianNLLLoss loss_fn_grad(grad_options);
+            
+            torch::Tensor loss_grad = loss_fn_grad(input_grad, target_no_grad, variance_no_grad);
+            
+            if (loss_grad.defined() && loss_grad.numel() == 1) {
+                loss_grad.backward();
             }
+        } catch (...) {
+            // Backward pass failed silently - expected for some configurations
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

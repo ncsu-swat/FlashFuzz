@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <iostream>       // For cerr, cout
+#include <limits>         // For std::numeric_limits
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -41,34 +46,80 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::selu_(input_copy);
         }
         
-        // Try with edge cases if we have enough data
+        // Try with different tensor types
         if (offset < Size) {
-            // Create a tensor with extreme values
-            torch::Tensor extreme_input;
+            uint8_t test_type = Data[offset++] % 6;
             
-            uint8_t extreme_type = Data[offset++] % 4;
-            if (extreme_type == 0) {
-                // Very large positive values
-                extreme_input = torch::ones_like(input) * 1e10;
-            } else if (extreme_type == 1) {
-                // Very large negative values
-                extreme_input = torch::ones_like(input) * -1e10;
-            } else if (extreme_type == 2) {
-                // NaN values
-                extreme_input = torch::full_like(input, std::numeric_limits<float>::quiet_NaN());
-            } else {
-                // Inf values
-                extreme_input = torch::full_like(input, std::numeric_limits<float>::infinity());
+            try {
+                torch::Tensor test_input;
+                
+                if (test_type == 0) {
+                    // Very large positive values
+                    test_input = torch::ones_like(input) * 1e10;
+                } else if (test_type == 1) {
+                    // Very large negative values
+                    test_input = torch::ones_like(input) * -1e10;
+                } else if (test_type == 2) {
+                    // NaN values
+                    test_input = torch::full_like(input, std::numeric_limits<float>::quiet_NaN());
+                } else if (test_type == 3) {
+                    // Inf values
+                    test_input = torch::full_like(input, std::numeric_limits<float>::infinity());
+                } else if (test_type == 4) {
+                    // Negative Inf values
+                    test_input = torch::full_like(input, -std::numeric_limits<float>::infinity());
+                } else {
+                    // Zero tensor
+                    test_input = torch::zeros_like(input);
+                }
+                
+                // Apply SELU to test values
+                torch::Tensor test_output = selu_default->forward(test_input);
+            } catch (const std::exception &e) {
+                // Silently catch expected failures for edge cases
             }
-            
-            // Apply SELU to extreme values
-            torch::Tensor extreme_output = selu_default->forward(extreme_input);
+        }
+        
+        // Test with double precision if we have more data
+        if (offset < Size && (Data[offset++] & 0x01)) {
+            try {
+                torch::Tensor double_input = input.to(torch::kDouble);
+                torch::Tensor double_output = selu_default->forward(double_input);
+            } catch (const std::exception &e) {
+                // Silently catch - some dtypes may not be supported
+            }
+        }
+        
+        // Test with different dimensions
+        if (offset < Size) {
+            try {
+                uint8_t dim_test = Data[offset++] % 4;
+                torch::Tensor dim_input;
+                
+                if (dim_test == 0) {
+                    // Scalar
+                    dim_input = torch::randn({});
+                } else if (dim_test == 1) {
+                    // 1D
+                    dim_input = torch::randn({16});
+                } else if (dim_test == 2) {
+                    // 2D
+                    dim_input = torch::randn({4, 8});
+                } else {
+                    // 4D (batch, channel, height, width)
+                    dim_input = torch::randn({2, 3, 4, 4});
+                }
+                
+                torch::Tensor dim_output = selu_default->forward(dim_input);
+            } catch (const std::exception &e) {
+                // Silently catch
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

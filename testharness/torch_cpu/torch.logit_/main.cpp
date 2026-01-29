@@ -1,11 +1,18 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
+#include <cstring>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -28,17 +35,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             eps = std::abs(eps);
             if (eps == 0.0) eps = 1e-6;
             if (std::isnan(eps) || std::isinf(eps)) eps = 1e-6;
+            // Clamp to reasonable range
+            if (eps > 0.5) eps = 0.5;
         }
         
         // Make a copy of the input tensor to preserve original data
-        torch::Tensor tensor_copy = input_tensor.clone();
+        // logit_ requires floating point tensor
+        torch::Tensor tensor_copy = input_tensor.to(torch::kFloat32).clone();
         
         // Apply logit_ in-place operation
+        // logit(x) = log(x / (1 - x)), expects input in range [0, 1]
+        // eps clamps input to [eps, 1-eps] to avoid inf
         tensor_copy.logit_(eps);
         
-        // Alternative: test the functional version as well if there's enough data
+        // Also test the functional version for better coverage
         if (offset < Size && Data[offset] % 2 == 0) {
-            torch::Tensor result = torch::logit(input_tensor, eps);
+            torch::Tensor input_float = input_tensor.to(torch::kFloat32);
+            torch::Tensor result = torch::logit(input_float, eps);
+            (void)result; // Prevent unused variable warning
         }
         
         return 0;
@@ -46,7 +60,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

@@ -1,149 +1,224 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <torch/script.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         if (Size < 4) {
             return 0;
         }
+
+        size_t offset = 0;
+
+        // torch.jit.isinstance is a TorchScript-only construct for runtime type checking
+        // It can only be used inside TorchScript code, not as a direct C++ API call
         
-        // Create a tensor from the input data
+        // Test 1: Basic isinstance checks with various types
+        static std::string script_code = R"JIT(
+import torch
+from typing import Dict, List, Optional, Tuple
+
+def check_tensor(x: torch.Tensor) -> bool:
+    return isinstance(x, torch.Tensor)
+
+def check_optional_tensor(x: Optional[torch.Tensor]) -> bool:
+    return isinstance(x, torch.Tensor)
+
+def check_int_value(x: int) -> bool:
+    return isinstance(x, int)
+
+def check_float_value(x: float) -> bool:
+    return isinstance(x, float)
+
+def check_bool_value(x: bool) -> bool:
+    return isinstance(x, bool)
+
+def check_str_value(x: str) -> bool:
+    return isinstance(x, str)
+
+def check_list_int(x: List[int]) -> bool:
+    return isinstance(x, List[int])
+
+def check_list_tensor(x: List[torch.Tensor]) -> bool:
+    return isinstance(x, List[torch.Tensor])
+
+def check_dict_str_int(x: Dict[str, int]) -> bool:
+    return isinstance(x, Dict[str, int])
+
+def check_tuple_int_int(x: Tuple[int, int]) -> bool:
+    return isinstance(x, Tuple[int, int])
+)JIT";
+
+        static std::shared_ptr<torch::jit::CompilationUnit> cu = torch::jit::compile(script_code);
+
+        // Create tensor from fuzzer input
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create a simple JIT script module
-        std::string script_code = R"(
-            def check_tensor_type(x):
-                return torch.jit.isinstance(x, torch.Tensor)
-                
-            def check_int_type(x):
-                return torch.jit.isinstance(x, int)
-                
-            def check_float_type(x):
-                return torch.jit.isinstance(x, float)
-                
-            def check_list_type(x):
-                return torch.jit.isinstance(x, list)
-                
-            def check_tuple_type(x):
-                return torch.jit.isinstance(x, tuple)
-                
-            def check_dict_type(x):
-                return torch.jit.isinstance(x, dict)
-        )";
-        
-        auto compilation_unit = torch::jit::compile(script_code);
-        
-        // Test isinstance with tensor
-        std::vector<torch::jit::IValue> inputs = {tensor};
-        torch::jit::IValue result = compilation_unit->get_function("check_tensor_type")(inputs);
-        bool is_tensor = result.toBool();
-        
-        // Test isinstance with int
-        if (offset + 1 < Size) {
-            int64_t int_val = static_cast<int64_t>(Data[offset++]);
-            inputs = {int_val};
-            result = compilation_unit->get_function("check_int_type")(inputs);
-            bool is_int = result.toBool();
+
+        // Test isinstance with Tensor
+        {
+            std::vector<torch::jit::IValue> inputs = {tensor};
+            auto& func = cu->get_function("check_tensor");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
         }
-        
+
+        // Test isinstance with int
+        if (offset < Size) {
+            int64_t int_val = static_cast<int64_t>(Data[offset++] % 128);
+            std::vector<torch::jit::IValue> inputs = {int_val};
+            auto& func = cu->get_function("check_int_value");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
+        }
+
         // Test isinstance with float
-        if (offset + 4 <= Size) {
+        if (offset + sizeof(float) <= Size) {
             float float_val;
             std::memcpy(&float_val, Data + offset, sizeof(float));
             offset += sizeof(float);
-            inputs = {float_val};
-            result = compilation_unit->get_function("check_float_type")(inputs);
-            bool is_float = result.toBool();
+            // Sanitize float value
+            if (std::isnan(float_val) || std::isinf(float_val)) {
+                float_val = 0.0f;
+            }
+            std::vector<torch::jit::IValue> inputs = {static_cast<double>(float_val)};
+            auto& func = cu->get_function("check_float_value");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
         }
-        
-        // Test isinstance with list
+
+        // Test isinstance with bool
         if (offset < Size) {
-            c10::impl::GenericList list_val(c10::AnyType::get());
-            size_t list_size = Data[offset++] % 5; // Create a list with 0-4 elements
-            
-            for (size_t i = 0; i < list_size && offset < Size; i++) {
-                list_val.push_back(static_cast<int64_t>(Data[offset++]));
-            }
-            
-            inputs = {list_val};
-            result = compilation_unit->get_function("check_list_type")(inputs);
-            bool is_list = result.toBool();
+            bool bool_val = (Data[offset++] % 2) == 1;
+            std::vector<torch::jit::IValue> inputs = {bool_val};
+            auto& func = cu->get_function("check_bool_value");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
         }
-        
-        // Test isinstance with tuple
+
+        // Test isinstance with string
         if (offset < Size) {
-            std::vector<torch::jit::IValue> tuple_elements;
-            size_t tuple_size = Data[offset++] % 5; // Create a tuple with 0-4 elements
-            
-            for (size_t i = 0; i < tuple_size && offset < Size; i++) {
-                tuple_elements.push_back(static_cast<int64_t>(Data[offset++]));
-            }
-            
-            c10::impl::GenericList list(c10::AnyType::get());
-            for (const auto& elem : tuple_elements) {
-                list.push_back(elem);
-            }
-            
-            inputs = {c10::ivalue::Tuple::create(std::move(list))};
-            result = compilation_unit->get_function("check_tuple_type")(inputs);
-            bool is_tuple = result.toBool();
+            size_t str_len = std::min(static_cast<size_t>(Data[offset++] % 16), Size - offset);
+            std::string str_val(reinterpret_cast<const char*>(Data + offset), str_len);
+            offset += str_len;
+            std::vector<torch::jit::IValue> inputs = {str_val};
+            auto& func = cu->get_function("check_str_value");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
         }
-        
-        // Test isinstance with dict
-        if (offset + 2 < Size) {
-            c10::impl::GenericDict dict(c10::AnyType::get(), c10::AnyType::get());
-            size_t dict_size = Data[offset++] % 3; // Create a dict with 0-2 elements
-            
-            for (size_t i = 0; i < dict_size && offset + 1 < Size; i++) {
-                int64_t key = static_cast<int64_t>(Data[offset++]);
-                int64_t value = static_cast<int64_t>(Data[offset++]);
-                dict.insert(torch::jit::IValue(key), torch::jit::IValue(value));
-            }
-            
-            inputs = {dict};
-            result = compilation_unit->get_function("check_dict_type")(inputs);
-            bool is_dict = result.toBool();
-        }
-        
-        // Create a more complex test with nested types
-        if (Size > 10 && offset + 5 < Size) {
-            // Create a script with more complex type checking
-            std::string complex_script = R"(
-                def check_complex_type(x):
-                    if torch.jit.isinstance(x, list):
-                        for item in x:
-                            if torch.jit.isinstance(item, torch.Tensor):
-                                return True
-                    return False
-            )";
-            
-            auto complex_compilation_unit = torch::jit::compile(complex_script);
-            
-            // Create a list of tensors
-            c10::impl::GenericList tensor_list(c10::AnyType::get());
-            size_t list_size = Data[offset++] % 3 + 1; // 1-3 tensors
-            
+
+        // Test isinstance with List[int]
+        if (offset < Size) {
+            c10::List<int64_t> int_list;
+            size_t list_size = Data[offset++] % 5;
             for (size_t i = 0; i < list_size && offset < Size; i++) {
+                int_list.push_back(static_cast<int64_t>(Data[offset++]));
+            }
+            std::vector<torch::jit::IValue> inputs = {int_list};
+            auto& func = cu->get_function("check_list_int");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
+        }
+
+        // Test isinstance with List[Tensor]
+        if (offset < Size) {
+            c10::List<torch::Tensor> tensor_list;
+            size_t list_size = Data[offset++] % 3 + 1;
+            for (size_t i = 0; i < list_size && offset + 4 < Size; i++) {
                 torch::Tensor small_tensor = fuzzer_utils::createTensor(Data, Size, offset);
                 tensor_list.push_back(small_tensor);
             }
-            
-            std::vector<torch::jit::IValue> complex_inputs = {tensor_list};
-            torch::jit::IValue complex_result = complex_compilation_unit->get_function("check_complex_type")(complex_inputs);
-            bool is_complex_match = complex_result.toBool();
+            std::vector<torch::jit::IValue> inputs = {tensor_list};
+            auto& func = cu->get_function("check_list_tensor");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
+        }
+
+        // Test isinstance with Dict[str, int]
+        if (offset + 2 < Size) {
+            c10::Dict<std::string, int64_t> dict;
+            size_t dict_size = Data[offset++] % 3;
+            for (size_t i = 0; i < dict_size && offset + 1 < Size; i++) {
+                std::string key = "key" + std::to_string(Data[offset++] % 10);
+                int64_t value = static_cast<int64_t>(Data[offset++]);
+                dict.insert(key, value);
+            }
+            std::vector<torch::jit::IValue> inputs = {dict};
+            auto& func = cu->get_function("check_dict_str_int");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
+        }
+
+        // Test isinstance with Tuple[int, int]
+        if (offset + 2 <= Size) {
+            int64_t a = static_cast<int64_t>(Data[offset++]);
+            int64_t b = static_cast<int64_t>(Data[offset++]);
+            auto tuple_val = c10::ivalue::Tuple::create({a, b});
+            std::vector<torch::jit::IValue> inputs = {tuple_val};
+            auto& func = cu->get_function("check_tuple_int_int");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toBool();
+        }
+
+        // Test 2: isinstance with union types (using Optional as example)
+        if (offset < Size) {
+            bool use_none = (Data[offset++] % 2) == 0;
+            torch::jit::IValue optional_tensor;
+            if (use_none) {
+                optional_tensor = torch::jit::IValue();
+            } else {
+                optional_tensor = tensor;
+            }
+            std::vector<torch::jit::IValue> inputs = {optional_tensor};
+            auto& func = cu->get_function("check_optional_tensor");
+            try {
+                torch::jit::IValue result = func(inputs);
+                (void)result.toBool();
+            } catch (...) {
+                // Optional with None may fail type check - expected
+            }
+        }
+
+        // Test 3: More complex isinstance usage in control flow
+        static std::string complex_script = R"JIT(
+import torch
+from typing import List
+
+def process_by_type(x: List[int], y: torch.Tensor) -> torch.Tensor:
+    if isinstance(x, List[int]):
+        scale = float(len(x))
+    else:
+        scale = 1.0
+    if isinstance(y, torch.Tensor):
+        return y * scale
+    return y
+)JIT";
+
+        static std::shared_ptr<torch::jit::CompilationUnit> cu2 = torch::jit::compile(complex_script);
+
+        if (offset < Size) {
+            c10::List<int64_t> int_list;
+            size_t list_size = Data[offset++] % 5 + 1;
+            for (size_t i = 0; i < list_size && offset < Size; i++) {
+                int_list.push_back(static_cast<int64_t>(Data[offset++]));
+            }
+            std::vector<torch::jit::IValue> inputs = {int_list, tensor};
+            auto& func = cu2->get_function("process_by_type");
+            torch::jit::IValue result = func(inputs);
+            (void)result.toTensor();
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

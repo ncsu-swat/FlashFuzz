@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <tuple>          // For std::get
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
@@ -18,54 +23,85 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Get a dimension value for median if tensor is not a scalar
-        int64_t dim = 0;
-        bool keepdim = false;
-        
-        // If we have more data, use it to determine dimension and keepdim
-        if (offset + 2 <= Size) {
-            dim = static_cast<int64_t>(Data[offset++]) % (input.dim() + 1) - 1; // -1 means no dim specified
-            keepdim = Data[offset++] & 0x1; // Use lowest bit for boolean
+        // median doesn't work on empty tensors
+        if (input.numel() == 0) {
+            return 0;
         }
         
-        // Try different variants of median
+        // Get parameters for median variants
+        int64_t dim = 0;
+        bool keepdim = false;
+        bool use_dim_variant = false;
+        
+        // If we have more data, use it to determine variant and parameters
+        if (offset + 1 <= Size) {
+            uint8_t control_byte = Data[offset++];
+            use_dim_variant = control_byte & 0x1;
+            keepdim = (control_byte >> 1) & 0x1;
+        }
+        
+        if (offset + 1 <= Size && input.dim() > 0) {
+            dim = static_cast<int64_t>(Data[offset++]) % input.dim();
+        }
+        
+        // Variant 1: median without dimension (returns single value)
+        // Only works on 1-D tensors or flattened tensors
         try {
-            // Variant 1: median without dimension (returns single value)
+            // For tensors that aren't 1D, this computes median of flattened tensor
             torch::Tensor result1 = torch::median(input);
-            
-            // Variant 2: median with dimension (returns tuple)
-            if (input.dim() > 0 && dim >= 0) {
+            // Force computation
+            (void)result1.item<float>();
+        } catch (const c10::Error &e) {
+            // Expected for certain tensor types (e.g., complex)
+        }
+        
+        // Variant 2: median with dimension (returns tuple of values and indices)
+        if (use_dim_variant && input.dim() > 0) {
+            try {
                 auto result2 = torch::median(input, dim, keepdim);
                 auto values = std::get<0>(result2);
                 auto indices = std::get<1>(result2);
+                // Force computation
+                (void)values.sum().item<float>();
+                (void)indices.sum().item<int64_t>();
+            } catch (const c10::Error &e) {
+                // Expected for certain configurations
             }
-            
-            // Variant 3: median with named dimension (if available)
-            if (input.dim() > 0 && offset < Size) {
-                // Try to create a named tensor if we have more data
-                std::vector<torch::Dimname> names;
-                for (int64_t i = 0; i < input.dim() && offset < Size; i++) {
-                    char name_char = static_cast<char>('a' + (Data[offset++] % 26));
-                    names.push_back(torch::Dimname::fromSymbol(torch::Symbol::dimname(std::string(1, name_char))));
-                }
+        }
+        
+        // Variant 3: Test with contiguous and non-contiguous tensors
+        if (input.dim() >= 2 && offset < Size) {
+            try {
+                // Create a non-contiguous view by transposing
+                torch::Tensor transposed = input.transpose(0, input.dim() - 1);
+                torch::Tensor result3 = torch::median(transposed);
+                (void)result3.item<float>();
                 
-                if (names.size() == input.dim()) {
-                    torch::Tensor named_input = input.refine_names(names);
-                    if (dim >= 0 && dim < named_input.dim()) {
-                        auto result3 = torch::median(named_input, names[dim], keepdim);
-                        auto values = std::get<0>(result3);
-                        auto indices = std::get<1>(result3);
-                    }
+                if (use_dim_variant) {
+                    int64_t trans_dim = static_cast<int64_t>(Data[offset - 1]) % transposed.dim();
+                    auto result4 = torch::median(transposed, trans_dim, keepdim);
+                    (void)std::get<0>(result4).sum().item<float>();
                 }
+            } catch (const c10::Error &e) {
+                // Expected for certain configurations
+            }
+        }
+        
+        // Variant 4: Test with different dtypes (if we can convert)
+        try {
+            if (input.is_floating_point()) {
+                torch::Tensor double_input = input.to(torch::kDouble);
+                torch::Tensor result5 = torch::median(double_input);
+                (void)result5.item<double>();
             }
         } catch (const c10::Error &e) {
-            // PyTorch specific errors are expected and okay
+            // Expected for certain tensor types
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

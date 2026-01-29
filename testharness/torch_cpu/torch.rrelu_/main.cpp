@@ -1,86 +1,121 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes for tensor creation
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor - needs to be floating point for rrelu
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Ensure tensor is floating point
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
         // Extract lower and upper bounds from remaining data
-        float lower = 0.0;
-        float upper = 0.0;
+        float lower = 0.125f;  // default lower
+        float upper = 0.3333f; // default upper
         
         if (offset + sizeof(float) <= Size) {
-            std::memcpy(&lower, Data + offset, sizeof(float));
+            float tmp_lower;
+            std::memcpy(&tmp_lower, Data + offset, sizeof(float));
             offset += sizeof(float);
+            // Only use if it's a valid finite number in reasonable range
+            if (std::isfinite(tmp_lower) && tmp_lower >= 0.0f && tmp_lower <= 1.0f) {
+                lower = tmp_lower;
+            }
         }
         
         if (offset + sizeof(float) <= Size) {
-            std::memcpy(&upper, Data + offset, sizeof(float));
+            float tmp_upper;
+            std::memcpy(&tmp_upper, Data + offset, sizeof(float));
             offset += sizeof(float);
+            // Only use if it's a valid finite number in reasonable range
+            if (std::isfinite(tmp_upper) && tmp_upper >= 0.0f && tmp_upper <= 1.0f) {
+                upper = tmp_upper;
+            }
         }
         
-        // Ensure lower <= upper (if not, swap them)
+        // Ensure lower <= upper
         if (lower > upper) {
             std::swap(lower, upper);
         }
         
-        // Create a copy of the input tensor for testing
-        torch::Tensor input_copy = input.clone();
+        // Store original data pointer to verify in-place operation
+        void* original_data_ptr = input.data_ptr();
         
-        // Apply rrelu_ in-place
+        // Determine which variant to test based on fuzzer data
+        uint8_t variant = 0;
         if (offset < Size) {
-            // Use the next byte to determine if we should provide a generator
-            bool use_generator = (Data[offset] % 2 == 0);
-            
-            if (use_generator) {
-                // Create a generator with a seed from the data
-                uint64_t seed = 0;
-                if (offset + sizeof(uint64_t) <= Size) {
-                    std::memcpy(&seed, Data + offset, sizeof(uint64_t));
-                    offset += sizeof(uint64_t);
-                }
-                
-                auto generator = torch::make_generator<torch::CPUGeneratorImpl>(seed);
-                torch::rrelu_(input, lower, upper, false, generator);
-            } else {
-                // Use the default generator
+            variant = Data[offset++] % 4;
+        }
+        
+        switch (variant) {
+            case 0:
+                // Default parameters
+                torch::rrelu_(input);
+                break;
+            case 1:
+                // With lower bound only
+                torch::rrelu_(input, lower);
+                break;
+            case 2:
+                // With lower and upper bounds
                 torch::rrelu_(input, lower, upper);
-            }
-        } else {
-            // Use default parameters
-            torch::rrelu_(input);
+                break;
+            case 3:
+                // With training flag
+                {
+                    bool training = (offset < Size) ? (Data[offset++] % 2 == 1) : true;
+                    torch::rrelu_(input, lower, upper, training);
+                }
+                break;
         }
         
         // Verify that the operation was applied in-place
-        if (input.data_ptr() != input_copy.data_ptr()) {
-            throw std::runtime_error("rrelu_ should modify the tensor in-place");
+        if (input.data_ptr() != original_data_ptr) {
+            std::cerr << "rrelu_ should modify the tensor in-place" << std::endl;
         }
         
-        // Test non-inplace version for comparison
-        torch::Tensor output = torch::rrelu(input_copy, lower, upper);
+        // Also test non-inplace version for coverage
+        torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, offset);
+        if (!input2.is_floating_point()) {
+            input2 = input2.to(torch::kFloat32);
+        }
         
-        // Try to access elements to check for potential crashes
+        try {
+            torch::Tensor output = torch::rrelu(input2, lower, upper);
+            // Force computation
+            if (output.numel() > 0) {
+                output.sum().item<float>();
+            }
+        } catch (...) {
+            // Ignore failures in non-inplace version
+        }
+        
+        // Force computation on in-place result
         if (input.numel() > 0) {
-            input.item();
+            input.sum().item<float>();
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

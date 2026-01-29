@@ -1,12 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <torch/torch.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -45,7 +50,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 if (tensor1.dim() > 0 && tensor1.size(0) > 0) {
                     // Reshape tensor to match input requirements if possible
                     auto batch_size = tensor1.size(0);
-                    auto reshaped = tensor1.reshape({batch_size, -1});
+                    auto reshaped = tensor1.reshape({batch_size, -1}).to(torch::kFloat);
                     
                     // If the last dimension isn't 10, resize it
                     if (reshaped.size(1) != 10) {
@@ -78,6 +83,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             } catch (...) {
                 // Catch any exceptions from accessing modules
             }
+            
+            // Test size and empty
+            try {
+                auto sz = sequential->size();
+                auto is_empty = sequential->is_empty();
+            } catch (...) {
+            }
         }
         
         // Test ModuleList container
@@ -97,10 +109,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             try {
                 if (module_list->size() > 0) {
                     auto module = module_list[0];
-                    auto modules = module_list->modules();
                 }
             } catch (...) {
                 // Catch any exceptions from accessing modules
+            }
+            
+            // Test insert at position
+            try {
+                module_list->insert(1, torch::nn::Sigmoid());
+            } catch (...) {
             }
             
             // Test extending the list
@@ -113,19 +130,30 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             } catch (...) {
                 // Catch any exceptions from extending
             }
+            
+            // Test iteration
+            try {
+                for (const auto& module : *module_list) {
+                    (void)module;
+                }
+            } catch (...) {
+            }
         }
         
-        // Test ModuleDict container
+        // Test ModuleDict container - use update() instead of private insert()
         {
+            // Initialize ModuleDict with items using update
             torch::nn::ModuleDict module_dict;
             
-            // Add modules to the dictionary
+            // Add modules to the dictionary using update with vector of pairs
             try {
-                module_dict->update("linear1", torch::nn::Linear(10, 5));
-                module_dict->update("relu", torch::nn::ReLU());
-                module_dict->update("linear2", torch::nn::Linear(5, 1));
+                std::vector<std::pair<std::string, std::shared_ptr<torch::nn::Module>>> items;
+                items.push_back({"linear1", torch::nn::Linear(10, 5).ptr()});
+                items.push_back({"relu", torch::nn::ReLU().ptr()});
+                items.push_back({"linear2", torch::nn::Linear(5, 1).ptr()});
+                module_dict->update(items);
             } catch (...) {
-                // Catch any exceptions from inserting modules
+                // Catch any exceptions from updating modules
             }
             
             // Test accessing modules
@@ -136,8 +164,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 auto keys = module_dict->keys();
                 auto values = module_dict->values();
+                auto sz = module_dict->size();
+                auto is_empty = module_dict->is_empty();
             } catch (...) {
                 // Catch any exceptions from accessing modules
+            }
+            
+            // Test update with more items
+            try {
+                std::vector<std::pair<std::string, std::shared_ptr<torch::nn::Module>>> more_items;
+                more_items.push_back({"linear3", torch::nn::Linear(2, 3).ptr()});
+                module_dict->update(more_items);
+            } catch (...) {
+            }
+            
+            // Test pop
+            try {
+                if (module_dict->contains("relu")) {
+                    auto popped = module_dict->pop("relu");
+                }
+            } catch (...) {
             }
             
             // Test clear
@@ -152,10 +198,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         {
             torch::nn::ParameterList param_list;
             
-            // Add parameters to the list
+            // Add parameters to the list - must use clone to avoid sharing
             try {
-                param_list->append(tensor1);
-                param_list->append(tensor2);
+                param_list->append(tensor1.clone().to(torch::kFloat).set_requires_grad(true));
+                param_list->append(tensor2.clone().to(torch::kFloat).set_requires_grad(true));
             } catch (...) {
                 // Catch any exceptions from adding parameters
             }
@@ -164,7 +210,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             try {
                 if (param_list->size() > 0) {
                     auto param = param_list[0];
-                    auto params = param_list->parameters();
                 }
             } catch (...) {
                 // Catch any exceptions from accessing parameters
@@ -173,11 +218,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Test extending the list
             try {
                 torch::nn::ParameterList extension;
-                extension->append(tensor3);
+                extension->append(tensor3.clone().to(torch::kFloat).set_requires_grad(true));
                 
                 param_list->extend(*extension);
             } catch (...) {
                 // Catch any exceptions from extending
+            }
+            
+            // Test size and empty
+            try {
+                auto sz = param_list->size();
+                auto is_empty = param_list->is_empty();
+            } catch (...) {
             }
         }
         
@@ -187,8 +239,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Add parameters to the dictionary
             try {
-                param_dict->insert("param1", tensor1);
-                param_dict->insert("param2", tensor2);
+                param_dict->insert("param1", tensor1.clone().to(torch::kFloat).set_requires_grad(true));
+                param_dict->insert("param2", tensor2.clone().to(torch::kFloat).set_requires_grad(true));
             } catch (...) {
                 // Catch any exceptions from inserting parameters
             }
@@ -201,8 +253,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 auto keys = param_dict->keys();
                 auto values = param_dict->values();
+                auto sz = param_dict->size();
+                auto is_empty = param_dict->is_empty();
             } catch (...) {
                 // Catch any exceptions from accessing parameters
+            }
+            
+            // Test pop
+            try {
+                if (param_dict->contains("param2")) {
+                    auto popped = param_dict->pop("param2");
+                }
+            } catch (...) {
+            }
+            
+            // Test get with default
+            try {
+                auto param = param_dict->get("nonexistent", torch::zeros({2, 2}));
+            } catch (...) {
             }
             
             // Test clear

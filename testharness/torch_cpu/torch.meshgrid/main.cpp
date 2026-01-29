@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -33,6 +38,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 }
             }
             
+            // Limit tensor size to avoid memory issues
+            if (tensor.size(0) > 100) {
+                tensor = tensor.slice(0, 0, 100);
+            }
+            
             tensors.push_back(tensor);
         }
         
@@ -47,7 +57,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             indexing_ij = (Data[offset++] % 2) == 0;
         }
         
-        // Apply meshgrid operation
+        // Apply meshgrid operation with different indexing modes
         std::vector<torch::Tensor> result;
         if (indexing_ij) {
             result = torch::meshgrid(tensors, "ij");
@@ -55,27 +65,37 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             result = torch::meshgrid(tensors, "xy");
         }
         
-        // Verify result
-        if (result.size() != tensors.size()) {
-            throw std::runtime_error("Unexpected result size from meshgrid");
+        // Perform operations on the result to ensure code paths are exercised
+        for (const auto& res_tensor : result) {
+            // Exercise various tensor operations on the result
+            volatile auto dim = res_tensor.dim();
+            volatile auto numel = res_tensor.numel();
+            
+            if (res_tensor.numel() > 0) {
+                // Compute sum to exercise the tensor data
+                torch::Tensor sum = res_tensor.sum();
+                volatile float sum_val = sum.item<float>();
+                (void)sum_val;
+                
+                // Exercise shape operations
+                auto sizes = res_tensor.sizes();
+                (void)sizes;
+            }
         }
         
-        // Perform some operations on the result to ensure it's used
-        for (auto& res_tensor : result) {
-            torch::Tensor sum = res_tensor.sum();
-            if (sum.numel() > 0) {
-                float sum_val = sum.item<float>();
-                // Use sum_val to prevent compiler optimization
-                if (std::isnan(sum_val)) {
-                    throw std::runtime_error("NaN detected in result");
-                }
-            }
+        // Also test the deprecated version without indexing argument for coverage
+        // (will use default "ij" indexing)
+        try {
+            auto result_default = torch::meshgrid(tensors);
+            (void)result_default;
+        } catch (...) {
+            // Silently ignore - deprecated API may behave differently
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

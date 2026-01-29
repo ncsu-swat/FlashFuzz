@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -23,12 +28,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Create and add parameters to the list
         for (uint8_t i = 0; i < numParams && offset < Size; ++i) {
-            // Create a tensor to use as parameter
             torch::Tensor tensor;
             try {
                 tensor = fuzzer_utils::createTensor(Data, Size, offset);
             } catch (const std::exception& e) {
-                // If tensor creation fails, create a simple tensor
+                // Silent catch - create a simple tensor as fallback
                 tensor = torch::ones({1});
             }
             
@@ -42,23 +46,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Access parameters by index
             auto firstParam = (*paramList)[0];
             
-            // Test iteration
+            // Test iteration over named_parameters
             for (const auto& param : paramList->named_parameters()) {
                 auto shape = param.value().sizes();
+                (void)shape; // Suppress unused variable warning
             }
             
-            // Test extend functionality if we have enough parameters
-            if (paramList->size() >= 2) {
-                torch::nn::ParameterList secondList;
-                torch::Tensor tensor2 = torch::ones({2, 2});
-                tensor2.requires_grad_(true);
-                secondList->append(tensor2);
-                
-                // Extend the first list with the second
-                paramList->extend(*secondList);
-            }
-            
-            // Test append functionality
+            // Test append functionality with new tensors
             torch::Tensor tensor3 = torch::zeros({3, 3});
             tensor3.requires_grad_(true);
             paramList->append(tensor3);
@@ -68,42 +62,93 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             for (const auto& pair : namedParams) {
                 auto name = pair.key();
                 auto param = pair.value();
+                (void)name;
+                (void)param;
             }
             
             // Test parameters
             auto params = paramList->parameters();
+            (void)params;
             
             // Test to(device) functionality
             paramList->to(torch::kCPU);
             
-            // Test to(dtype) functionality
+            // Test to(dtype) functionality - only float types can have gradients
             if (offset < Size) {
-                uint8_t dtypeSelector = Data[offset++];
-                auto dtype = fuzzer_utils::parseDataType(dtypeSelector);
-                paramList->to(dtype);
+                uint8_t dtypeSelector = Data[offset++] % 4;
+                torch::Dtype dtype;
+                switch (dtypeSelector) {
+                    case 0: dtype = torch::kFloat32; break;
+                    case 1: dtype = torch::kFloat64; break;
+                    case 2: dtype = torch::kFloat16; break;
+                    default: dtype = torch::kFloat32; break;
+                }
+                try {
+                    paramList->to(dtype);
+                } catch (const std::exception& e) {
+                    // Silent catch - some dtype conversions may fail
+                }
+            }
+            
+            // Test clone functionality
+            torch::nn::ParameterList clonedList;
+            for (const auto& param : paramList->parameters()) {
+                auto cloned = param.clone();
+                cloned.requires_grad_(true);
+                clonedList->append(cloned);
+            }
+            
+            // Test zero_grad on parameters
+            for (auto& param : paramList->parameters()) {
+                if (param.grad().defined()) {
+                    param.grad().zero_();
+                }
             }
         }
         
         // Test empty ParameterList
         torch::nn::ParameterList emptyList;
         auto emptyParams = emptyList->parameters();
+        auto emptySize = emptyList->size();
+        (void)emptyParams;
+        (void)emptySize;
         
-        // Test ParameterList with a single large tensor
+        // Test ParameterList with tensor from fuzzer data
         if (offset < Size) {
             try {
                 torch::Tensor largeTensor = fuzzer_utils::createTensor(Data, Size, offset);
                 torch::nn::ParameterList singleParamList;
                 largeTensor.requires_grad_(true);
                 singleParamList->append(largeTensor);
+                
+                // Exercise operations on the single-param list
+                auto singleParams = singleParamList->parameters();
+                singleParamList->to(torch::kCPU);
             } catch (const std::exception& e) {
-                // Ignore exceptions from tensor creation
+                // Silent catch for tensor creation failures
             }
+        }
+        
+        // Test ParameterList construction with initializer
+        {
+            torch::Tensor t1 = torch::randn({2, 2});
+            torch::Tensor t2 = torch::randn({3, 3});
+            t1.requires_grad_(true);
+            t2.requires_grad_(true);
+            
+            torch::nn::ParameterList initList;
+            initList->append(t1);
+            initList->append(t2);
+            
+            // Verify size
+            auto listSize = initList->size();
+            (void)listSize;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

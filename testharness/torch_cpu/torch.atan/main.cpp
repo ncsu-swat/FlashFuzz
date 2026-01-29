@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -39,15 +44,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Try with different dtype if possible
             if (option_byte % 3 == 0 && input.scalar_type() != torch::kBool) {
-                torch::ScalarType target_dtype = fuzzer_utils::parseDataType(Data[offset++]);
-                torch::Tensor result_cast = torch::atan(input.to(target_dtype));
+                if (offset < Size) {
+                    torch::ScalarType target_dtype = fuzzer_utils::parseDataType(Data[offset++]);
+                    try {
+                        torch::Tensor result_cast = torch::atan(input.to(target_dtype));
+                    } catch (...) {
+                        // Some dtype conversions may not be supported, silently ignore
+                    }
+                }
             }
             
             // Try with non-contiguous tensor
             if (option_byte % 3 == 1 && input.dim() > 0 && input.numel() > 1) {
-                torch::Tensor transposed = input.transpose(0, input.dim() - 1);
-                if (!transposed.is_contiguous()) {
-                    torch::Tensor result_noncontig = torch::atan(transposed);
+                try {
+                    torch::Tensor transposed = input.transpose(0, input.dim() - 1);
+                    if (!transposed.is_contiguous()) {
+                        torch::Tensor result_noncontig = torch::atan(transposed);
+                    }
+                } catch (...) {
+                    // Transpose may fail for certain tensor configurations, silently ignore
                 }
             }
             
@@ -68,7 +83,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

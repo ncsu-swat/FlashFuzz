@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <iostream>       // For cerr/cout
+#include <cstdint>        // For uint64_t
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -45,49 +51,67 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Variant 1: all() - reduce over all dimensions
         torch::Tensor result1 = torch::all(input_tensor);
+        (void)result1; // Suppress unused variable warning
         
         // Variant 2: all(dim, keepdim) - reduce over specific dimension
         if (input_tensor.dim() > 0) {
-            torch::Tensor result2 = torch::all(input_tensor, dim, keepdim);
+            try {
+                torch::Tensor result2 = torch::all(input_tensor, dim, keepdim);
+                (void)result2;
+            } catch (const std::exception &) {
+                // Shape/dimension errors are expected for some inputs
+            }
         }
         
         // Variant 3: all(dim) - reduce over specific dimension without keepdim
         if (input_tensor.dim() > 0) {
-            torch::Tensor result3 = torch::all(input_tensor, dim);
-        }
-        
-        // Variant 4: Test with named dimension if tensor has names
-        if (offset < Size && input_tensor.dim() > 0) {
             try {
-                // Create a named tensor by adding names to dimensions
-                std::vector<torch::Dimname> names;
-                for (int i = 0; i < input_tensor.dim(); i++) {
-                    names.push_back(torch::Dimname::wildcard());
-                }
-                auto named_tensor = input_tensor.refine_names(names);
-                
-                // Test all with Dimname
-                torch::Tensor result4 = torch::all(named_tensor, names[dim % names.size()], keepdim);
+                torch::Tensor result3 = torch::all(input_tensor, dim);
+                (void)result3;
             } catch (const std::exception &) {
-                // Ignore exceptions from named tensor operations
+                // Shape/dimension errors are expected for some inputs
             }
         }
         
-        // Variant 5: Test with boolean tensor explicitly
-        if (input_tensor.dtype() != torch::kBool) {
+        // Variant 4: Test with boolean tensor explicitly
+        try {
             // Convert to boolean tensor
             torch::Tensor bool_tensor = input_tensor.to(torch::kBool);
-            torch::Tensor result5 = torch::all(bool_tensor);
+            torch::Tensor result4 = torch::all(bool_tensor);
+            (void)result4;
             
             if (bool_tensor.dim() > 0) {
-                torch::Tensor result6 = torch::all(bool_tensor, dim, keepdim);
+                torch::Tensor result5 = torch::all(bool_tensor, dim, keepdim);
+                (void)result5;
+            }
+        } catch (const std::exception &) {
+            // Conversion or dimension errors are expected for some inputs
+        }
+        
+        // Variant 5: Test with different dtypes
+        try {
+            torch::Tensor int_tensor = input_tensor.to(torch::kInt);
+            torch::Tensor result6 = torch::all(int_tensor);
+            (void)result6;
+        } catch (const std::exception &) {
+            // Dtype conversion errors are expected for some inputs
+        }
+        
+        // Variant 6: Test with contiguous/non-contiguous tensors
+        if (input_tensor.dim() >= 2) {
+            try {
+                torch::Tensor transposed = input_tensor.transpose(0, 1);
+                torch::Tensor result7 = torch::all(transposed);
+                (void)result7;
+            } catch (const std::exception &) {
+                // Transposition errors are expected for some inputs
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

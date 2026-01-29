@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -19,24 +23,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::ParameterDict paramDict;
         
         // Determine number of parameters to add (1-10)
-        uint8_t numParams = (Size > 0) ? (Data[offset] % 10) + 1 : 1;
+        uint8_t numParams = (Data[offset] % 10) + 1;
         offset++;
         
         // Add parameters to the ParameterDict
         for (uint8_t i = 0; i < numParams && offset < Size; i++) {
-            // Create a tensor to use as parameter
             torch::Tensor tensor;
             try {
                 tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            } catch (const std::exception& e) {
-                // If tensor creation fails, try with a simple tensor
-                tensor = torch::ones({1});
+            } catch (...) {
+                // If tensor creation fails, use a simple tensor
+                tensor = torch::randn({2, 2});
             }
             
-            // Create a parameter key
             std::string key = "param" + std::to_string(i);
             
-            // Add parameter to the dict
+            // Insert tensor as parameter
             paramDict->insert(key, tensor);
         }
         
@@ -44,17 +46,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (paramDict->size() > 0) {
             // Test contains
             std::string firstKey = "param0";
-            bool contains = paramDict->contains(firstKey);
+            bool hasKey = paramDict->contains(firstKey);
             
-            // Test get
-            if (contains) {
-                torch::Tensor param = paramDict->get(firstKey);
+            // Test access via operator[]
+            if (hasKey) {
+                torch::Tensor param = paramDict[firstKey];
+                // Do something with param to ensure it's exercised
+                auto shape = param.sizes();
             }
             
-            // Test iteration
-            for (const auto& pair : *paramDict) {
-                const std::string& name = pair.key();
-                const torch::Tensor& param = pair.value();
+            // Test keys()
+            auto keys = paramDict->keys();
+            
+            // Test values()
+            auto values = paramDict->values();
+            
+            // Test iteration via keys and operator[]
+            for (const auto& key : paramDict->keys()) {
+                torch::Tensor param = paramDict[key];
+                // Access to exercise iteration
+                auto dtype = param.dtype();
             }
             
             // Test removal if we have at least one parameter
@@ -67,7 +78,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 }
             }
             
-            // Test clear
+            // Test clear based on fuzz data
             if (offset < Size && Data[offset] % 2 == 0) {
                 paramDict->clear();
             }
@@ -77,33 +88,50 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test empty ParameterDict
         torch::nn::ParameterDict emptyDict;
         
+        // Test if empty using size() == 0
+        bool isEmpty = (emptyDict->size() == 0);
+        
         // Test adding parameters with different dtypes
         if (offset + 1 < Size) {
-            emptyDict->insert("float_param", torch::ones({1}, torch::kFloat));
-            emptyDict->insert("int_param", torch::ones({1}, torch::kInt));
-            emptyDict->insert("bool_param", torch::ones({1}, torch::kBool));
+            emptyDict->insert("float_param", torch::randn({3, 3}, torch::kFloat));
+            emptyDict->insert("double_param", torch::randn({2, 2}, torch::kDouble));
         }
         
         // Test update from another ParameterDict
-        if (offset < Size && Data[offset] % 2 == 0) {
-            emptyDict->update(*paramDict);
+        if (offset < Size && paramDict->size() > 0 && Data[offset] % 2 == 0) {
+            try {
+                emptyDict->update(*paramDict);
+            } catch (...) {
+                // Update may fail if keys conflict, ignore
+            }
         }
         
-        // Test named_parameters
-        for (const auto& param : paramDict->named_parameters()) {
-            const std::string& name = param.key();
-            const torch::Tensor& tensor = param.value();
+        // Test parameters() - returns vector of tensors
+        auto params = paramDict->parameters();
+        for (const auto& p : params) {
+            auto numel = p.numel();
         }
         
-        // Test parameters
-        for (const auto& param : paramDict->parameters()) {
-            // Access the parameter tensor
+        // Test named_parameters() - returns OrderedDict
+        auto namedParams = paramDict->named_parameters();
+        for (const auto& np : namedParams) {
+            const std::string& name = np.key();
+            const torch::Tensor& tensor = np.value();
+            // Use the variables to avoid warnings
+            (void)name;
+            (void)tensor;
         }
+        
+        // Test size()
+        size_t dictSize = paramDict->size();
+        (void)dictSize;
+        (void)isEmpty;
+        
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

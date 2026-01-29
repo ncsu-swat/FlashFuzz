@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -24,80 +28,75 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
         } else {
             // If no data left, create a simple tensor
-            tensor2 = torch::ones({1, 2, 3});
+            tensor2 = torch::ones({2, 3, 4});
+        }
+        
+        // Skip if either tensor is 0-dimensional
+        if (tensor1.dim() == 0 || tensor2.dim() == 0) {
+            return 0;
         }
         
         // Extract dims parameter for tensordot
         int64_t dims = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dims, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure dims is within a reasonable range
-            dims = std::abs(dims) % 5;
+        if (offset + sizeof(uint8_t) <= Size) {
+            dims = Data[offset++] % 4;  // Limit to 0-3 dimensions
         }
         
-        // Try different variants of tensordot
-        
-        // Variant 1: Basic tensordot with scalar dims - create dimension arrays
-        if (tensor1.dim() > 0 && tensor2.dim() > 0) {
-            std::vector<int64_t> dims1_basic, dims2_basic;
+        // Variant 1: tensordot with matching last dims of tensor1 and first dims of tensor2
+        {
             int64_t max_contract_dims = std::min(tensor1.dim(), tensor2.dim());
             int64_t num_contract_dims = std::min(max_contract_dims, dims);
             
-            for (int64_t i = 0; i < num_contract_dims; i++) {
-                dims1_basic.push_back(tensor1.dim() - 1 - i);
-                dims2_basic.push_back(i);
-            }
-            
-            if (!dims1_basic.empty() && !dims2_basic.empty()) {
+            if (num_contract_dims > 0) {
+                std::vector<int64_t> dims1, dims2;
+                
+                // Contract last num_contract_dims of tensor1 with first num_contract_dims of tensor2
+                for (int64_t i = 0; i < num_contract_dims; i++) {
+                    dims1.push_back(tensor1.dim() - num_contract_dims + i);
+                    dims2.push_back(i);
+                }
+                
                 try {
-                    torch::Tensor result1 = torch::tensordot(tensor1, tensor2, dims1_basic, dims2_basic);
-                } catch (const std::exception& e) {
-                    // Catch and continue - this is expected for some incompatible dimensions
+                    torch::Tensor result1 = torch::tensordot(tensor1, tensor2, dims1, dims2);
+                } catch (...) {
+                    // Expected for incompatible dimension sizes
                 }
             }
         }
         
-        // Variant 2: tensordot with list of dimensions
-        if (tensor1.dim() > 0 && tensor2.dim() > 0) {
+        // Variant 2: tensordot with fuzzer-controlled dimension indices
+        if (offset + 2 <= Size) {
+            int64_t num_dims_to_contract = (Data[offset++] % 3) + 1;  // 1-3 dims
+            num_dims_to_contract = std::min(num_dims_to_contract, std::min(tensor1.dim(), tensor2.dim()));
+            
             std::vector<int64_t> dims1, dims2;
             
-            // Extract dimensions for contraction
-            int64_t max_contract_dims = std::min(tensor1.dim(), tensor2.dim());
-            int64_t num_contract_dims = std::min(max_contract_dims, dims);
-            
-            for (int64_t i = 0; i < num_contract_dims; i++) {
-                int64_t dim1 = 0, dim2 = 0;
+            for (int64_t i = 0; i < num_dims_to_contract && offset + 2 <= Size; i++) {
+                int64_t dim1 = Data[offset++] % tensor1.dim();
+                int64_t dim2 = Data[offset++] % tensor2.dim();
                 
-                if (offset + sizeof(int64_t) <= Size) {
-                    std::memcpy(&dim1, Data + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    dim1 = std::abs(dim1) % tensor1.dim();
+                // Avoid duplicate dimensions
+                bool dup1 = false, dup2 = false;
+                for (auto d : dims1) if (d == dim1) dup1 = true;
+                for (auto d : dims2) if (d == dim2) dup2 = true;
+                
+                if (!dup1 && !dup2) {
+                    dims1.push_back(dim1);
+                    dims2.push_back(dim2);
                 }
-                
-                if (offset + sizeof(int64_t) <= Size) {
-                    std::memcpy(&dim2, Data + offset, sizeof(int64_t));
-                    offset += sizeof(int64_t);
-                    dim2 = std::abs(dim2) % tensor2.dim();
-                }
-                
-                dims1.push_back(dim1);
-                dims2.push_back(dim2);
             }
             
-            // Try tensordot with dimension lists
-            if (!dims1.empty() && !dims2.empty()) {
+            if (!dims1.empty() && dims1.size() == dims2.size()) {
                 try {
                     torch::Tensor result2 = torch::tensordot(tensor1, tensor2, dims1, dims2);
-                } catch (const std::exception& e) {
-                    // Catch and continue - this is expected for some incompatible dimensions
+                } catch (...) {
+                    // Expected for incompatible dimension sizes
                 }
             }
         }
         
         // Variant 3: Try with different data types
-        if (offset < Size && tensor1.dim() > 0 && tensor2.dim() > 0) {
+        if (offset < Size) {
             uint8_t dtype_selector = Data[offset++];
             auto dtype = fuzzer_utils::parseDataType(dtype_selector);
             
@@ -105,27 +104,29 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 torch::Tensor tensor1_cast = tensor1.to(dtype);
                 torch::Tensor tensor2_cast = tensor2.to(dtype);
                 
-                std::vector<int64_t> dims1_cast, dims2_cast;
-                int64_t max_contract_dims = std::min(tensor1_cast.dim(), tensor2_cast.dim());
-                int64_t num_contract_dims = std::min(max_contract_dims, dims);
-                
-                for (int64_t i = 0; i < num_contract_dims; i++) {
-                    dims1_cast.push_back(tensor1_cast.dim() - 1 - i);
-                    dims2_cast.push_back(i);
+                // Simple contraction: last dim of tensor1 with first dim of tensor2
+                if (tensor1_cast.dim() > 0 && tensor2_cast.dim() > 0) {
+                    std::vector<int64_t> d1 = {tensor1_cast.dim() - 1};
+                    std::vector<int64_t> d2 = {0};
+                    torch::Tensor result3 = torch::tensordot(tensor1_cast, tensor2_cast, d1, d2);
                 }
-                
-                if (!dims1_cast.empty() && !dims2_cast.empty()) {
-                    torch::Tensor result3 = torch::tensordot(tensor1_cast, tensor2_cast, dims1_cast, dims2_cast);
-                }
-            } catch (const std::exception& e) {
-                // Catch and continue - some dtype combinations might be invalid
+            } catch (...) {
+                // Some dtype combinations might be invalid
             }
+        }
+        
+        // Variant 4: Empty contraction (outer product)
+        try {
+            std::vector<int64_t> empty_dims1, empty_dims2;
+            torch::Tensor outer_product = torch::tensordot(tensor1, tensor2, empty_dims1, empty_dims2);
+        } catch (...) {
+            // May fail for very large tensors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

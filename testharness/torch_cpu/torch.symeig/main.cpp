@@ -1,103 +1,137 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Skip if we don't have enough data
-        if (Size < 2) {
+        // Need minimum data for meaningful test
+        if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Ensure the tensor is square matrix (required for symeig)
-        // We need at least 2D tensor with equal last two dimensions
-        if (input.dim() < 2) {
-            // Make it at least 2D by adding dimensions
-            std::vector<int64_t> new_shape;
-            if (input.dim() == 0) {
-                // Scalar tensor, reshape to 1x1
-                new_shape = {1, 1};
-            } else if (input.dim() == 1) {
-                // 1D tensor, reshape to n x n
-                int64_t n = input.size(0);
-                new_shape = {n, n};
+        // Parse parameters from input data
+        bool upper = Data[offset++] & 0x1;
+        uint8_t size_hint = Data[offset++];
+        
+        // Determine matrix size (1 to 16 for reasonable computation time)
+        int64_t n = (size_hint % 15) + 1;
+        
+        // Create a tensor from remaining data
+        torch::Tensor input = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+        
+        // Ensure we have a floating point type for eigenvalue computation
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat);
+        }
+        
+        // Handle complex types - convert to real
+        if (input.is_complex()) {
+            input = torch::real(input);
+        }
+        
+        // Reshape to square matrix
+        int64_t total_elements = input.numel();
+        if (total_elements == 0) {
+            // Create a small default matrix
+            input = torch::randn({n, n}, torch::kFloat);
+        } else if (total_elements < n * n) {
+            // Repeat elements to fill the matrix
+            int64_t actual_n = static_cast<int64_t>(std::sqrt(static_cast<double>(total_elements)));
+            if (actual_n < 1) actual_n = 1;
+            n = actual_n;
+            input = input.flatten().narrow(0, 0, std::min(total_elements, n * n));
+            if (input.numel() < n * n) {
+                // Pad with zeros
+                torch::Tensor padded = torch::zeros({n * n}, input.options());
+                padded.narrow(0, 0, input.numel()).copy_(input);
+                input = padded;
             }
-            input = input.reshape(new_shape);
-        }
-        
-        // Make the last two dimensions equal (square matrix)
-        std::vector<int64_t> shape = input.sizes().vec();
-        int64_t max_dim = std::max(shape[shape.size()-1], shape[shape.size()-2]);
-        shape[shape.size()-1] = shape[shape.size()-2] = max_dim;
-        
-        // Resize the tensor to have square matrices in the last two dimensions
-        input = input.expand(shape);
-        
-        // Make the matrix symmetric (required for symeig)
-        // For each batch element, we create a symmetric matrix: A = (M + M.t())/2
-        torch::Tensor input_t = input.transpose(-2, -1);
-        torch::Tensor symmetric_input = (input + input_t) * 0.5;
-        
-        // Parse additional parameters from the input data
-        bool eigenvectors = true;
-        bool upper = true;
-        
-        if (offset < Size) {
-            eigenvectors = Data[offset++] & 0x1;
-        }
-        
-        if (offset < Size) {
-            upper = Data[offset++] & 0x1;
-        }
-        
-        // Convert to float or double for numerical stability
-        torch::ScalarType orig_dtype = symmetric_input.scalar_type();
-        torch::Tensor input_converted;
-        
-        if (torch::isComplexType(orig_dtype) || 
-            (orig_dtype != torch::kFloat && orig_dtype != torch::kDouble)) {
-            input_converted = symmetric_input.to(torch::kFloat);
+            input = input.reshape({n, n});
         } else {
-            input_converted = symmetric_input;
+            // Use first n*n elements
+            input = input.flatten().narrow(0, 0, n * n).reshape({n, n});
         }
         
-        // Apply symeig operation
-        auto result = torch::linalg_eigh(input_converted, upper ? "U" : "L");
+        // Make the matrix symmetric: A = (M + M^T) / 2
+        torch::Tensor symmetric_input = (input + input.transpose(0, 1)) * 0.5;
         
-        // Unpack the result
+        // Ensure no NaN or Inf values
+        if (torch::any(torch::isnan(symmetric_input)).item<bool>() ||
+            torch::any(torch::isinf(symmetric_input)).item<bool>()) {
+            symmetric_input = torch::randn({n, n}, torch::kFloat);
+            symmetric_input = (symmetric_input + symmetric_input.transpose(0, 1)) * 0.5;
+        }
+        
+        // Call torch::linalg_eigh (replacement for deprecated torch::symeig)
+        // UPLO parameter: "U" for upper triangular, "L" for lower triangular
+        std::tuple<torch::Tensor, torch::Tensor> result;
+        
+        try {
+            result = torch::linalg_eigh(symmetric_input, upper ? "U" : "L");
+        } catch (const std::exception &) {
+            // Expected failure for some edge cases (singular matrices, etc.)
+            return 0;
+        }
+        
         torch::Tensor eigenvalues = std::get<0>(result);
-        torch::Tensor eigenvectors_tensor = std::get<1>(result);
+        torch::Tensor eigenvectors = std::get<1>(result);
         
-        // Verify that eigenvalues are real
-        if (eigenvalues.numel() > 0) {
-            // Check if eigenvalues are sorted
-            if (eigenvalues.dim() > 0 && eigenvalues.size(-1) > 1) {
-                torch::Tensor diff = eigenvalues.narrow(-1, 1, eigenvalues.size(-1) - 1) - 
-                                    eigenvalues.narrow(-1, 0, eigenvalues.size(-1) - 1);
+        // Basic validation - eigenvalues should be real for symmetric matrices
+        // and eigenvectors should be orthogonal
+        if (eigenvalues.numel() > 0 && eigenvectors.numel() > 0) {
+            // Verify reconstruction: A = V * diag(eigenvalues) * V^T
+            torch::Tensor reconstructed = torch::matmul(
+                torch::matmul(eigenvectors, torch::diag(eigenvalues)),
+                eigenvectors.transpose(0, 1)
+            );
+            
+            // Compute difference (for coverage, not validation)
+            torch::Tensor diff = symmetric_input - reconstructed;
+            volatile float max_diff = torch::max(torch::abs(diff)).item<float>();
+            (void)max_diff;  // Prevent optimization
+            
+            // Check orthogonality of eigenvectors
+            torch::Tensor identity_check = torch::matmul(
+                eigenvectors.transpose(0, 1), 
+                eigenvectors
+            );
+            volatile float trace_val = torch::trace(identity_check).item<float>();
+            (void)trace_val;  // Prevent optimization
+        }
+        
+        // Also test batched input for better coverage
+        if (n <= 8 && Size > 10) {
+            torch::Tensor batched = symmetric_input.unsqueeze(0).expand({2, n, n}).clone();
+            
+            try {
+                auto batched_result = torch::linalg_eigh(batched, upper ? "U" : "L");
+                torch::Tensor batched_eigenvalues = std::get<0>(batched_result);
+                torch::Tensor batched_eigenvectors = std::get<1>(batched_result);
                 
-                // If eigenvectors were computed, verify orthogonality
-                if (eigenvectors && eigenvectors_tensor.numel() > 0) {
-                    // For each batch, compute V * V.t() which should be close to identity
-                    // for orthogonal eigenvectors
-                    torch::Tensor vvt = torch::matmul(eigenvectors_tensor, 
-                                                     eigenvectors_tensor.transpose(-2, -1));
-                }
+                // Access results to ensure computation
+                volatile float first_eigenvalue = batched_eigenvalues[0][0].item<float>();
+                (void)first_eigenvalue;
+            } catch (const std::exception &) {
+                // Expected for some edge cases
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    
+    return 0;
 }

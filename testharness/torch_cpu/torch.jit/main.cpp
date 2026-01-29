@@ -1,175 +1,221 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <torch/script.h> // For torch::jit functionality
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <torch/script.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to work with
         if (Size < 4) {
             return 0;
         }
         
-        // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a simple module to test JIT functionality
-        std::string module_code;
-        
         // Use remaining bytes to determine which JIT test to run
+        uint8_t test_selector = 0;
         if (offset < Size) {
-            uint8_t test_selector = Data[offset++] % 5;
-            
-            switch (test_selector) {
-                case 0: {
-                    // Simple identity function
-                    module_code = R"(
-                        def forward(self, x):
-                            return x
-                    )";
-                    break;
-                }
-                case 1: {
-                    // Basic arithmetic
-                    module_code = R"(
-                        def forward(self, x):
-                            return x + x
-                    )";
-                    break;
-                }
-                case 2: {
-                    // Control flow
-                    module_code = R"(
-                        def forward(self, x):
-                            if x.sum() > 0:
-                                return x * 2
-                            else:
-                                return x * -1
-                    )";
-                    break;
-                }
-                case 3: {
-                    // More complex operations
-                    module_code = R"(
-                        def forward(self, x):
-                            return torch.nn.functional.relu(x)
-                    )";
-                    break;
-                }
-                case 4: {
-                    // Try with loops
-                    module_code = R"(
-                        def forward(self, x):
-                            result = x
-                            for _ in range(3):
-                                result = result + x
-                            return result
-                    )";
-                    break;
-                }
-            }
-        } else {
-            // Default module if we've consumed all data
-            module_code = R"(
-                def forward(self, x):
-                    return x
-            )";
+            test_selector = Data[offset++] % 6;
         }
         
-        // Try different JIT compilation methods
-        if (offset < Size) {
-            uint8_t jit_method = Data[offset++] % 3;
-            
-            switch (jit_method) {
-                case 0: {
-                    // Method 1: Compile a TorchScript function from a string
-                    auto compilation_unit = torch::jit::compile(module_code);
-                    auto function = compilation_unit->find_function("forward");
-                    if (function) {
-                        std::vector<torch::jit::IValue> inputs;
-                        inputs.push_back(input_tensor);
-                        torch::jit::IValue output = function->operator()(inputs);
-                        torch::Tensor result = output.toTensor();
-                    }
-                    break;
-                }
-                case 1: {
-                    // Method 2: Script a small module and run it
-                    torch::jit::Module scripted_module("scripted_module");
-                    scripted_module.define(R"JIT(
-                        def forward(self, x):
-                            return torch.sigmoid(x)
-                    )JIT");
-                    std::vector<torch::jit::IValue> inputs;
-                    inputs.push_back(input_tensor);
-                    torch::jit::IValue output = scripted_module.forward(inputs);
-                    torch::Tensor result = output.toTensor().sum();
-                    break;
-                }
-                case 2: {
-                    // Method 3: Define a module with control flow
-                    torch::jit::Module scripted_module("control_module");
-                    scripted_module.define(R"JIT(
-                        def forward(self, x):
-                            if x.sum() > 0:
-                                return x.tanh()
-                            else:
-                                return x.relu()
-                    )JIT");
-                    std::vector<torch::jit::IValue> inputs;
-                    inputs.push_back(input_tensor);
-                    torch::jit::IValue output = scripted_module.forward(inputs);
-                    torch::Tensor result = output.toTensor().sum();
-                    break;
-                }
-            }
-        } else {
-            // Default JIT method if we've consumed all data
-            auto compilation_unit = torch::jit::compile(module_code);
-            auto function = compilation_unit->find_function("forward");
-            if (function) {
+        switch (test_selector) {
+            case 0: {
+                // Test: Define and run a simple module with identity
+                torch::jit::Module module("test_module");
+                module.define(R"JIT(
+                    def forward(self, x):
+                        return x
+                )JIT");
                 std::vector<torch::jit::IValue> inputs;
                 inputs.push_back(input_tensor);
-                torch::jit::IValue output = function->operator()(inputs);
-                torch::Tensor result = output.toTensor();
+                auto output = module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+                break;
+            }
+            case 1: {
+                // Test: Basic arithmetic operations
+                torch::jit::Module module("arith_module");
+                module.define(R"JIT(
+                    def forward(self, x):
+                        return x + x * 2
+                )JIT");
+                std::vector<torch::jit::IValue> inputs;
+                inputs.push_back(input_tensor);
+                auto output = module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+                break;
+            }
+            case 2: {
+                // Test: Control flow with if statement
+                torch::jit::Module module("control_module");
+                module.define(R"JIT(
+                    def forward(self, x):
+                        if x.sum() > 0:
+                            return x * 2
+                        else:
+                            return x * -1
+                )JIT");
+                std::vector<torch::jit::IValue> inputs;
+                inputs.push_back(input_tensor);
+                auto output = module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+                break;
+            }
+            case 3: {
+                // Test: Module with activation function
+                torch::jit::Module module("activation_module");
+                module.define(R"JIT(
+                    def forward(self, x):
+                        return torch.sigmoid(x)
+                )JIT");
+                std::vector<torch::jit::IValue> inputs;
+                inputs.push_back(input_tensor);
+                auto output = module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+                break;
+            }
+            case 4: {
+                // Test: Module with loop
+                torch::jit::Module module("loop_module");
+                module.define(R"JIT(
+                    def forward(self, x):
+                        result = x
+                        for i in range(3):
+                            result = result + x
+                        return result
+                )JIT");
+                std::vector<torch::jit::IValue> inputs;
+                inputs.push_back(input_tensor);
+                auto output = module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+                break;
+            }
+            case 5: {
+                // Test: Module with multiple methods
+                torch::jit::Module module("multi_method_module");
+                module.define(R"JIT(
+                    def helper(self, x):
+                        return x.relu()
+                    def forward(self, x):
+                        y = self.helper(x)
+                        return y.tanh()
+                )JIT");
+                std::vector<torch::jit::IValue> inputs;
+                inputs.push_back(input_tensor);
+                auto output = module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+                break;
             }
         }
         
-        // Test serialization and deserialization if we have more data
-        if (offset < Size && Data[offset++] % 2 == 0) {
-            // Create a simple scripted module
-            torch::jit::Module scripted_module("serialized_module");
-            scripted_module.define(R"JIT(
+        // Test save to buffer and load (memory-based, not file-based)
+        if (offset < Size && Data[offset++] % 3 == 0) {
+            try {
+                torch::jit::Module module("buffer_test_module");
+                module.define(R"JIT(
+                    def forward(self, x):
+                        return x * 2
+                )JIT");
+                
+                // Save to stringstream (in-memory)
+                std::ostringstream buffer;
+                module.save(buffer);
+                
+                // Load from stringstream
+                std::istringstream input_buffer(buffer.str());
+                torch::jit::Module loaded_module = torch::jit::load(input_buffer);
+                
+                std::vector<torch::jit::IValue> inputs;
+                inputs.push_back(input_tensor);
+                auto output = loaded_module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+            }
+            catch (...) {
+                // Serialization may fail for some configurations, ignore silently
+            }
+        }
+        
+        // Test cloning a module
+        if (offset < Size && Data[offset++] % 3 == 0) {
+            torch::jit::Module module("clone_test_module");
+            module.define(R"JIT(
                 def forward(self, x):
-                    return x * 2
+                    return x.abs()
             )JIT");
             
-            // Save to a temporary file
-            scripted_module.save("temp_module.pt");
+            torch::jit::Module cloned = module.clone();
             
-            // Load it back
-            torch::jit::Module loaded_module = torch::jit::load("temp_module.pt");
-            
-            // Run the loaded module
             std::vector<torch::jit::IValue> inputs;
             inputs.push_back(input_tensor);
-            torch::jit::IValue output = loaded_module.forward(inputs);
-            torch::Tensor result = output.toTensor();
+            auto output = cloned.forward(inputs);
+            if (output.isTensor()) {
+                torch::Tensor result = output.toTensor();
+                (void)result.sum().item<float>();
+            }
         }
-    }
-    catch (const c10::Error &e)
-    {
-        return 0;
+        
+        // Test module with parameters
+        if (offset < Size && Data[offset++] % 3 == 0) {
+            torch::jit::Module module("param_module");
+            
+            // Register a parameter
+            auto weight = torch::randn({input_tensor.size(-1), input_tensor.size(-1)});
+            module.register_parameter("weight", weight, false);
+            
+            module.define(R"JIT(
+                def forward(self, x):
+                    return torch.matmul(x, self.weight)
+            )JIT");
+            
+            std::vector<torch::jit::IValue> inputs;
+            inputs.push_back(input_tensor);
+            
+            try {
+                auto output = module.forward(inputs);
+                if (output.isTensor()) {
+                    torch::Tensor result = output.toTensor();
+                    (void)result.sum().item<float>();
+                }
+            }
+            catch (...) {
+                // Shape mismatch is expected for some inputs
+            }
+        }
     }
     catch (const std::exception &e)
     {
-        return 0;
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return -1;
     }
+    
     return 0;
 }

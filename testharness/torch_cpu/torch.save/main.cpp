@@ -1,13 +1,23 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <fstream>        // For file operations
-#include <filesystem>     // For filesystem operations
+#include <cstdio>         // For std::remove
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
+    // Use fixed filenames to avoid file accumulation
+    const std::string temp_filename = "/tmp/fuzz_tensor.pt";
+    const std::string temp_filename2 = "/tmp/fuzz_tensors.pt";
+    const std::string temp_archive = "/tmp/fuzz_tensor.archive";
+    
     try
     {
         size_t offset = 0;
@@ -20,10 +30,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a tensor from the input data
         torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a temporary filename for saving
-        std::string temp_filename = "temp_tensor_" + std::to_string(reinterpret_cast<uintptr_t>(Data)) + ".pt";
-        
-        // Test torch::save functionality
+        // Test torch::save functionality with single tensor
         torch::save(tensor, temp_filename);
         
         // Verify the save worked by loading the tensor back
@@ -35,7 +42,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor tensor2 = fuzzer_utils::createTensor(Data, Size, offset);
             std::vector<torch::Tensor> tensors = {tensor, tensor2};
             
-            std::string temp_filename2 = "temp_tensors_" + std::to_string(reinterpret_cast<uintptr_t>(Data)) + ".pt";
             torch::save(tensors, temp_filename2);
             
             // Load the tensors back
@@ -46,36 +52,72 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::remove(temp_filename2.c_str());
         }
         
-        // Try to save a tensor with options
+        // Try to save using OutputArchive for more coverage
         if (Size > offset + 2) {
-            uint8_t option_byte = Data[offset++];
+            torch::serialize::OutputArchive output_archive;
+            output_archive.write("tensor", tensor);
+            output_archive.save_to(temp_archive);
             
-            torch::serialize::OutputArchive archive;
-            archive.write("tensor", tensor);
-            archive.save_to(temp_filename + ".archive");
+            // Verify by loading with InputArchive
+            torch::serialize::InputArchive input_archive;
+            input_archive.load_from(temp_archive);
+            torch::Tensor archive_loaded;
+            input_archive.read("tensor", archive_loaded);
+            
+            // Clean up archive file
+            std::remove(temp_archive.c_str());
         }
         
-        // Try to save to a non-existent directory
-        if (Size > offset + 2) {
+        // Try saving tensors with different dtypes for coverage
+        if (Size > offset + 1) {
+            uint8_t dtype_byte = Data[offset++] % 4;
+            torch::Tensor typed_tensor;
+            
+            switch (dtype_byte) {
+                case 0:
+                    typed_tensor = tensor.to(torch::kFloat32);
+                    break;
+                case 1:
+                    typed_tensor = tensor.to(torch::kFloat64);
+                    break;
+                case 2:
+                    typed_tensor = tensor.to(torch::kInt32);
+                    break;
+                case 3:
+                    typed_tensor = tensor.to(torch::kInt64);
+                    break;
+            }
+            
+            torch::save(typed_tensor, temp_filename);
+            torch::Tensor loaded_typed;
+            torch::load(loaded_typed, temp_filename);
+        }
+        
+        // Try to save to an invalid path (expected to fail)
+        if (Size > offset + 1) {
             uint8_t dir_byte = Data[offset++];
-            if (dir_byte % 5 == 0) {  // Occasionally try invalid paths
+            if (dir_byte % 10 == 0) {  // Occasionally try invalid paths
                 try {
-                    std::string invalid_path = "/nonexistent_dir_" + std::to_string(dir_byte) + "/tensor.pt";
+                    std::string invalid_path = "/nonexistent_dir_xyz/tensor.pt";
                     torch::save(tensor, invalid_path);
                 } catch (...) {
-                    // Expected to fail, continue
+                    // Expected to fail, continue silently
                 }
             }
         }
         
-        // Clean up the temporary file
+        // Clean up the main temporary file
         std::remove(temp_filename.c_str());
         
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        // Clean up files on exception
+        std::remove(temp_filename.c_str());
+        std::remove(temp_filename2.c_str());
+        std::remove(temp_archive.c_str());
+        return -1;  // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
+    return 0;  // Keep the input
 }

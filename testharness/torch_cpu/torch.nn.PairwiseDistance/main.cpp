@@ -1,128 +1,152 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create tensors
         if (Size < 4) {
             return 0;
         }
         
-        // Create two input tensors for pairwise distance
+        // Create first input tensor
         torch::Tensor x1 = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create second tensor if we have data left
+        // Create second tensor with same shape as x1 for pairwise distance
         torch::Tensor x2;
         if (offset < Size) {
             x2 = fuzzer_utils::createTensor(Data, Size, offset);
         } else {
-            // If no data left, create a tensor with same shape as x1
-            x2 = torch::ones_like(x1);
+            x2 = torch::randn_like(x1);
         }
         
         // Extract parameters for PairwiseDistance from remaining data
-        double p = 2.0; // Default p-norm value
+        double p = 2.0;
         bool keepdim = false;
         double eps = 1e-6;
         
-        if (offset + 1 < Size) {
-            // Use remaining data to determine p value (1, 2, or other)
+        if (offset < Size) {
             uint8_t p_selector = Data[offset++];
-            if (p_selector % 3 == 0) {
+            if (p_selector % 4 == 0) {
                 p = 1.0;
-            } else if (p_selector % 3 == 1) {
+            } else if (p_selector % 4 == 1) {
                 p = 2.0;
+            } else if (p_selector % 4 == 2) {
+                p = 3.0;
             } else {
-                // Use a different p value
                 p = 0.5 + (p_selector % 10);
             }
         }
         
         if (offset < Size) {
-            // Use remaining data to determine keepdim
             keepdim = (Data[offset++] % 2 == 0);
         }
         
         if (offset < Size) {
-            // Use remaining data to determine eps
             uint8_t eps_selector = Data[offset++];
             eps = 1e-8 * (1 + eps_selector % 100);
         }
         
-        // Try to make tensors compatible for pairwise distance
-        // PairwiseDistance expects tensors with same shape except possibly the last dimension
-        if (x1.dim() > 0 && x2.dim() > 0) {
-            // Try to reshape tensors to have compatible shapes if needed
-            if (x1.sizes() != x2.sizes()) {
-                // For pairwise distance, all dimensions except the last should match
-                std::vector<int64_t> new_shape1, new_shape2;
-                
-                if (x1.dim() >= 2 && x2.dim() >= 2) {
-                    // Keep all dimensions except the last one the same
-                    for (int i = 0; i < std::min(x1.dim(), x2.dim()) - 1; i++) {
-                        int64_t common_dim = std::min(x1.size(i), x2.size(i));
-                        new_shape1.push_back(common_dim);
-                        new_shape2.push_back(common_dim);
-                    }
-                    
-                    // Keep the last dimensions as they are
-                    new_shape1.push_back(x1.size(-1));
-                    new_shape2.push_back(x2.size(-1));
-                    
-                    // Try to reshape
-                    try {
-                        x1 = x1.reshape(new_shape1);
-                        x2 = x2.reshape(new_shape2);
-                    } catch (...) {
-                        // If reshape fails, create new tensors with compatible shapes
-                        x1 = torch::ones(new_shape1, x1.options());
-                        x2 = torch::ones(new_shape2, x2.options());
-                    }
-                }
+        // Ensure tensors are floating point for distance computation
+        if (!x1.is_floating_point()) {
+            x1 = x1.to(torch::kFloat32);
+        }
+        if (!x2.is_floating_point()) {
+            x2 = x2.to(torch::kFloat32);
+        }
+        
+        // PairwiseDistance requires tensors with the same shape
+        // Make x2 match x1's shape
+        if (x1.sizes() != x2.sizes()) {
+            try {
+                // Try to expand/broadcast x2 to match x1
+                x2 = x2.expand_as(x1).clone();
+            } catch (...) {
+                // If expansion fails, create new tensor with same shape
+                x2 = torch::randn_like(x1);
             }
+        }
+        
+        // Ensure tensors are at least 1D
+        if (x1.dim() == 0) {
+            x1 = x1.unsqueeze(0);
+            x2 = x2.unsqueeze(0);
         }
         
         // Create PairwiseDistance module
-        torch::nn::PairwiseDistance pairwise_distance(
-            torch::nn::PairwiseDistanceOptions().p(p).eps(eps).keepdim(keepdim)
-        );
+        auto options = torch::nn::PairwiseDistanceOptions().p(p).eps(eps).keepdim(keepdim);
+        torch::nn::PairwiseDistance pairwise_distance(options);
         
-        // Apply pairwise distance
-        torch::Tensor output = pairwise_distance->forward(x1, x2);
+        // Apply pairwise distance using module
+        torch::Tensor output;
+        try {
+            output = pairwise_distance(x1, x2);
+        } catch (...) {
+            // Shape mismatch or other expected errors
+            return 0;
+        }
         
-        // Try alternative ways to compute pairwise distance
-        if (offset < Size) {
-            uint8_t alt_method = Data[offset++];
-            if (alt_method % 3 == 0) {
-                // Use functional interface
-                output = torch::pairwise_distance(x1, x2, p, eps, keepdim);
-            } else if (alt_method % 3 == 1 && p == 2.0) {
-                // For p=2, try using pdist
-                if (x1.dim() == 2) {
-                    output = torch::pdist(x1, 2.0);
-                }
+        // Also test the functional interface
+        if (offset < Size && Data[offset - 1] % 2 == 0) {
+            try {
+                torch::Tensor output_func = torch::pairwise_distance(x1, x2, p, eps, keepdim);
+                (void)output_func;
+            } catch (...) {
+                // Silently handle expected errors
             }
         }
         
-        // Access output elements to ensure computation is performed
-        if (output.numel() > 0) {
-            float sum = output.sum().item<float>();
-            if (std::isnan(sum) || std::isinf(sum)) {
-                // This is not an error, just a result of the computation
+        // Test with different p values using functional API
+        if (offset < Size) {
+            uint8_t test_selector = Data[offset - 1];
+            try {
+                if (test_selector % 5 == 0) {
+                    // L1 distance
+                    auto out1 = torch::pairwise_distance(x1, x2, 1.0, eps, keepdim);
+                    (void)out1;
+                } else if (test_selector % 5 == 1) {
+                    // L2 distance
+                    auto out2 = torch::pairwise_distance(x1, x2, 2.0, eps, keepdim);
+                    (void)out2;
+                } else if (test_selector % 5 == 2) {
+                    // Infinity norm (max)
+                    auto out_inf = torch::pairwise_distance(x1, x2, std::numeric_limits<double>::infinity(), eps, keepdim);
+                    (void)out_inf;
+                }
+            } catch (...) {
+                // Silently handle expected errors
             }
+        }
+        
+        // Test pdist for 2D tensors (computes pairwise distances between all rows)
+        if (x1.dim() == 2 && x1.size(0) > 1) {
+            try {
+                auto pdist_output = torch::pdist(x1, p);
+                (void)pdist_output;
+            } catch (...) {
+                // Silently handle expected errors
+            }
+        }
+        
+        // Access output to ensure computation is performed
+        if (output.defined() && output.numel() > 0) {
+            volatile float sum = output.sum().item<float>();
+            (void)sum;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

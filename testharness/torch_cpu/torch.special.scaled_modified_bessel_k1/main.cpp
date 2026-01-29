@@ -1,64 +1,104 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Skip if we don't have enough data
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
+        
+        size_t offset = 0;
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // scaled_modified_bessel_k1 works on floating point tensors
+        // Convert to float if not already
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
         // Apply the scaled_modified_bessel_k1 operation
+        // This computes exp(x) * K1(x) where K1 is the modified Bessel function of second kind
         torch::Tensor result = torch::special::scaled_modified_bessel_k1(input);
         
-        // Try to access the result to ensure computation is performed
+        // Verify result is defined and force computation
         if (result.defined() && result.numel() > 0) {
-            auto accessor = result.accessor<float, 1>();
-            volatile float first_element = accessor[0];
-            (void)first_element;
+            // Use sum to force computation without assuming shape/dtype
+            volatile float check = result.sum().item<float>();
+            (void)check;
         }
         
-        // Try with different input types
-        if (offset + 2 < Size) {
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
-            torch::Tensor result2 = torch::special::scaled_modified_bessel_k1(input2);
-        }
-        
-        // Try with scalar input converted to tensor
-        if (input.numel() > 0) {
-            torch::Scalar scalar_input = input.item();
-            try {
-                torch::Tensor scalar_tensor = torch::tensor(scalar_input);
-                torch::Tensor scalar_result = torch::special::scaled_modified_bessel_k1(scalar_tensor);
-            } catch (...) {
-                // Ignore exceptions from scalar input
-            }
-        }
-        
-        // Try with different device if available
+        // Test with double precision
         try {
-            if (torch::cuda::is_available()) {
-                torch::Tensor cuda_input = input.cuda();
-                torch::Tensor cuda_result = torch::special::scaled_modified_bessel_k1(cuda_input);
+            torch::Tensor input_double = input.to(torch::kFloat64);
+            torch::Tensor result_double = torch::special::scaled_modified_bessel_k1(input_double);
+            if (result_double.defined() && result_double.numel() > 0) {
+                volatile double check = result_double.sum().item<double>();
+                (void)check;
             }
         } catch (...) {
-            // Ignore CUDA-related exceptions
+            // Silently ignore dtype conversion issues
+        }
+        
+        // Test with different tensor shapes if we have remaining data
+        if (offset < Size) {
+            size_t offset2 = 0;
+            try {
+                torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset2);
+                if (!input2.is_floating_point()) {
+                    input2 = input2.to(torch::kFloat32);
+                }
+                torch::Tensor result2 = torch::special::scaled_modified_bessel_k1(input2);
+                if (result2.defined() && result2.numel() > 0) {
+                    volatile float check = result2.sum().item<float>();
+                    (void)check;
+                }
+            } catch (...) {
+                // Silently ignore issues with second tensor
+            }
+        }
+        
+        // Test with contiguous vs non-contiguous tensor
+        if (input.dim() >= 2 && input.size(0) > 1) {
+            try {
+                // Create non-contiguous view by transposing
+                torch::Tensor transposed = input.transpose(0, input.dim() - 1);
+                torch::Tensor result_t = torch::special::scaled_modified_bessel_k1(transposed);
+                if (result_t.defined() && result_t.numel() > 0) {
+                    volatile float check = result_t.sum().item<float>();
+                    (void)check;
+                }
+            } catch (...) {
+                // Silently ignore transpose issues
+            }
+        }
+        
+        // Test with positive values only (Bessel K1 has special behavior for positive values)
+        try {
+            torch::Tensor positive_input = torch::abs(input) + 0.001f;  // Avoid zero
+            torch::Tensor result_pos = torch::special::scaled_modified_bessel_k1(positive_input);
+            if (result_pos.defined() && result_pos.numel() > 0) {
+                volatile float check = result_pos.sum().item<float>();
+                (void)check;
+            }
+        } catch (...) {
+            // Silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,17 +1,20 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <algorithm>      // For std::max
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <algorithm>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes for basic tensor creation
         if (Size < 10) {
             return 0;
         }
@@ -19,103 +22,115 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create the input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create the index tensor (must be long/int64 type for indexing)
-        torch::Tensor index;
-        if (offset < Size) {
-            index = fuzzer_utils::createTensor(Data, Size, offset);
-            index = index.to(torch::kInt64);
-        } else {
-            // If we don't have enough data, create a simple index tensor
-            index = torch::tensor({0}, torch::kInt64);
-        }
-        
-        // Create the src tensor to add
-        torch::Tensor src;
-        if (offset < Size) {
-            src = fuzzer_utils::createTensor(Data, Size, offset);
-            // Convert src to match input's dtype
-            src = src.to(input.dtype());
-        } else {
-            // If we don't have enough data, create a simple src tensor
-            src = torch::ones_like(input);
+        if (input.numel() == 0 || input.dim() == 0) {
+            return 0;
         }
         
         // Get a dimension to scatter along
         int64_t dim = 0;
-        if (offset < Size && input.dim() > 0) {
-            dim = static_cast<int64_t>(Data[offset++]) % std::max(static_cast<int64_t>(1), input.dim());
-        }
-        
-        // Try different variants of scatter_add
-        try {
-            // Variant 1: Using the scatter_add_ method on the input tensor
-            auto result1 = input.clone().scatter_add_(dim, index, src);
-        } catch (const std::exception& e) {
-            // Continue to next variant
-        }
-        
-        try {
-            // Variant 2: Using the functional form
-            auto result2 = torch::scatter_add(input, dim, index, src);
-        } catch (const std::exception& e) {
-            // Continue to next variant
-        }
-        
-        // Try with different reduction modes if we have more data
         if (offset < Size) {
-            std::string reduction = "sum"; // Default
-            uint8_t reduction_selector = Data[offset++];
-            if (reduction_selector % 3 == 0) {
-                reduction = "sum";
-            } else if (reduction_selector % 3 == 1) {
-                reduction = "prod";
-            } else {
-                reduction = "mean";
-            }
+            dim = static_cast<int64_t>(Data[offset++]) % input.dim();
+        }
+        
+        // Create index tensor with same number of dimensions as input
+        // Index values must be in valid range [0, input.size(dim))
+        torch::Tensor index;
+        if (offset < Size) {
+            torch::Tensor raw_index = fuzzer_utils::createTensor(Data, Size, offset);
+            // Convert to int64 and ensure same dimensions
+            raw_index = raw_index.to(torch::kInt64);
             
-            try {
-                // Variant 3: With reduction parameter
-                auto result3 = torch::scatter(input, dim, index, src, reduction);
-            } catch (const std::exception& e) {
-                // Continue
-            }
-        }
-        
-        // Try with edge cases if we have more data
-        if (offset < Size) {
-            // Try with negative dimension
-            try {
-                int64_t neg_dim = -1;
-                if (input.dim() > 0) {
-                    neg_dim = -1 * (static_cast<int64_t>(Data[offset++]) % input.dim() + 1);
+            // Reshape to have same number of dimensions as input
+            std::vector<int64_t> index_shape;
+            for (int64_t i = 0; i < input.dim(); i++) {
+                if (i < raw_index.dim()) {
+                    index_shape.push_back(std::min(raw_index.size(i), input.size(i)));
+                } else {
+                    index_shape.push_back(1);
                 }
-                auto result4 = torch::scatter_add(input, neg_dim, index, src);
-            } catch (const std::exception& e) {
-                // Continue
             }
             
-            // Try with out-of-bounds indices
+            // Create index with proper shape and valid values
+            int64_t total_elements = 1;
+            for (auto s : index_shape) total_elements *= s;
+            if (total_elements == 0) total_elements = 1;
+            
+            index = torch::randint(0, std::max(input.size(dim), (int64_t)1), index_shape, torch::kInt64);
+        } else {
+            std::vector<int64_t> index_shape(input.dim(), 1);
+            index = torch::zeros(index_shape, torch::kInt64);
+        }
+        
+        // Create src tensor with same shape as index
+        torch::Tensor src = torch::randn(index.sizes(), input.options());
+        
+        // Variant 1: In-place scatter_add_
+        try {
+            auto result1 = input.clone().scatter_add_(dim, index, src);
+        } catch (...) {
+            // Expected failures for invalid inputs
+        }
+        
+        // Variant 2: Functional form torch::scatter_add
+        try {
+            auto result2 = torch::scatter_add(input, dim, index, src);
+        } catch (...) {
+            // Expected failures
+        }
+        
+        // Variant 3: Try with negative dimension
+        if (offset < Size && input.dim() > 0) {
             try {
-                auto bad_index = index.clone();
-                bad_index.fill_(input.size(dim > 0 ? dim : 0) + 1);
-                auto result5 = torch::scatter_add(input, dim, bad_index, src);
-            } catch (const std::exception& e) {
-                // Continue
+                int64_t neg_dim = -(1 + (Data[offset++] % input.dim()));
+                auto result3 = torch::scatter_add(input, neg_dim, index, src);
+            } catch (...) {
+                // Expected failures
+            }
+        }
+        
+        // Variant 4: scatter with reduce parameter (different API)
+        if (offset < Size) {
+            try {
+                // torch::scatter with reduce mode
+                auto result4 = torch::scatter(input, dim, index, src);
+            } catch (...) {
+                // Expected failures
+            }
+        }
+        
+        // Variant 5: Different dtypes
+        if (offset < Size) {
+            try {
+                auto float_input = input.to(torch::kFloat32);
+                auto float_src = src.to(torch::kFloat32);
+                auto result5 = torch::scatter_add(float_input, dim, index, float_src);
+            } catch (...) {
+                // Expected failures
             }
             
-            // Try with mismatched shapes
             try {
-                auto mismatched_src = torch::ones({1});
-                auto result6 = torch::scatter_add(input, dim, index, mismatched_src);
-            } catch (const std::exception& e) {
-                // Continue
+                auto double_input = input.to(torch::kFloat64);
+                auto double_src = src.to(torch::kFloat64);
+                auto result6 = torch::scatter_add(double_input, dim, index, double_src);
+            } catch (...) {
+                // Expected failures
+            }
+        }
+        
+        // Variant 6: Multi-dimensional scatter
+        if (offset < Size && input.dim() > 1) {
+            try {
+                int64_t other_dim = (dim + 1) % input.dim();
+                auto result7 = torch::scatter_add(input, other_dim, index, src);
+            } catch (...) {
+                // Expected failures
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

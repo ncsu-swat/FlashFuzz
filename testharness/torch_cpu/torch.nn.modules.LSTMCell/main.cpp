@@ -1,165 +1,142 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 4) {
+        // Need at least some data to configure the LSTM cell
+        if (Size < 8) {
             return 0;
         }
-        
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create hidden state tensors (h0, c0)
-        torch::Tensor h0, c0;
-        
-        if (offset < Size) {
-            h0 = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a default h0
-            if (input.dim() > 0 && input.size(0) > 0) {
-                h0 = torch::zeros({input.size(0), 10});
-            } else {
-                h0 = torch::zeros({1, 10});
-            }
-        }
-        
-        if (offset < Size) {
-            c0 = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a default c0
-            if (h0.dim() > 0 && h0.size(0) > 0 && h0.size(1) > 0) {
-                c0 = torch::zeros({h0.size(0), h0.size(1)});
-            } else {
-                c0 = torch::zeros({1, 10});
-            }
-        }
-        
-        // Extract parameters for LSTM cell
-        int64_t input_size = 0;
-        int64_t hidden_size = 0;
-        bool bias = true;
-        
-        if (input.dim() > 0) {
-            if (input.dim() > 1) {
-                input_size = input.size(1);
-            } else {
-                input_size = 1;
-            }
-        } else {
-            input_size = 1;
-        }
-        
-        if (h0.dim() > 0 && h0.dim() > 1) {
-            hidden_size = h0.size(1);
-        } else {
-            hidden_size = 10;
-        }
-        
-        // Use a byte from the input to determine whether to use bias
-        if (offset < Size) {
-            bias = (Data[offset++] % 2 == 0);
-        }
-        
-        // Create LSTM cell
+
+        size_t offset = 0;
+
+        // Extract configuration from fuzzer data
+        uint8_t input_size_byte = Data[offset++];
+        uint8_t hidden_size_byte = Data[offset++];
+        uint8_t batch_size_byte = Data[offset++];
+        uint8_t config_byte = Data[offset++];
+
+        // Constrain sizes to reasonable ranges to avoid OOM
+        int64_t input_size = (input_size_byte % 32) + 1;   // 1-32
+        int64_t hidden_size = (hidden_size_byte % 32) + 1; // 1-32
+        int64_t batch_size = (batch_size_byte % 8) + 1;    // 1-8
+        bool use_bias = (config_byte & 0x01) != 0;
+        bool provide_hidden = (config_byte & 0x02) != 0;
+
+        // Create LSTM cell with extracted parameters
         torch::nn::LSTMCellOptions options(input_size, hidden_size);
-        options.bias(bias);
-        
+        options.bias(use_bias);
         torch::nn::LSTMCell lstm_cell(options);
-        
-        // Try to make input and hidden states compatible
-        if (input.dim() == 0) {
-            input = input.unsqueeze(0).unsqueeze(0);
-            if (input_size > 1) {
-                input = input.expand({1, input_size});
+
+        // Create input tensor with correct shape: (batch_size, input_size)
+        torch::Tensor input;
+        if (offset < Size) {
+            torch::Tensor raw_input = fuzzer_utils::createTensor(Data, Size, offset);
+            // Reshape or create a properly sized input
+            int64_t total_elements = raw_input.numel();
+            if (total_elements >= batch_size * input_size) {
+                input = raw_input.flatten().slice(0, 0, batch_size * input_size)
+                            .reshape({batch_size, input_size}).to(torch::kFloat);
+            } else if (total_elements > 0) {
+                // Pad with zeros if not enough elements
+                auto flat = raw_input.flatten().to(torch::kFloat);
+                auto padding = torch::zeros({batch_size * input_size - total_elements});
+                input = torch::cat({flat, padding}).reshape({batch_size, input_size});
+            } else {
+                input = torch::randn({batch_size, input_size});
             }
-        } else if (input.dim() == 1) {
-            input = input.unsqueeze(0);
-            if (input.size(1) != input_size && input_size > 0) {
-                input = input.slice(1, 0, std::min(input.size(1), input_size));
-                if (input.size(1) < input_size) {
-                    auto padding = torch::zeros({input.size(0), input_size - input.size(1)}, input.options());
-                    input = torch::cat({input, padding}, 1);
+        } else {
+            input = torch::randn({batch_size, input_size});
+        }
+
+        // Ensure input is float
+        input = input.to(torch::kFloat);
+
+        // Optionally provide hidden states
+        std::tuple<torch::Tensor, torch::Tensor> hx;
+        
+        if (provide_hidden) {
+            torch::Tensor h0, c0;
+            
+            // Create h0
+            if (offset < Size) {
+                torch::Tensor raw_h0 = fuzzer_utils::createTensor(Data, Size, offset);
+                int64_t h_elements = raw_h0.numel();
+                if (h_elements >= batch_size * hidden_size) {
+                    h0 = raw_h0.flatten().slice(0, 0, batch_size * hidden_size)
+                             .reshape({batch_size, hidden_size}).to(torch::kFloat);
+                } else {
+                    h0 = torch::zeros({batch_size, hidden_size});
                 }
+            } else {
+                h0 = torch::zeros({batch_size, hidden_size});
             }
-        }
-        
-        // Ensure h0 and c0 have compatible shapes
-        if (h0.dim() == 0) {
-            h0 = h0.unsqueeze(0).unsqueeze(0);
-            if (hidden_size > 1) {
-                h0 = h0.expand({1, hidden_size});
-            }
-        } else if (h0.dim() == 1) {
-            h0 = h0.unsqueeze(0);
-            if (h0.size(1) != hidden_size && hidden_size > 0) {
-                h0 = h0.slice(1, 0, std::min(h0.size(1), hidden_size));
-                if (h0.size(1) < hidden_size) {
-                    auto padding = torch::zeros({h0.size(0), hidden_size - h0.size(1)}, h0.options());
-                    h0 = torch::cat({h0, padding}, 1);
+
+            // Create c0
+            if (offset < Size) {
+                torch::Tensor raw_c0 = fuzzer_utils::createTensor(Data, Size, offset);
+                int64_t c_elements = raw_c0.numel();
+                if (c_elements >= batch_size * hidden_size) {
+                    c0 = raw_c0.flatten().slice(0, 0, batch_size * hidden_size)
+                             .reshape({batch_size, hidden_size}).to(torch::kFloat);
+                } else {
+                    c0 = torch::zeros({batch_size, hidden_size});
                 }
+            } else {
+                c0 = torch::zeros({batch_size, hidden_size});
             }
+
+            hx = std::make_tuple(h0, c0);
+            
+            // Call with hidden state
+            auto result = lstm_cell(input, hx);
+            auto h1 = std::get<0>(result);
+            auto c1 = std::get<1>(result);
+            
+            // Use the results
+            auto sum_val = torch::sum(h1).item<float>() + torch::sum(c1).item<float>();
+            (void)sum_val;
+        } else {
+            // Call without hidden state (will use zeros internally)
+            auto result = lstm_cell(input);
+            auto h1 = std::get<0>(result);
+            auto c1 = std::get<1>(result);
+            
+            // Use the results
+            auto sum_val = torch::sum(h1).item<float>() + torch::sum(c1).item<float>();
+            (void)sum_val;
         }
-        
-        if (c0.dim() == 0) {
-            c0 = c0.unsqueeze(0).unsqueeze(0);
-            if (hidden_size > 1) {
-                c0 = c0.expand({1, hidden_size});
+
+        // Test multiple forward passes to explore state-dependent behavior
+        if ((config_byte & 0x04) != 0) {
+            torch::Tensor h_state = torch::zeros({batch_size, hidden_size});
+            torch::Tensor c_state = torch::zeros({batch_size, hidden_size});
+            
+            int num_steps = ((config_byte >> 4) % 4) + 1; // 1-4 steps
+            for (int i = 0; i < num_steps; i++) {
+                auto result = lstm_cell(input, std::make_tuple(h_state, c_state));
+                h_state = std::get<0>(result);
+                c_state = std::get<1>(result);
             }
-        } else if (c0.dim() == 1) {
-            c0 = c0.unsqueeze(0);
-            if (c0.size(1) != hidden_size && hidden_size > 0) {
-                c0 = c0.slice(1, 0, std::min(c0.size(1), hidden_size));
-                if (c0.size(1) < hidden_size) {
-                    auto padding = torch::zeros({c0.size(0), hidden_size - c0.size(1)}, c0.options());
-                    c0 = torch::cat({c0, padding}, 1);
-                }
-            }
-        }
-        
-        // Make sure batch sizes match
-        if (input.dim() > 0 && h0.dim() > 0 && input.size(0) != h0.size(0)) {
-            int64_t batch_size = std::min(input.size(0), h0.size(0));
-            input = input.slice(0, 0, batch_size);
-            h0 = h0.slice(0, 0, batch_size);
-            c0 = c0.slice(0, 0, batch_size);
-        }
-        
-        // Convert tensors to same dtype if needed
-        auto target_dtype = torch::kFloat;
-        input = input.to(target_dtype);
-        h0 = h0.to(target_dtype);
-        c0 = c0.to(target_dtype);
-        
-        // Apply LSTM cell
-        auto result = lstm_cell(input, std::make_tuple(h0, c0));
-        
-        // Extract outputs
-        auto h1 = std::get<0>(result);
-        auto c1 = std::get<1>(result);
-        
-        // Perform some operations on the results to ensure they're used
-        auto sum_h = torch::sum(h1);
-        auto sum_c = torch::sum(c1);
-        auto total_sum = sum_h + sum_c;
-        
-        // Prevent the compiler from optimizing away the computation
-        if (total_sum.item<float>() == -999999.0f) {
-            throw std::runtime_error("This should never happen");
+            
+            auto final_sum = torch::sum(h_state).item<float>();
+            (void)final_sum;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

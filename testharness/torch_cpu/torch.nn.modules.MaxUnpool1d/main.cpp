@@ -1,74 +1,63 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 4) {
+        // Need enough data for parameters
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Create indices tensor (same shape as input)
-        torch::Tensor indices = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Ensure indices are valid (non-negative integers)
-        indices = indices.abs().to(torch::kInt64);
+        size_t offset = 0;
         
         // Extract parameters for MaxUnpool1d
-        int64_t kernel_size = 0;
-        int64_t stride = 0;
-        int64_t padding = 0;
+        int64_t kernel_size = (Data[offset++] % 5) + 1; // 1-5
+        int64_t stride = (Data[offset++] % 5) + 1; // 1-5
+        int64_t padding = Data[offset++] % 3; // 0-2
         
-        // Parse kernel_size
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&kernel_size, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            kernel_size = std::abs(kernel_size) % 10 + 1; // Ensure positive and reasonable
-        } else {
-            kernel_size = 2; // Default value
-        }
+        // Extract tensor dimensions
+        int64_t batch_size = (Data[offset++] % 4) + 1; // 1-4
+        int64_t channels = (Data[offset++] % 8) + 1; // 1-8
+        int64_t length = (Data[offset++] % 16) + 1; // 1-16
         
-        // Parse stride
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&stride, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            stride = std::abs(stride) % 10 + 1; // Ensure positive and reasonable
-        } else {
-            stride = kernel_size; // Default value
-        }
+        // Determine if we should provide output_size
+        bool use_output_size = Data[offset++] % 2;
         
-        // Parse padding
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            padding = std::abs(padding) % 5; // Ensure non-negative and reasonable
-        } else {
-            padding = 0; // Default value
-        }
+        // Create input tensor with proper shape for MaxUnpool1d: (N, C, L)
+        torch::Tensor input = torch::randn({batch_size, channels, length}, torch::kFloat32);
         
-        // Create output_size vector if there's enough data
-        std::optional<std::vector<int64_t>> output_size = std::nullopt;
-        if (input.dim() > 0 && offset + sizeof(int64_t) <= Size) {
-            int64_t output_length;
-            std::memcpy(&output_length, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            output_length = std::abs(output_length) % 100 + 1; // Ensure positive and reasonable
-            
-            if (input.dim() == 3) {
-                output_size = std::vector<int64_t>{input.size(0), input.size(1), output_length};
-            } else if (input.dim() == 2) {
-                output_size = std::vector<int64_t>{input.size(0), output_length};
+        // Populate input from fuzzer data if available
+        if (offset + input.numel() * sizeof(float) <= Size) {
+            float* input_data = input.data_ptr<float>();
+            for (int64_t i = 0; i < input.numel() && offset + sizeof(float) <= Size; i++) {
+                std::memcpy(&input_data[i], Data + offset, sizeof(float));
+                offset += sizeof(float);
             }
+        }
+        
+        // Create indices tensor with same shape as input
+        // Indices must be in valid range for the unpooled output
+        torch::Tensor indices = torch::zeros({batch_size, channels, length}, torch::kInt64);
+        
+        // Fill indices with valid values (each index should be in [0, kernel_size) offset by position * stride)
+        int64_t* idx_data = indices.data_ptr<int64_t>();
+        for (int64_t i = 0; i < indices.numel(); i++) {
+            int64_t pos = i % length; // position in the length dimension
+            int64_t base_idx = pos * stride;
+            int64_t local_idx = 0;
+            if (offset < Size) {
+                local_idx = Data[offset++] % kernel_size;
+            }
+            idx_data[i] = base_idx + local_idx;
         }
         
         // Create MaxUnpool1d options
@@ -79,19 +68,36 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create MaxUnpool1d module
         torch::nn::MaxUnpool1d unpool(options);
         
-        // Apply MaxUnpool1d operation
-        torch::Tensor output = unpool->forward(input, indices, output_size);
+        // Calculate expected output size
+        int64_t output_length = (length - 1) * stride - 2 * padding + kernel_size;
         
-        // Access output properties to ensure computation is performed
-        auto output_sizes = output.sizes();
-        auto output_dtype = output.dtype();
+        try {
+            torch::Tensor output;
+            
+            if (use_output_size && output_length > 0) {
+                // Optionally provide explicit output_size
+                std::vector<int64_t> out_size = {batch_size, channels, output_length};
+                output = unpool->forward(input, indices, out_size);
+            } else {
+                output = unpool->forward(input, indices);
+            }
+            
+            // Access output to ensure computation
+            volatile auto sum = output.sum().item<float>();
+            (void)sum;
+        }
+        catch (const c10::Error&) {
+            // Shape/index errors are expected with random data
+        }
+        catch (const std::runtime_error&) {
+            // Runtime errors from invalid configurations
+        }
         
-        return 0; // keep the input
+        return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

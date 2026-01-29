@@ -1,85 +1,116 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
         
-        // Need at least 1 byte to determine number of tensors
-        if (Size < 1) {
+        // Need at least 4 bytes for meaningful input
+        if (Size < 4) {
             return 0;
         }
         
-        // Determine number of tensors to concatenate (1-8)
-        uint8_t num_tensors = (Data[offset++] % 8) + 1;
+        // Determine number of tensors to concatenate (2-5)
+        uint8_t num_tensors = (Data[offset++] % 4) + 2;
         
-        // Create a vector to hold our tensors
-        std::vector<torch::Tensor> tensors;
+        // Determine dimension to concatenate along (0-3)
+        int64_t cat_dim = Data[offset++] % 4;
         
-        // Create tensors
-        for (uint8_t i = 0; i < num_tensors && offset < Size; ++i) {
-            try {
-                torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                tensors.push_back(tensor);
-            } catch (const std::exception& e) {
-                // If we can't create a tensor, just continue with what we have
-                break;
-            }
+        // Determine tensor rank (1-4)
+        uint8_t rank = (Data[offset++] % 4) + 1;
+        
+        // Ensure cat_dim is valid for the rank
+        if (cat_dim >= rank) {
+            cat_dim = rank - 1;
         }
         
-        // Need at least one tensor to proceed
-        if (tensors.empty()) {
-            return 0;
+        // Determine base shape from fuzzer data
+        std::vector<int64_t> base_shape;
+        for (uint8_t i = 0; i < rank && offset < Size; ++i) {
+            int64_t dim_size = (Data[offset++] % 8) + 1;  // 1-8 for each dimension
+            base_shape.push_back(dim_size);
         }
         
-        // Determine dimension to concatenate along
-        int64_t dim = 0;
+        // Pad shape if we didn't get enough bytes
+        while (base_shape.size() < rank) {
+            base_shape.push_back(2);
+        }
+        
+        // Determine dtype
+        torch::ScalarType dtype = torch::kFloat32;
         if (offset < Size) {
-            // Get the rank of the first tensor
-            int64_t max_dim = tensors[0].dim() - 1;
-            if (max_dim >= 0) {
-                // Allow negative dimensions for testing edge cases
-                dim = static_cast<int64_t>(Data[offset++]);
-                // Don't clamp the dimension to allow testing out-of-bounds cases
+            uint8_t dtype_selector = Data[offset++] % 4;
+            switch (dtype_selector) {
+                case 0: dtype = torch::kFloat32; break;
+                case 1: dtype = torch::kFloat64; break;
+                case 2: dtype = torch::kInt32; break;
+                case 3: dtype = torch::kInt64; break;
             }
         }
         
-        // Try to concatenate the tensors
-        torch::Tensor result = torch::cat(tensors, dim);
+        // Create tensors with compatible shapes
+        std::vector<torch::Tensor> tensors;
+        for (uint8_t i = 0; i < num_tensors; ++i) {
+            std::vector<int64_t> tensor_shape = base_shape;
+            
+            // Vary only the concatenation dimension
+            if (offset < Size) {
+                tensor_shape[cat_dim] = (Data[offset++] % 8) + 1;
+            } else {
+                tensor_shape[cat_dim] = (i % 4) + 1;
+            }
+            
+            torch::Tensor tensor = torch::rand(tensor_shape, torch::dtype(dtype));
+            tensors.push_back(tensor);
+        }
         
-        // Try some additional operations on the result to increase coverage
-        if (!result.sizes().empty()) {
-            // Try to sum the result
-            torch::Tensor sum = result.sum();
-            
-            // Try to reshape if possible
-            if (result.numel() > 0) {
-                try {
-                    torch::Tensor reshaped = result.reshape({-1});
-                } catch (...) {
-                    // Ignore reshape errors
-                }
-            }
-            
-            // Try slicing if possible
-            if (result.dim() > 0 && result.size(0) > 0) {
-                try {
-                    torch::Tensor sliced = result.slice(0, 0, result.size(0) / 2);
-                } catch (...) {
-                    // Ignore slicing errors
-                }
-            }
+        // Test torch::cat (same as torch::concat)
+        torch::Tensor result = torch::cat(tensors, cat_dim);
+        
+        // Verify result shape
+        int64_t expected_cat_size = 0;
+        for (const auto& t : tensors) {
+            expected_cat_size += t.size(cat_dim);
+        }
+        assert(result.size(cat_dim) == expected_cat_size);
+        
+        // Additional operations to increase coverage
+        torch::Tensor sum = result.sum();
+        
+        // Test with TensorList
+        torch::TensorList tensor_list(tensors);
+        torch::Tensor result2 = torch::cat(tensor_list, cat_dim);
+        
+        // Test negative dimension
+        if (offset < Size && Data[offset] % 2 == 0) {
+            int64_t neg_dim = -(rank - cat_dim);
+            torch::Tensor result_neg = torch::cat(tensors, neg_dim);
+        }
+        
+        // Test with single tensor
+        std::vector<torch::Tensor> single_tensor = {tensors[0]};
+        torch::Tensor result_single = torch::cat(single_tensor, cat_dim);
+        
+        // Test contiguous path
+        if (result.dim() > 0 && result.numel() > 0) {
+            torch::Tensor contiguous = result.contiguous();
+            torch::Tensor reshaped = result.reshape({-1});
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
+    return 0;  // Keep the input
 }

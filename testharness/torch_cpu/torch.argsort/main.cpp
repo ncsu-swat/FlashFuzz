@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,10 +23,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Handle empty or scalar tensors
+        if (input_tensor.dim() == 0) {
+            // Scalar tensor - argsort should still work, returns 0-d tensor
+            torch::Tensor result = torch::argsort(input_tensor);
+            (void)result.item<int64_t>();
+            return 0;
+        }
+        
         // Extract parameters for argsort
-        int64_t dim = 0;
+        int64_t dim = -1;  // Default to last dimension
         bool descending = false;
-        bool stable = false;
         
         // Parse dim parameter if we have more data
         if (offset + sizeof(int64_t) <= Size) {
@@ -29,10 +41,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             std::memcpy(&raw_dim, Data + offset, sizeof(int64_t));
             offset += sizeof(int64_t);
             
-            // If tensor is not empty, modulo by number of dimensions to get valid dim
-            if (input_tensor.dim() > 0) {
-                dim = ((raw_dim % input_tensor.dim()) + input_tensor.dim()) % input_tensor.dim();
-            }
+            // Modulo by number of dimensions to get valid dim
+            // Handle both positive and negative indexing
+            dim = raw_dim % input_tensor.dim();
         }
         
         // Parse descending parameter if we have more data
@@ -40,43 +51,49 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             descending = Data[offset++] & 0x1;
         }
         
-        // Parse stable parameter if we have more data
+        // Determine which variant to use based on remaining data
+        int variant = 0;
         if (offset < Size) {
-            stable = Data[offset++] & 0x1;
+            variant = Data[offset++] % 3;
         }
         
-        // Apply argsort operation
         torch::Tensor result;
         
-        // Try different variants of argsort
-        if (offset % 3 == 0) {
-            // Variant 1: argsort with dim, descending, stable
-            result = torch::argsort(input_tensor, dim, descending, stable);
-        } 
-        else if (offset % 3 == 1) {
-            // Variant 2: argsort with dim, descending
+        if (variant == 0) {
+            // Variant 1: argsort with dim and descending
             result = torch::argsort(input_tensor, dim, descending);
-        }
-        else {
-            // Variant 3: argsort with dim only
+        } 
+        else if (variant == 1) {
+            // Variant 2: argsort with dim only (descending=false by default)
             result = torch::argsort(input_tensor, dim);
         }
-        
-        // Verify result is not empty
-        if (result.numel() != input_tensor.numel()) {
-            throw std::runtime_error("Result tensor has different number of elements than input tensor");
+        else {
+            // Variant 3: argsort with default parameters (dim=-1, descending=false)
+            result = torch::argsort(input_tensor);
         }
         
-        // Try to use the result to ensure it's not optimized away
-        auto sum = result.sum().item<double>();
-        if (std::isnan(sum) || std::isinf(sum)) {
-            throw std::runtime_error("Result contains NaN or Inf values");
+        // Verify result shape matches input shape
+        if (result.sizes() != input_tensor.sizes()) {
+            std::cerr << "Result shape mismatch" << std::endl;
+            return -1;
+        }
+        
+        // Verify result dtype is integer (indices)
+        if (result.dtype() != torch::kLong) {
+            std::cerr << "Result dtype is not Long" << std::endl;
+            return -1;
+        }
+        
+        // Access result to ensure computation happens
+        if (result.numel() > 0) {
+            volatile auto val = result.sum().item<int64_t>();
+            (void)val;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For isnan, isinf
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,19 +23,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor y
         torch::Tensor y = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create optional x tensor if we have enough data left
-        torch::Tensor x;
-        bool has_x = false;
-        if (offset + 4 < Size) {
-            x = fuzzer_utils::createTensor(Data, Size, offset);
-            has_x = true;
+        // Need at least 1D tensor for trapezoid
+        if (y.dim() == 0) {
+            return 0;
         }
         
         // Get dim parameter if we have data left
         int64_t dim = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + sizeof(int8_t) <= Size) {
+            int8_t dim_byte = static_cast<int8_t>(Data[offset]);
+            offset += sizeof(int8_t);
+            // Clamp dim to valid range for the tensor
+            dim = dim_byte % y.dim();
+            if (dim < 0) {
+                dim += y.dim();
+            }
         }
         
         // Get dx parameter if we have data left
@@ -38,30 +45,70 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&dx, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize dx to avoid NaN/Inf issues
+            if (std::isnan(dx) || std::isinf(dx) || dx == 0.0) {
+                dx = 1.0;
+            }
         }
         
-        // Try different variants of trapezoid
-        if (has_x) {
-            // Variant 1: trapezoid with x and y tensors
-            torch::Tensor result1 = torch::trapezoid(y, x, dim);
-            
-            // Variant 2: trapezoid with x, y, and dim
-            torch::Tensor result2 = torch::trapezoid(y, x);
-        } else {
-            // Variant 3: trapezoid with y and dx
-            torch::Tensor result3 = torch::trapezoid(y, dx, dim);
-            
-            // Variant 4: trapezoid with y and dx (no dim)
-            torch::Tensor result4 = torch::trapezoid(y, dx);
-            
-            // Variant 5: trapezoid with just y
-            torch::Tensor result5 = torch::trapezoid(y);
+        // Determine which variant to use based on remaining data
+        uint8_t variant = 0;
+        if (offset < Size) {
+            variant = Data[offset] % 5;
+            offset++;
+        }
+        
+        try {
+            switch (variant) {
+                case 0: {
+                    // Variant: trapezoid with just y
+                    torch::Tensor result = torch::trapezoid(y);
+                    break;
+                }
+                case 1: {
+                    // Variant: trapezoid with y and dim
+                    torch::Tensor result = torch::trapezoid(y, dim);
+                    break;
+                }
+                case 2: {
+                    // Variant: trapezoid with y and dx
+                    torch::Tensor result = torch::trapezoid(y, dx);
+                    break;
+                }
+                case 3: {
+                    // Variant: trapezoid with y, dx, and dim
+                    torch::Tensor result = torch::trapezoid(y, dx, dim);
+                    break;
+                }
+                case 4: {
+                    // Variant: trapezoid with x tensor
+                    // x should have same size as y along the integration dim
+                    if (offset + 4 < Size) {
+                        // Create x tensor with same shape as y
+                        torch::Tensor x = fuzzer_utils::createTensor(Data, Size, offset);
+                        
+                        // x must be 1D with size matching y.size(dim)
+                        // or have same shape as y
+                        if (x.numel() > 0) {
+                            // Reshape x to be 1D matching y's size along dim
+                            int64_t dim_size = y.size(dim);
+                            if (x.numel() >= dim_size && dim_size > 0) {
+                                x = x.flatten().slice(0, 0, dim_size);
+                                torch::Tensor result = torch::trapezoid(y, x, dim);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        } catch (const std::exception &e) {
+            // Inner catch for expected shape/type mismatches - silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

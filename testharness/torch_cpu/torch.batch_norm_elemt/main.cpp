@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstdint>        // For uint64_t
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,87 +24,109 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create weight, bias, mean, and var tensors
-        // These should have the same size as the number of channels (dim 1) in the input
-        int64_t num_channels = 1;
-        if (input.dim() > 1) {
-            num_channels = input.size(1);
+        // batch_norm_elemt expects input with at least 2 dimensions (N, C, ...)
+        // If input has fewer dimensions, reshape or skip
+        if (input.dim() < 2) {
+            // Reshape to at least 2D: treat as (1, C) where C is the total size
+            int64_t total_size = input.numel();
+            if (total_size == 0) {
+                return 0;
+            }
+            input = input.reshape({1, total_size});
         }
         
-        // Create weight tensor
+        // Get number of channels from dimension 1
+        int64_t num_channels = input.size(1);
+        if (num_channels == 0) {
+            return 0;
+        }
+        
+        // Get the dtype of the input tensor to ensure consistency
+        auto dtype = input.dtype();
+        
+        // Create weight tensor (1D with size = num_channels)
         torch::Tensor weight;
         if (offset < Size) {
             weight = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure weight has correct shape (should be 1D with size = num_channels)
-            if (weight.dim() != 1 || weight.size(0) != num_channels) {
-                weight = torch::ones({num_channels});
+            // Flatten and resize to match num_channels
+            weight = weight.flatten();
+            if (weight.numel() >= num_channels) {
+                weight = weight.slice(0, 0, num_channels).to(dtype);
+            } else {
+                weight = torch::ones({num_channels}, dtype);
             }
         } else {
-            weight = torch::ones({num_channels});
+            weight = torch::ones({num_channels}, dtype);
         }
         
-        // Create bias tensor
+        // Create bias tensor (1D with size = num_channels)
         torch::Tensor bias;
         if (offset < Size) {
             bias = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure bias has correct shape
-            if (bias.dim() != 1 || bias.size(0) != num_channels) {
-                bias = torch::zeros({num_channels});
+            bias = bias.flatten();
+            if (bias.numel() >= num_channels) {
+                bias = bias.slice(0, 0, num_channels).to(dtype);
+            } else {
+                bias = torch::zeros({num_channels}, dtype);
             }
         } else {
-            bias = torch::zeros({num_channels});
+            bias = torch::zeros({num_channels}, dtype);
         }
         
-        // Create mean tensor
+        // Create mean tensor (1D with size = num_channels)
         torch::Tensor mean;
         if (offset < Size) {
             mean = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure mean has correct shape
-            if (mean.dim() != 1 || mean.size(0) != num_channels) {
-                mean = torch::zeros({num_channels});
+            mean = mean.flatten();
+            if (mean.numel() >= num_channels) {
+                mean = mean.slice(0, 0, num_channels).to(dtype);
+            } else {
+                mean = torch::zeros({num_channels}, dtype);
             }
         } else {
-            mean = torch::zeros({num_channels});
+            mean = torch::zeros({num_channels}, dtype);
         }
         
-        // Create var tensor
-        torch::Tensor var;
+        // Create invstd tensor (inverse standard deviation, 1D with size = num_channels)
+        // Note: batch_norm_elemt uses invstd (inverse std), not variance
+        torch::Tensor invstd;
         if (offset < Size) {
-            var = fuzzer_utils::createTensor(Data, Size, offset);
-            // Ensure var has correct shape
-            if (var.dim() != 1 || var.size(0) != num_channels) {
-                var = torch::ones({num_channels});
+            invstd = fuzzer_utils::createTensor(Data, Size, offset);
+            invstd = invstd.flatten();
+            if (invstd.numel() >= num_channels) {
+                invstd = invstd.slice(0, 0, num_channels).to(dtype);
+            } else {
+                invstd = torch::ones({num_channels}, dtype);
             }
-            // Ensure var is positive (required for batch_norm)
-            var = torch::abs(var) + 1e-5;
+            // Ensure invstd is positive (it's inverse std dev)
+            invstd = torch::abs(invstd) + 1e-5f;
         } else {
-            var = torch::ones({num_channels});
+            invstd = torch::ones({num_channels}, dtype);
         }
         
         // Get epsilon value from the input data
-        float eps = 1e-5;
+        float eps = 1e-5f;
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&eps, Data + offset, sizeof(float));
             offset += sizeof(float);
-            // Ensure epsilon is positive and not too large
+            // Ensure epsilon is positive and reasonable
             eps = std::abs(eps);
             if (eps > 1.0f) eps = 1.0f;
             if (eps < 1e-10f) eps = 1e-10f;
         }
         
         // Apply batch_norm_elemt
-        torch::Tensor output = torch::batch_norm_elemt(input, weight, bias, mean, var, eps);
+        // Signature: batch_norm_elemt(input, weight, bias, mean, invstd, eps)
+        torch::Tensor output = torch::batch_norm_elemt(input, weight, bias, mean, invstd, eps);
         
-        // Try to access the output to ensure computation is not optimized away
-        float sum = output.sum().item<float>();
-        if (std::isnan(sum) || std::isinf(sum)) {
-            return 0;
-        }
+        // Access the output to ensure computation is not optimized away
+        volatile float sum = output.sum().item<float>();
+        (void)sum;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -8,7 +8,13 @@
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -33,10 +39,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (element_size > 0 && storage_bytes >= element_size) {
             int64_t view_elems = static_cast<int64_t>(
                 std::min<size_t>(storage_bytes / element_size, 64));
-            torch::Tensor storage_view =
-                torch::from_blob(storage.mutable_data(), {view_elems}, tensor.options());
-            volatile double acc = storage_view.flatten().sum().item<double>();
-            (void)acc;
+            try {
+                torch::Tensor storage_view =
+                    torch::from_blob(storage.mutable_data(), {view_elems}, tensor.options());
+                volatile double acc = storage_view.flatten().sum().item<double>();
+                (void)acc;
+            } catch (...) {
+                // from_blob may fail for certain dtype/shape combinations
+            }
         }
 
         torch::Tensor tensor_copy = tensor.clone();
@@ -46,13 +56,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 
         // Replace the storage buffer with a fresh allocation to exercise set_data_ptr.
         if (storage_bytes > 0) {
-            c10::Allocator *allocator = c10::GetAllocator(device.type());
-            size_t swap_bytes = std::min<size_t>(storage_bytes, 512);
-            at::DataPtr new_ptr = allocator->allocate(swap_bytes);
-            if (new_ptr) {
-                std::memset(new_ptr.get(), 0xAB, swap_bytes);
-                storage.set_data_ptr(std::move(new_ptr));
-                storage.set_nbytes(swap_bytes);
+            try {
+                c10::Allocator *allocator = c10::GetAllocator(device.type());
+                size_t swap_bytes = std::min<size_t>(storage_bytes, 512);
+                at::DataPtr new_ptr = allocator->allocate(swap_bytes);
+                if (new_ptr) {
+                    std::memset(new_ptr.get(), 0xAB, swap_bytes);
+                    storage.set_data_ptr(std::move(new_ptr));
+                    storage.set_nbytes(swap_bytes);
+                }
+            } catch (...) {
+                // Allocator operations may fail for certain device types
             }
         }
 
@@ -74,20 +88,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 
             size_t fresh_elems = element_size > 0 ? std::max<size_t>(1, new_bytes / element_size) : 1;
             fresh_elems = std::min<size_t>(fresh_elems, 32);
-            torch::Tensor fresh_view = torch::from_blob(
-                fresh_storage.mutable_data(),
-                {static_cast<int64_t>(fresh_elems)},
-                tensor.options().device(torch::kCPU));
-            volatile double check = fresh_view.flatten().sum().item<double>();
-            (void)check;
+            try {
+                torch::Tensor fresh_view = torch::from_blob(
+                    fresh_storage.mutable_data(),
+                    {static_cast<int64_t>(fresh_elems)},
+                    tensor.options().device(torch::kCPU));
+                volatile double check = fresh_view.flatten().sum().item<double>();
+                (void)check;
+            } catch (...) {
+                // from_blob may fail for certain configurations
+            }
         }
 
         #ifdef USE_CUDA
         if (torch::cuda::is_available()) {
-            torch::Tensor cuda_tensor = tensor.to(torch::kCUDA, /*non_blocking=*/false, /*copy=*/true);
-            c10::Storage cuda_storage = cuda_tensor.storage();
-            volatile auto cuda_device = cuda_storage.device();
-            (void)cuda_device;
+            try {
+                torch::Tensor cuda_tensor = tensor.to(torch::kCUDA, /*non_blocking=*/false, /*copy=*/true);
+                c10::Storage cuda_storage = cuda_tensor.storage();
+                volatile auto cuda_device = cuda_storage.device();
+                (void)cuda_device;
+            } catch (...) {
+                // CUDA operations may fail
+            }
         }
         #endif
     }

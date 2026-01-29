@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -21,36 +25,75 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply torch.special.exp2 operation
         torch::Tensor result = torch::special::exp2(input);
         
-        // Try to access the result to ensure computation is performed
+        // Access the result to ensure computation is performed
         if (result.defined() && result.numel() > 0) {
-            result.item();
+            volatile float sum = result.sum().item<float>();
+            (void)sum;
         }
         
-        // Try some edge cases if we have more data
-        if (offset + 1 < Size) {
-            // Create another tensor with potentially different properties
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
+        // Test with out parameter version
+        try {
+            torch::Tensor output = torch::empty_like(input.to(torch::kFloat));
+            torch::Tensor float_input = input.to(torch::kFloat);
+            torch::special::exp2_out(output, float_input);
             
-            // Test inplace version if available
-            torch::Tensor input2_copy = input2.clone();
-            torch::special::exp2_out(input2_copy, input2);
-            
-            // Test with different output types
-            if (input.is_floating_point()) {
-                // Test with double precision output
-                torch::Tensor double_result = torch::special::exp2(input.to(torch::kDouble));
+            if (output.defined() && output.numel() > 0) {
+                volatile float sum = output.sum().item<float>();
+                (void)sum;
+            }
+        } catch (...) {
+            // Silently ignore expected failures (shape/type mismatches)
+        }
+        
+        // Test with different dtypes
+        if (offset < Size) {
+            try {
+                // Test with double precision
+                torch::Tensor double_input = input.to(torch::kDouble);
+                torch::Tensor double_result = torch::special::exp2(double_input);
                 
-                // Test with half precision output if supported
-                if (torch::cuda::is_available()) {
-                    torch::Tensor half_result = torch::special::exp2(input.to(torch::kHalf));
+                if (double_result.defined() && double_result.numel() > 0) {
+                    volatile double sum = double_result.sum().item<double>();
+                    (void)sum;
                 }
+            } catch (...) {
+                // Silently ignore dtype conversion failures
+            }
+            
+            try {
+                // Test with float32
+                torch::Tensor float_input = input.to(torch::kFloat);
+                torch::Tensor float_result = torch::special::exp2(float_input);
+                
+                if (float_result.defined() && float_result.numel() > 0) {
+                    volatile float sum = float_result.sum().item<float>();
+                    (void)sum;
+                }
+            } catch (...) {
+                // Silently ignore dtype conversion failures
+            }
+        }
+        
+        // Create another tensor with remaining data for additional testing
+        if (offset + 2 < Size) {
+            try {
+                size_t new_offset = 0;
+                torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, new_offset);
+                torch::Tensor result2 = torch::special::exp2(input2);
+                
+                if (result2.defined() && result2.numel() > 0) {
+                    volatile float sum = result2.sum().item<float>();
+                    (void)sum;
+                }
+            } catch (...) {
+                // Silently ignore failures from second tensor
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

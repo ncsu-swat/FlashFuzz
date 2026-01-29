@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstdint>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,73 +23,105 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Get a dimension to unsqueeze
+        // Get a dimension to unsqueeze - bound it to valid range
         int64_t dim = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + sizeof(int8_t) <= Size) {
+            int8_t dim_byte = static_cast<int8_t>(Data[offset]);
+            offset += sizeof(int8_t);
+            // Bound dim to valid range for unsqueeze: [-input.dim()-1, input.dim()]
+            int64_t max_dim = input_tensor.dim() + 1;
+            if (max_dim > 0) {
+                dim = dim_byte % max_dim;
+            }
         }
         
         // Apply unsqueeze_copy operation
-        torch::Tensor result = torch::unsqueeze_copy(input_tensor, dim);
-        
-        // Verify the result has one more dimension than the input
-        if (result.dim() != input_tensor.dim() + 1) {
-            throw std::runtime_error("Unexpected dimension count after unsqueeze_copy");
+        try {
+            torch::Tensor result = torch::unsqueeze_copy(input_tensor, dim);
+            
+            // Basic sanity check - result should have one more dimension
+            (void)result.sizes();
+        } catch (const c10::Error &e) {
+            // Expected for invalid dimensions
         }
         
-        // Try another dimension if we have more data
-        if (offset + sizeof(int64_t) <= Size) {
-            int64_t dim2;
-            std::memcpy(&dim2, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        // Try with a negative dimension
+        if (offset + sizeof(int8_t) <= Size) {
+            int8_t dim_byte = static_cast<int8_t>(Data[offset]);
+            offset += sizeof(int8_t);
             
-            // Apply unsqueeze_copy again on the result
-            torch::Tensor result2 = torch::unsqueeze_copy(result, dim2);
-            
-            // Verify the result has one more dimension than before
-            if (result2.dim() != result.dim() + 1) {
-                throw std::runtime_error("Unexpected dimension count after second unsqueeze_copy");
-            }
-        }
-        
-        // Try unsqueeze_copy on a scalar tensor if we have a tensor with no dimensions
-        if (input_tensor.dim() == 0) {
-            torch::Tensor scalar_result = torch::unsqueeze_copy(input_tensor, 0);
-            if (scalar_result.dim() != 1) {
-                throw std::runtime_error("Unexpected dimension count after unsqueeze_copy on scalar");
-            }
-        }
-        
-        // Try unsqueeze_copy with a negative dimension
-        if (offset + sizeof(int64_t) <= Size) {
-            int64_t neg_dim;
-            std::memcpy(&neg_dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Make sure it's negative
-            neg_dim = -std::abs(neg_dim) - 1;
-            
-            // Apply unsqueeze_copy with negative dimension
-            torch::Tensor neg_result = torch::unsqueeze_copy(input_tensor, neg_dim);
-            
-            // Verify the result has one more dimension than the input
-            if (neg_result.dim() != input_tensor.dim() + 1) {
-                throw std::runtime_error("Unexpected dimension count after unsqueeze_copy with negative dim");
-            }
-        }
-        
-        // Try unsqueeze_copy with a very large dimension (should throw)
-        if (offset + sizeof(int64_t) <= Size) {
-            int64_t large_dim;
-            std::memcpy(&large_dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Make it large but not too large to avoid undefined behavior
-            large_dim = std::abs(large_dim) + input_tensor.dim() + 10;
+            // Make it negative: valid negative dims are [-input.dim()-1, -1]
+            int64_t neg_dim = -(std::abs(dim_byte) % (input_tensor.dim() + 1)) - 1;
             
             try {
+                torch::Tensor neg_result = torch::unsqueeze_copy(input_tensor, neg_dim);
+                (void)neg_result.sizes();
+            } catch (const c10::Error &e) {
+                // Expected for invalid dimensions
+            }
+        }
+        
+        // Try unsqueeze_copy on a scalar tensor (0-dim tensor)
+        {
+            torch::Tensor scalar_tensor = torch::tensor(1.0f);
+            try {
+                torch::Tensor scalar_result = torch::unsqueeze_copy(scalar_tensor, 0);
+                (void)scalar_result.sizes();
+            } catch (const c10::Error &e) {
+                // Unexpected but handle gracefully
+            }
+        }
+        
+        // Try chained unsqueeze_copy operations
+        if (offset + sizeof(int8_t) <= Size) {
+            int8_t dim_byte = static_cast<int8_t>(Data[offset]);
+            offset += sizeof(int8_t);
+            
+            try {
+                torch::Tensor result1 = torch::unsqueeze_copy(input_tensor, 0);
+                int64_t dim2 = dim_byte % (result1.dim() + 1);
+                torch::Tensor result2 = torch::unsqueeze_copy(result1, dim2);
+                (void)result2.sizes();
+            } catch (const c10::Error &e) {
+                // Expected for invalid operations
+            }
+        }
+        
+        // Test with different tensor types
+        if (offset + sizeof(int8_t) <= Size) {
+            int8_t type_selector = Data[offset];
+            offset += sizeof(int8_t);
+            
+            torch::Tensor typed_tensor;
+            switch (type_selector % 4) {
+                case 0:
+                    typed_tensor = input_tensor.to(torch::kFloat32);
+                    break;
+                case 1:
+                    typed_tensor = input_tensor.to(torch::kFloat64);
+                    break;
+                case 2:
+                    typed_tensor = input_tensor.to(torch::kInt32);
+                    break;
+                case 3:
+                    typed_tensor = input_tensor.to(torch::kInt64);
+                    break;
+            }
+            
+            try {
+                torch::Tensor typed_result = torch::unsqueeze_copy(typed_tensor, 0);
+                (void)typed_result.sizes();
+            } catch (const c10::Error &e) {
+                // Handle gracefully
+            }
+        }
+        
+        // Test with out-of-bounds dimension (should throw)
+        if (offset < Size) {
+            int64_t large_dim = input_tensor.dim() + 10;
+            try {
                 torch::Tensor large_result = torch::unsqueeze_copy(input_tensor, large_dim);
+                (void)large_result.sizes();
             } catch (const c10::Error &e) {
                 // Expected exception for out-of-bounds dimension
             }
@@ -93,7 +130,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

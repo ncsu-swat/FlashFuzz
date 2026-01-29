@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstring>        // For memcpy
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -32,6 +38,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&value, Data + offset, sizeof(float));
             offset += sizeof(float);
+            // Sanitize NaN/Inf values
+            if (std::isnan(value) || std::isinf(value)) {
+                value = 1.0f;
+            }
         }
 
         // Try different variants of addcdiv
@@ -88,12 +98,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 
         // Test with empty tensors
         try {
-            torch::Tensor empty_tensor = torch::empty({0}, input.options());
             if (input.dim() > 0) {
                 std::vector<int64_t> empty_shape = input.sizes().vec();
                 empty_shape[0] = 0;
                 torch::Tensor shaped_empty = torch::empty(empty_shape, input.options());
-                torch::Tensor result_empty = torch::addcdiv(shaped_empty, tensor1, tensor2, value);
+                torch::Tensor t1_empty = torch::empty(empty_shape, tensor1.options());
+                torch::Tensor t2_empty = torch::empty(empty_shape, tensor2.options());
+                torch::Tensor result_empty = torch::addcdiv(shaped_empty, t1_empty, t2_empty, value);
             }
         } catch (const std::exception&) {
             // Catch and continue
@@ -115,7 +126,24 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor zero_tensor = torch::zeros_like(tensor2);
             torch::Tensor div_by_zero = torch::addcdiv(input, tensor1, zero_tensor, value);
         } catch (const std::exception&) {
-            // Expected to throw
+            // Expected to throw or produce inf
+        }
+
+        // Test with negative value
+        try {
+            torch::Tensor result_neg = torch::addcdiv(input, tensor1, tensor2, -value);
+        } catch (const std::exception&) {
+            // Catch and continue
+        }
+
+        // Test with different dtypes
+        try {
+            torch::Tensor input_double = input.to(torch::kFloat64);
+            torch::Tensor t1_double = tensor1.to(torch::kFloat64);
+            torch::Tensor t2_double = tensor2.to(torch::kFloat64);
+            torch::Tensor result_double = torch::addcdiv(input_double, t1_double, t2_double, static_cast<double>(value));
+        } catch (const std::exception&) {
+            // Catch and continue
         }
     }
     catch (const std::exception &e)

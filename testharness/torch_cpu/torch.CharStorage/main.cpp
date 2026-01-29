@@ -7,7 +7,13 @@
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -65,6 +71,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (fill_tensor.numel() > 0) {
             volatile int8_t acc = fill_tensor[0].item<int8_t>();
             acc += static_cast<int8_t>(storage.nbytes() & 0x7F);
+            (void)acc;
         }
     }
     catch (const std::exception &e)

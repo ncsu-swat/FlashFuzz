@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,9 +22,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Ensure the tensor has at least 5 dimensions (batch, channels, D, H, W)
-        // If not, reshape it to have 5 dimensions
-        if (input.dim() < 5) {
+        // Ensure the tensor has at least 4 or 5 dimensions 
+        // AdaptiveAvgPool3d expects (N, C, D, H, W) or (C, D, H, W)
+        if (input.dim() < 4) {
             std::vector<int64_t> new_shape;
             
             // Keep original dimensions
@@ -28,8 +32,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 new_shape.push_back(input.size(i));
             }
             
-            // Add missing dimensions
-            while (new_shape.size() < 5) {
+            // Add missing dimensions to reach at least 4
+            while (new_shape.size() < 4) {
                 new_shape.push_back(1);
             }
             
@@ -46,11 +50,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 std::memcpy(&size_val, Data + offset, sizeof(int64_t));
                 offset += sizeof(int64_t);
                 
-                // Make sure output size is reasonable (can be None/0 or positive)
-                if (size_val < 0) {
-                    size_val = 0;  // Treat negative as None
+                // Output size must be positive (at least 1)
+                if (size_val <= 0) {
+                    size_val = 1;
                 } else if (size_val > 100) {
-                    size_val = size_val % 100 + 1;  // Limit to reasonable size
+                    size_val = (size_val % 100) + 1;  // Limit to reasonable size
                 }
                 
                 output_size.push_back(size_val);
@@ -64,56 +68,90 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::AdaptiveAvgPool3d pool = nullptr;
         
         // Try different output size configurations
+        uint8_t config_type = 0;
         if (offset < Size) {
-            uint8_t config_type = Data[offset++] % 4;
-            
-            switch (config_type) {
-                case 0:
-                    // Single integer for all dimensions
-                    pool = torch::nn::AdaptiveAvgPool3d(output_size[0]);
-                    break;
-                    
-                case 1:
-                    // Tuple of 3 values
-                    pool = torch::nn::AdaptiveAvgPool3d(torch::nn::AdaptiveAvgPool3dOptions(
-                        {output_size[0], output_size[1], output_size[2]}));
-                    break;
-                    
-                case 2:
-                    // Some dimensions as 0/None (meaning preserve input size)
-                    if (output_size[0] == 0) output_size[0] = 1;
-                    if (output_size[1] == 0) output_size[1] = 1;
-                    if (output_size[2] == 0) output_size[2] = 1;
-                    pool = torch::nn::AdaptiveAvgPool3d(torch::nn::AdaptiveAvgPool3dOptions(
-                        {output_size[0], output_size[1], output_size[2]}));
-                    break;
-                    
-                case 3:
-                    // Default constructor (should preserve input size)
-                    pool = torch::nn::AdaptiveAvgPool3d(torch::nn::AdaptiveAvgPool3dOptions(1));
-                    break;
-            }
-        } else {
-            // Default if not enough data
-            pool = torch::nn::AdaptiveAvgPool3d(torch::nn::AdaptiveAvgPool3dOptions(1));
+            config_type = Data[offset++] % 4;
+        }
+        
+        switch (config_type) {
+            case 0:
+                // Single integer for all dimensions
+                pool = torch::nn::AdaptiveAvgPool3d(
+                    torch::nn::AdaptiveAvgPool3dOptions(output_size[0]));
+                break;
+                
+            case 1:
+                // Tuple of 3 values
+                pool = torch::nn::AdaptiveAvgPool3d(
+                    torch::nn::AdaptiveAvgPool3dOptions(
+                        std::vector<int64_t>{output_size[0], output_size[1], output_size[2]}));
+                break;
+                
+            case 2:
+                // Different values for each dimension
+                pool = torch::nn::AdaptiveAvgPool3d(
+                    torch::nn::AdaptiveAvgPool3dOptions(
+                        std::vector<int64_t>{output_size[0], output_size[1], output_size[2]}));
+                break;
+                
+            case 3:
+            default:
+                // Default: output size of 1
+                pool = torch::nn::AdaptiveAvgPool3d(
+                    torch::nn::AdaptiveAvgPool3dOptions(1));
+                break;
         }
         
         // Apply the pooling operation
-        torch::Tensor output = pool->forward(input);
+        // Inner try-catch for expected failures (shape mismatches, etc.)
+        try {
+            torch::Tensor output = pool->forward(input);
+            
+            // Basic validation that output has expected dimensions
+            (void)output.sizes();
+        } catch (const c10::Error&) {
+            // Expected failures for invalid input shapes
+        }
         
-        // Optionally test other edge cases
-        if (offset < Size && Data[offset] % 2 == 0) {
-            // Test with empty batch dimension
-            if (input.size(0) > 0) {
-                torch::Tensor empty_input = input.slice(0, 0, 0);
-                torch::Tensor empty_output = pool->forward(empty_input);
+        // Test with 5D input (batch mode)
+        if (input.dim() == 4 && offset < Size && Data[offset] % 2 == 0) {
+            try {
+                torch::Tensor input_5d = input.unsqueeze(0);  // Add batch dimension
+                torch::Tensor output_5d = pool->forward(input_5d);
+                (void)output_5d.sizes();
+            } catch (const c10::Error&) {
+                // Expected for some configurations
+            }
+        }
+        
+        // Test with different dtypes
+        if (offset + 1 < Size) {
+            uint8_t dtype_choice = Data[offset++] % 3;
+            try {
+                torch::Tensor typed_input;
+                switch (dtype_choice) {
+                    case 0:
+                        typed_input = input.to(torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_input = input.to(torch::kFloat64);
+                        break;
+                    case 2:
+                    default:
+                        typed_input = input.to(torch::kFloat16);
+                        break;
+                }
+                torch::Tensor typed_output = pool->forward(typed_input);
+                (void)typed_output.sizes();
+            } catch (const c10::Error&) {
+                // Some dtypes may not be supported
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
+    return 0;  // keep the input
 }

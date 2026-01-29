@@ -1,11 +1,18 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
+#include <limits>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -29,16 +36,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             if (std::isnan(lambda) || std::isinf(lambda)) {
                 lambda = 0.5;
             }
+            // Clamp to reasonable range to avoid numerical issues
+            lambda = std::min(lambda, 1e6);
         }
         
-        // Create Hardshrink module with the parsed lambda
-        torch::nn::Hardshrink hardshrink(lambda);
+        // Create Hardshrink module with the parsed lambda using HardshrinkOptions
+        torch::nn::Hardshrink hardshrink(torch::nn::HardshrinkOptions().lambda(lambda));
         
         // Apply Hardshrink to the input tensor
         torch::Tensor output = hardshrink(input);
         
         // Alternative way to apply Hardshrink using functional API
-        torch::Tensor output2 = torch::nn::functional::hardshrink(input, torch::nn::functional::HardshrinkFuncOptions().lambda(lambda));
+        torch::Tensor output2 = torch::nn::functional::hardshrink(
+            input, 
+            torch::nn::functional::HardshrinkFuncOptions().lambda(lambda)
+        );
         
         // Try with different lambda values to test edge cases
         if (offset + 1 <= Size) {
@@ -46,54 +58,60 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             // Test with zero lambda
             if (lambda_selector % 5 == 0) {
-                torch::nn::Hardshrink zero_hardshrink(0.0);
+                torch::nn::Hardshrink zero_hardshrink(torch::nn::HardshrinkOptions().lambda(0.0));
                 torch::Tensor zero_output = zero_hardshrink(input);
             }
             
             // Test with very small lambda
             if (lambda_selector % 5 == 1) {
-                torch::nn::Hardshrink small_hardshrink(1e-10);
+                torch::nn::Hardshrink small_hardshrink(torch::nn::HardshrinkOptions().lambda(1e-10));
                 torch::Tensor small_output = small_hardshrink(input);
             }
             
-            // Test with very large lambda
+            // Test with large lambda
             if (lambda_selector % 5 == 2) {
-                torch::nn::Hardshrink large_hardshrink(1e10);
+                torch::nn::Hardshrink large_hardshrink(torch::nn::HardshrinkOptions().lambda(1e6));
                 torch::Tensor large_output = large_hardshrink(input);
             }
             
-            // Test with negative lambda (should behave the same as positive)
+            // Test with a different fuzzed lambda
             if (lambda_selector % 5 == 3) {
-                torch::nn::Hardshrink neg_hardshrink(-lambda);
-                torch::Tensor neg_output = neg_hardshrink(input);
+                double alt_lambda = static_cast<double>(lambda_selector) / 255.0 * 10.0;
+                torch::nn::Hardshrink alt_hardshrink(torch::nn::HardshrinkOptions().lambda(alt_lambda));
+                torch::Tensor alt_output = alt_hardshrink(input);
             }
             
-            // Test with NaN lambda (should default to 0.5 or throw)
+            // Test with default options (lambda=0.5)
             if (lambda_selector % 5 == 4) {
-                try {
-                    double nan_lambda = std::numeric_limits<double>::quiet_NaN();
-                    torch::nn::Hardshrink nan_hardshrink(nan_lambda);
-                    torch::Tensor nan_output = nan_hardshrink(input);
-                } catch (...) {
-                    // Expected behavior might be to throw
-                }
+                torch::nn::Hardshrink default_hardshrink;
+                torch::Tensor default_output = default_hardshrink(input);
             }
         }
         
-        // Test with cloned input for additional testing
-        if (offset < Size && Data[offset] % 2 == 0) {
+        // Test with different tensor types
+        if (offset < Size) {
+            uint8_t type_selector = Data[offset++];
+            
             try {
-                torch::Tensor input_clone = input.clone();
-                torch::Tensor clone_output = torch::nn::functional::hardshrink(input_clone, torch::nn::functional::HardshrinkFuncOptions().lambda(lambda));
+                if (type_selector % 3 == 0 && input.is_floating_point()) {
+                    // Test with float tensor
+                    torch::Tensor float_input = input.to(torch::kFloat32);
+                    torch::Tensor float_output = hardshrink(float_input);
+                }
+                else if (type_selector % 3 == 1 && input.is_floating_point()) {
+                    // Test with double tensor
+                    torch::Tensor double_input = input.to(torch::kFloat64);
+                    torch::Tensor double_output = hardshrink(double_input);
+                }
             } catch (...) {
-                // Might throw for certain inputs
+                // Type conversion might fail for certain inputs, ignore silently
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

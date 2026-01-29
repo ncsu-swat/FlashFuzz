@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <torch/torch.h>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,10 +22,15 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::ModuleDict moduleDict;
         
         // Determine number of modules to add (1-10)
-        uint8_t numModules = (Size > 0) ? (Data[offset] % 10) + 1 : 1;
+        uint8_t numModules = (Data[offset] % 10) + 1;
         offset++;
         
-        // Add modules to the ModuleDict
+        // Track which module_0 type was created for later forward pass
+        int module0Type = -1;
+        int64_t module0InFeatures = 0;
+        int64_t module0InChannels = 0;
+        
+        // Add modules to the ModuleDict using update with initializer list
         for (uint8_t i = 0; i < numModules && offset < Size; i++) {
             // Create a key for the module
             std::string key = "module_" + std::to_string(i);
@@ -38,7 +47,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     offset++;
                     int64_t outFeatures = (offset < Size) ? (Data[offset] % 100) + 1 : 5;
                     offset++;
-                    moduleDict[key] = torch::nn::Linear(inFeatures, outFeatures);
+                    moduleDict->update({{key, torch::nn::Linear(inFeatures, outFeatures)}});
+                    if (i == 0) {
+                        module0Type = 0;
+                        module0InFeatures = inFeatures;
+                    }
                     break;
                 }
                 case 1: {
@@ -47,33 +60,46 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     offset++;
                     int64_t outChannels = (offset < Size) ? (Data[offset] % 16) + 1 : 6;
                     offset++;
-                    int64_t kernelSize = (offset < Size) ? (Data[offset] % 7) + 1 : 3;
+                    int64_t kernelSize = (offset < Size) ? (Data[offset] % 5) + 1 : 3;
                     offset++;
-                    moduleDict[key] = torch::nn::Conv2d(
-                        torch::nn::Conv2dOptions(inChannels, outChannels, kernelSize));
+                    moduleDict->update({{key, torch::nn::Conv2d(
+                        torch::nn::Conv2dOptions(inChannels, outChannels, kernelSize))}});
+                    if (i == 0) {
+                        module0Type = 1;
+                        module0InChannels = inChannels;
+                    }
                     break;
                 }
                 case 2: {
                     // ReLU module
                     bool inplace = (offset < Size) ? (Data[offset] % 2 == 0) : false;
                     offset++;
-                    moduleDict[key] = torch::nn::ReLU(torch::nn::ReLUOptions().inplace(inplace));
+                    moduleDict->update({{key, torch::nn::ReLU(torch::nn::ReLUOptions().inplace(inplace))}});
+                    if (i == 0) {
+                        module0Type = 2;
+                    }
                     break;
                 }
                 case 3: {
                     // Dropout module
                     double prob = (offset < Size) ? static_cast<double>(Data[offset]) / 255.0 : 0.5;
                     offset++;
-                    moduleDict[key] = torch::nn::Dropout(torch::nn::DropoutOptions(prob));
+                    moduleDict->update({{key, torch::nn::Dropout(torch::nn::DropoutOptions(prob))}});
+                    if (i == 0) {
+                        module0Type = 3;
+                    }
                     break;
                 }
                 case 4: {
                     // Sequential module with a few layers
-                    moduleDict[key] = torch::nn::Sequential(
+                    moduleDict->update({{key, torch::nn::Sequential(
                         torch::nn::Linear(10, 5),
                         torch::nn::ReLU(),
                         torch::nn::Linear(5, 1)
-                    );
+                    )}});
+                    if (i == 0) {
+                        module0Type = 4;
+                    }
                     break;
                 }
             }
@@ -85,6 +111,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (moduleDict->size() > 0) {
             std::string testKey = "module_0";
             bool contains = moduleDict->contains(testKey);
+            (void)contains;
         }
         
         // 2. Test keys method
@@ -96,44 +123,61 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // 4. Test items method
         auto items = moduleDict->items();
         
-        // 5. Test clear method (with probability)
-        if (offset < Size && Data[offset] % 10 == 0) {
-            moduleDict->clear();
-        }
-        offset++;
+        // 5. Test size method
+        size_t dictSize = moduleDict->size();
+        (void)dictSize;
         
-        // 6. Test pop method (with probability)
-        if (offset < Size && moduleDict->size() > 0 && Data[offset] % 5 == 0) {
-            std::string popKey = "module_" + std::to_string(Data[offset] % moduleDict->size());
-            if (moduleDict->contains(popKey)) {
-                auto module = moduleDict->pop(popKey);
-            }
-        }
-        offset++;
+        // 6. Test empty method
+        bool isEmpty = moduleDict->is_empty();
+        (void)isEmpty;
         
-        // 7. Test update method (with probability)
-        if (offset < Size && Data[offset] % 3 == 0) {
-            torch::nn::ModuleDict newModules;
-            newModules["new_module"] = torch::nn::Linear(5, 3);
-            moduleDict->update(newModules);
-        }
-        offset++;
-        
-        // 8. Test forward pass with a tensor if we have a Linear module
-        if (moduleDict->contains("module_0")) {
+        // 7. Test forward pass based on known module type
+        if (moduleDict->contains("module_0") && module0Type >= 0) {
             try {
-                auto module = moduleDict->at<torch::nn::LinearImpl>("module_0");
-                // Create input tensor for the linear layer
-                int64_t batchSize = 2;
-                int64_t inFeatures = module.options.in_features();
-                auto input = torch::rand({batchSize, inFeatures});
-                auto output = module.forward(input);
-            } catch (const std::exception& e) {
-                // Catch exceptions from forward pass but continue testing
+                torch::NoGradGuard no_grad;
+                
+                if (module0Type == 0) {
+                    // Linear module
+                    auto input = torch::rand({2, module0InFeatures});
+                    auto module = moduleDict["module_0"]->as<torch::nn::Linear>();
+                    if (module) {
+                        auto output = module->forward(input);
+                    }
+                } else if (module0Type == 1) {
+                    // Conv2d module
+                    auto input = torch::rand({1, module0InChannels, 8, 8});
+                    auto module = moduleDict["module_0"]->as<torch::nn::Conv2d>();
+                    if (module) {
+                        auto output = module->forward(input);
+                    }
+                } else if (module0Type == 2) {
+                    // ReLU module
+                    auto input = torch::rand({2, 5});
+                    auto module = moduleDict["module_0"]->as<torch::nn::ReLU>();
+                    if (module) {
+                        auto output = module->forward(input);
+                    }
+                } else if (module0Type == 3) {
+                    // Dropout module
+                    auto input = torch::rand({2, 5});
+                    auto module = moduleDict["module_0"]->as<torch::nn::Dropout>();
+                    if (module) {
+                        auto output = module->forward(input);
+                    }
+                } else if (module0Type == 4) {
+                    // Sequential module
+                    auto input = torch::rand({2, 10});
+                    auto module = moduleDict["module_0"]->as<torch::nn::Sequential>();
+                    if (module) {
+                        auto output = module->forward(input);
+                    }
+                }
+            } catch (...) {
+                // Expected - forward might fail for various reasons
             }
         }
         
-        // 9. Test operator[] access
+        // 8. Test operator[] access
         if (moduleDict->size() > 0) {
             std::string accessKey = "module_0";
             if (moduleDict->contains(accessKey)) {
@@ -141,17 +185,42 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // 10. Test iteration through ModuleDict
+        // 9. Test iteration through ModuleDict
         for (const auto& item : moduleDict->named_children()) {
             const auto& name = item.key();
             const auto& module = item.value();
+            (void)name;
+            (void)module;
+        }
+        
+        // 10. Test pop method (with probability)
+        if (offset < Size && moduleDict->size() > 0 && Data[offset] % 5 == 0) {
+            auto keysList = moduleDict->keys();
+            if (!keysList.empty()) {
+                std::string popKey = keysList[Data[offset] % keysList.size()];
+                auto module = moduleDict->pop(popKey);
+            }
+        }
+        offset++;
+        
+        // 11. Test update method (with probability)
+        if (offset < Size && Data[offset] % 3 == 0) {
+            torch::nn::ModuleDict newModules;
+            newModules->update({{"new_module", torch::nn::Linear(5, 3)}});
+            moduleDict->update(*newModules);
+        }
+        offset++;
+        
+        // 12. Test clear method (with probability) - do this last
+        if (offset < Size && Data[offset] % 10 == 0) {
+            moduleDict->clear();
         }
         
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

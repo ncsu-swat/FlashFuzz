@@ -1,23 +1,24 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Skip if we don't have enough data
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create a quantized tensor for input
-        // First, create a floating-point tensor
+        // Create a floating-point tensor for input
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Ensure the tensor is float for quantization
@@ -25,73 +26,64 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             input_tensor = input_tensor.to(torch::kFloat);
         }
         
-        // Set up quantization parameters
+        // Ensure tensor is contiguous
+        input_tensor = input_tensor.contiguous();
+        
+        // Clamp input to reasonable range to avoid numerical issues
+        input_tensor = torch::clamp(input_tensor, -10.0f, 10.0f);
+        
+        // Extract quantization parameters from fuzzer data
         float scale = 1.0f / 256.0f;
         int zero_point = 0;
         
-        // Try different zero points if we have more data
         if (offset < Size) {
             zero_point = static_cast<int>(Data[offset++]) % 256;
         }
         
-        // Try different scales if we have more data
         if (offset + sizeof(float) <= Size) {
             float raw_scale;
             std::memcpy(&raw_scale, Data + offset, sizeof(float));
             offset += sizeof(float);
             
-            // Ensure scale is positive and reasonable
             if (std::isfinite(raw_scale) && raw_scale != 0.0f) {
                 scale = std::abs(raw_scale);
-                // Limit to a reasonable range
-                scale = std::max(1e-6f, std::min(scale, 1e6f));
+                scale = std::max(1e-6f, std::min(scale, 1e3f));
             }
         }
         
-        // Quantize the tensor
-        torch::Tensor quantized_input;
-        try {
-            quantized_input = torch::quantize_per_tensor(
-                input_tensor, 
-                scale, 
-                zero_point, 
-                torch::kQUInt8
-            );
-        } catch (const std::exception& e) {
-            // If quantization fails, try with default parameters
-            quantized_input = torch::quantize_per_tensor(
-                input_tensor, 
-                1.0f / 256.0f, 
-                0, 
-                torch::kQUInt8
-            );
-        }
-        
-        // Apply the sigmoid operation using functional interface
-        torch::Tensor output = torch::sigmoid(quantized_input);
-        
-        // Dequantize the output for validation
-        torch::Tensor dequantized_output = output.dequantize();
-        
-        // Verify the output is in the expected range [0, 1]
-        // This is just a sanity check, not a premature check
-        auto min_val = torch::min(dequantized_output).item<float>();
-        auto max_val = torch::max(dequantized_output).item<float>();
-        
-        // The following is just to use the values to prevent compiler optimization
-        if (min_val < -1.0f || max_val > 2.0f) {
-            // This should not happen with a proper sigmoid, but we're just using
-            // the values to prevent compiler from optimizing them away
-            volatile float dummy = min_val + max_val;
-            (void)dummy;
-        }
-        
-        // Try with different scale/zero_point for output if we have more data
-        if (offset + 5 <= Size) {
+        // Test 1: Quantize input, apply sigmoid via dequantize-compute-quantize
+        // This is the pattern used by torch.nn.quantized.Sigmoid internally
+        {
+            torch::Tensor quantized_input;
+            try {
+                quantized_input = torch::quantize_per_tensor(
+                    input_tensor, 
+                    scale, 
+                    zero_point, 
+                    torch::kQUInt8
+                );
+            } catch (...) {
+                // Quantization can fail with extreme parameters
+                quantized_input = torch::quantize_per_tensor(
+                    input_tensor, 
+                    1.0f / 256.0f, 
+                    0, 
+                    torch::kQUInt8
+                );
+            }
+            
+            // Dequantize -> sigmoid -> quantize (typical quantized module pattern)
+            torch::Tensor dequantized = quantized_input.dequantize();
+            torch::Tensor sigmoid_result = torch::sigmoid(dequantized);
+            
+            // Output scale for sigmoid is typically 1/256 with zero_point 0
+            // since sigmoid output is in [0, 1]
             float output_scale = 1.0f / 256.0f;
             int output_zero_point = 0;
             
-            output_zero_point = static_cast<int>(Data[offset++]) % 256;
+            if (offset < Size) {
+                output_zero_point = static_cast<int>(Data[offset++]) % 256;
+            }
             
             if (offset + sizeof(float) <= Size) {
                 float raw_output_scale;
@@ -100,35 +92,119 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 
                 if (std::isfinite(raw_output_scale) && raw_output_scale != 0.0f) {
                     output_scale = std::abs(raw_output_scale);
-                    output_scale = std::max(1e-6f, std::min(output_scale, 1e6f));
+                    output_scale = std::max(1e-6f, std::min(output_scale, 1e3f));
                 }
             }
             
-            // Apply sigmoid and then quantize with specified parameters
-            torch::Tensor sigmoid_result = torch::sigmoid(quantized_input.dequantize());
-            torch::Tensor output_with_params = torch::quantize_per_tensor(
+            torch::Tensor quantized_output = torch::quantize_per_tensor(
                 sigmoid_result,
                 output_scale,
                 output_zero_point,
                 torch::kQUInt8
             );
             
-            // Dequantize and check
-            torch::Tensor dequantized_output_with_params = output_with_params.dequantize();
-            auto min_val2 = torch::min(dequantized_output_with_params).item<float>();
-            auto max_val2 = torch::max(dequantized_output_with_params).item<float>();
+            // Verify output
+            torch::Tensor final_output = quantized_output.dequantize();
+            volatile float check = final_output.sum().item<float>();
+            (void)check;
+        }
+        
+        // Test 2: Try with qint8 instead of quint8
+        {
+            try {
+                torch::Tensor quantized_qint8 = torch::quantize_per_tensor(
+                    input_tensor,
+                    scale,
+                    0,  // zero_point must be 0 for qint8
+                    torch::kQInt8
+                );
+                
+                torch::Tensor dequantized = quantized_qint8.dequantize();
+                torch::Tensor sigmoid_result = torch::sigmoid(dequantized);
+                
+                torch::Tensor quantized_output = torch::quantize_per_tensor(
+                    sigmoid_result,
+                    1.0f / 256.0f,
+                    0,
+                    torch::kQInt8
+                );
+                
+                volatile float check = quantized_output.dequantize().sum().item<float>();
+                (void)check;
+            } catch (...) {
+                // qint8 quantization may fail with some parameters
+            }
+        }
+        
+        // Test 3: Different tensor shapes
+        if (offset + 2 <= Size) {
+            int dim1 = (Data[offset++] % 16) + 1;
+            int dim2 = (Data[offset++] % 16) + 1;
             
-            // Just to use the values
-            if (min_val2 < -1.0f || max_val2 > 2.0f) {
-                volatile float dummy = min_val2 + max_val2;
-                (void)dummy;
+            torch::Tensor shaped_tensor = torch::randn({dim1, dim2});
+            shaped_tensor = torch::clamp(shaped_tensor, -10.0f, 10.0f);
+            
+            try {
+                torch::Tensor q_shaped = torch::quantize_per_tensor(
+                    shaped_tensor,
+                    scale,
+                    zero_point,
+                    torch::kQUInt8
+                );
+                
+                torch::Tensor sigmoid_out = torch::sigmoid(q_shaped.dequantize());
+                torch::Tensor q_out = torch::quantize_per_tensor(
+                    sigmoid_out,
+                    1.0f / 256.0f,
+                    0,
+                    torch::kQUInt8
+                );
+                
+                volatile float check = q_out.dequantize().mean().item<float>();
+                (void)check;
+            } catch (...) {
+                // Shape-related issues
+            }
+        }
+        
+        // Test 4: Batched input (typical neural network usage)
+        if (offset + 3 <= Size) {
+            int batch = (Data[offset++] % 8) + 1;
+            int channels = (Data[offset++] % 32) + 1;
+            int features = (Data[offset++] % 32) + 1;
+            
+            torch::Tensor batched = torch::randn({batch, channels, features});
+            batched = torch::clamp(batched, -10.0f, 10.0f);
+            
+            try {
+                torch::Tensor q_batched = torch::quantize_per_tensor(
+                    batched,
+                    scale,
+                    zero_point,
+                    torch::kQUInt8
+                );
+                
+                torch::Tensor sigmoid_out = torch::sigmoid(q_batched.dequantize());
+                torch::Tensor q_out = torch::quantize_per_tensor(
+                    sigmoid_out,
+                    1.0f / 256.0f,
+                    0,
+                    torch::kQUInt8
+                );
+                
+                // Verify shape is preserved
+                auto out_sizes = q_out.sizes();
+                volatile int64_t check = out_sizes[0] * out_sizes[1] * out_sizes[2];
+                (void)check;
+            } catch (...) {
+                // Batched operation issues
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

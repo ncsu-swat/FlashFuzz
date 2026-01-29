@@ -1,158 +1,179 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        if (Size < 10) {
+        if (Size < 20) {
             return 0;
         }
+
+        size_t offset = 0;
+
+        // Parse convolution parameters first
+        int64_t in_channels = (Data[offset++] % 16) + 1;
+        int64_t out_channels = (Data[offset++] % 16) + 1;
+        int64_t kernel_size = (Data[offset++] % 5) + 1;
+        int64_t stride = (Data[offset++] % 3) + 1;
+        int64_t padding = Data[offset++] % 3;
+        int64_t dilation = (Data[offset++] % 2) + 1;
+        int64_t groups = (Data[offset++] % 4) + 1;
+        bool use_bias = Data[offset++] % 2 == 0;
+        uint8_t conv_type = Data[offset++] % 4; // 0=Conv1d, 1=Conv2d, 2=Conv3d, 3=ConvTranspose2d
+
+        // Ensure groups divides both in_channels and out_channels
+        while (in_channels % groups != 0) {
+            in_channels++;
+        }
+        while (out_channels % groups != 0) {
+            out_channels++;
+        }
+
+        // Parse spatial dimensions
+        int64_t batch_size = (Data[offset++] % 4) + 1;
+        int64_t spatial_dim = (Data[offset++] % 8) + kernel_size * dilation;
+
+        // Ensure spatial dimension is large enough for the convolution
+        int64_t min_spatial = (kernel_size - 1) * dilation + 1;
+        if (spatial_dim < min_spatial) {
+            spatial_dim = min_spatial;
+        }
+
+        // Create input tensor with appropriate dimensions
+        torch::Tensor input;
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Parse convolution parameters from the remaining data
-        uint8_t in_channels = 0;
-        uint8_t out_channels = 0;
-        uint8_t kernel_size = 0;
-        uint8_t stride = 0;
-        uint8_t padding = 0;
-        uint8_t dilation = 0;
-        uint8_t groups = 1;
-        bool bias = true;
-        
-        if (offset + 7 <= Size) {
-            in_channels = Data[offset++] % 16 + 1;
-            out_channels = Data[offset++] % 16 + 1;
-            kernel_size = Data[offset++] % 7 + 1;
-            stride = Data[offset++] % 5 + 1;
-            padding = Data[offset++] % 4;
-            dilation = Data[offset++] % 3 + 1;
-            groups = Data[offset++] % in_channels + 1;
-            
-            if (groups > in_channels) {
-                groups = in_channels;
+        if (conv_type == 0) {
+            // Conv1d: (N, C_in, L)
+            input = torch::randn({batch_size, in_channels, spatial_dim});
+        } else if (conv_type == 1 || conv_type == 3) {
+            // Conv2d/ConvTranspose2d: (N, C_in, H, W)
+            input = torch::randn({batch_size, in_channels, spatial_dim, spatial_dim});
+        } else {
+            // Conv3d: (N, C_in, D, H, W)
+            int64_t small_spatial = (spatial_dim / 2) + min_spatial;
+            input = torch::randn({batch_size, in_channels, small_spatial, small_spatial, small_spatial});
+        }
+
+        // Inner try-catch for expected shape/parameter failures
+        try {
+            if (conv_type == 0) {
+                // Test Conv1d
+                torch::nn::Conv1d conv(torch::nn::Conv1dOptions(in_channels, out_channels, kernel_size)
+                                        .stride(stride)
+                                        .padding(padding)
+                                        .dilation(dilation)
+                                        .groups(groups)
+                                        .bias(use_bias));
+                auto output = conv->forward(input);
+            } else if (conv_type == 1) {
+                // Test Conv2d
+                torch::nn::Conv2d conv(torch::nn::Conv2dOptions(in_channels, out_channels, kernel_size)
+                                        .stride(stride)
+                                        .padding(padding)
+                                        .dilation(dilation)
+                                        .groups(groups)
+                                        .bias(use_bias));
+                auto output = conv->forward(input);
+            } else if (conv_type == 2) {
+                // Test Conv3d
+                torch::nn::Conv3d conv(torch::nn::Conv3dOptions(in_channels, out_channels, kernel_size)
+                                        .stride(stride)
+                                        .padding(padding)
+                                        .dilation(dilation)
+                                        .groups(groups)
+                                        .bias(use_bias));
+                auto output = conv->forward(input);
+            } else {
+                // Test ConvTranspose2d
+                int64_t output_padding = (stride > 1 && padding > 0) ? std::min(padding, stride - 1) : 0;
+                torch::nn::ConvTranspose2d conv(
+                    torch::nn::ConvTranspose2dOptions(in_channels, out_channels, kernel_size)
+                        .stride(stride)
+                        .padding(padding)
+                        .output_padding(output_padding)
+                        .groups(groups)
+                        .bias(use_bias)
+                        .dilation(dilation));
+                auto output = conv->forward(input);
             }
+        } catch (const std::exception &) {
+            // Expected failures for invalid configurations - silently ignore
+        }
+
+        // Test Conv2d with asymmetric kernel sizes
+        if (offset + 2 <= Size && conv_type == 1) {
+            int64_t kernel_h = (Data[offset++] % 5) + 1;
+            int64_t kernel_w = (Data[offset++] % 5) + 1;
             
-            if (in_channels % groups != 0) {
-                in_channels = groups * (in_channels / groups + 1);
+            int64_t min_h = (kernel_h - 1) * dilation + 1;
+            int64_t min_w = (kernel_w - 1) * dilation + 1;
+            int64_t h = std::max(spatial_dim, min_h);
+            int64_t w = std::max(spatial_dim, min_w);
+            
+            torch::Tensor input2d = torch::randn({batch_size, in_channels, h, w});
+            
+            try {
+                torch::nn::Conv2d conv2(torch::nn::Conv2dOptions(in_channels, out_channels, {kernel_h, kernel_w})
+                                        .stride({stride, stride})
+                                        .padding({padding, padding})
+                                        .dilation({dilation, dilation})
+                                        .groups(groups)
+                                        .bias(use_bias));
+                auto output = conv2->forward(input2d);
+            } catch (const std::exception &) {
+                // Expected failures - silently ignore
             }
+        }
+
+        // Test ConvTranspose1d and ConvTranspose3d
+        if (offset < Size) {
+            uint8_t transpose_type = Data[offset++] % 2;
             
-            if (offset < Size) {
-                bias = Data[offset++] % 2 == 0;
+            try {
+                if (transpose_type == 0) {
+                    // ConvTranspose1d
+                    torch::Tensor input1d = torch::randn({batch_size, in_channels, spatial_dim});
+                    int64_t output_padding = (stride > 1) ? std::min((int64_t)1, stride - 1) : 0;
+                    torch::nn::ConvTranspose1d conv(
+                        torch::nn::ConvTranspose1dOptions(in_channels, out_channels, kernel_size)
+                            .stride(stride)
+                            .padding(padding)
+                            .output_padding(output_padding)
+                            .groups(groups)
+                            .bias(use_bias)
+                            .dilation(dilation));
+                    auto output = conv->forward(input1d);
+                } else {
+                    // ConvTranspose3d
+                    int64_t small_spatial = (spatial_dim / 2) + min_spatial;
+                    torch::Tensor input3d = torch::randn({batch_size, in_channels, small_spatial, small_spatial, small_spatial});
+                    int64_t output_padding = (stride > 1) ? std::min((int64_t)1, stride - 1) : 0;
+                    torch::nn::ConvTranspose3d conv(
+                        torch::nn::ConvTranspose3dOptions(in_channels, out_channels, kernel_size)
+                            .stride(stride)
+                            .padding(padding)
+                            .output_padding(output_padding)
+                            .groups(groups)
+                            .bias(use_bias)
+                            .dilation(dilation));
+                    auto output = conv->forward(input3d);
+                }
+            } catch (const std::exception &) {
+                // Expected failures - silently ignore
             }
-        }
-        
-        // Reshape input tensor if needed to match convolution requirements
-        auto input_sizes = input.sizes().vec();
-        int64_t batch_size = 1;
-        
-        if (input_sizes.empty()) {
-            // Scalar tensor, reshape to 4D
-            input = input.reshape({1, in_channels, kernel_size, kernel_size});
-        } else if (input_sizes.size() == 1) {
-            // 1D tensor, reshape to 4D
-            batch_size = input_sizes[0] > 0 ? input_sizes[0] : 1;
-            input = input.reshape({batch_size, in_channels, kernel_size, kernel_size});
-        } else if (input_sizes.size() == 2) {
-            // 2D tensor, reshape to 4D
-            batch_size = input_sizes[0] > 0 ? input_sizes[0] : 1;
-            int64_t features = input_sizes[1] > 0 ? input_sizes[1] : in_channels;
-            input = input.reshape({batch_size, features, kernel_size, kernel_size});
-        } else if (input_sizes.size() == 3) {
-            // 3D tensor, reshape to 4D for Conv2d
-            batch_size = input_sizes[0] > 0 ? input_sizes[0] : 1;
-            int64_t features = input_sizes[1] > 0 ? input_sizes[1] : in_channels;
-            int64_t height = input_sizes[2] > 0 ? input_sizes[2] : kernel_size;
-            input = input.reshape({batch_size, features, height, kernel_size});
-        } else if (input_sizes.size() > 4) {
-            // Higher dimensional tensor, reshape to 4D
-            batch_size = input_sizes[0] > 0 ? input_sizes[0] : 1;
-            int64_t features = input_sizes[1] > 0 ? input_sizes[1] : in_channels;
-            int64_t height = input_sizes[2] > 0 ? input_sizes[2] : kernel_size;
-            int64_t width = input_sizes[3] > 0 ? input_sizes[3] : kernel_size;
-            input = input.reshape({batch_size, features, height, width});
-        }
-        
-        // Ensure input has the right number of channels for the convolution
-        input_sizes = input.sizes().vec();
-        if (input_sizes.size() >= 2 && input_sizes[1] != in_channels) {
-            input_sizes[1] = in_channels;
-            input = input.reshape(input_sizes);
-        }
-        
-        // Create Conv1d, Conv2d, or Conv3d based on input dimensions
-        if (input.dim() == 3) {
-            // Conv1d
-            torch::nn::Conv1d conv(torch::nn::Conv1dOptions(in_channels, out_channels, kernel_size)
-                                    .stride(stride)
-                                    .padding(padding)
-                                    .dilation(dilation)
-                                    .groups(groups)
-                                    .bias(bias));
-            
-            auto output = conv->forward(input);
-        } else if (input.dim() == 4) {
-            // Conv2d
-            torch::nn::Conv2d conv(torch::nn::Conv2dOptions(in_channels, out_channels, kernel_size)
-                                    .stride(stride)
-                                    .padding(padding)
-                                    .dilation(dilation)
-                                    .groups(groups)
-                                    .bias(bias));
-            
-            auto output = conv->forward(input);
-        } else if (input.dim() == 5) {
-            // Conv3d
-            torch::nn::Conv3d conv(torch::nn::Conv3dOptions(in_channels, out_channels, kernel_size)
-                                    .stride(stride)
-                                    .padding(padding)
-                                    .dilation(dilation)
-                                    .groups(groups)
-                                    .bias(bias));
-            
-            auto output = conv->forward(input);
-        }
-        
-        // Try with different kernel sizes for height and width
-        if (offset + 1 < Size && input.dim() == 4) {
-            uint8_t kernel_h = Data[offset++] % 5 + 1;
-            uint8_t kernel_w = Data[offset++] % 5 + 1;
-            
-            torch::nn::Conv2d conv2(torch::nn::Conv2dOptions(in_channels, out_channels, {kernel_h, kernel_w})
-                                    .stride({stride, stride})
-                                    .padding({padding, padding})
-                                    .dilation({dilation, dilation})
-                                    .groups(groups)
-                                    .bias(bias));
-            
-            auto output = conv2->forward(input);
-        }
-        
-        // Try transposed convolution
-        if (offset < Size && input.dim() == 4) {
-            torch::nn::ConvTranspose2d conv_t(
-                torch::nn::ConvTranspose2dOptions(in_channels, out_channels, kernel_size)
-                    .stride(stride)
-                    .padding(padding)
-                    .output_padding(padding > 0 ? padding - 1 : 0)
-                    .groups(groups)
-                    .bias(bias)
-                    .dilation(dilation));
-            
-            auto output = conv_t->forward(input);
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,17 +1,20 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
@@ -19,82 +22,128 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Ensure we have a 5D tensor (batch, channels, depth, height, width)
-        // If not, reshape it to 5D
-        if (input_tensor.dim() < 3) {
-            std::vector<int64_t> new_shape = {1, 1, 1, 1, 1};
-            for (int i = 0; i < input_tensor.dim(); i++) {
-                new_shape[5 - input_tensor.dim() + i] = input_tensor.size(i);
-            }
-            input_tensor = input_tensor.reshape(new_shape);
-        }
-        else if (input_tensor.dim() > 5) {
-            // Flatten extra dimensions
-            std::vector<int64_t> new_shape = {1, 1, 1, 1, 1};
-            int64_t product = 1;
-            for (int i = 0; i < input_tensor.dim() - 5; i++) {
-                product *= input_tensor.size(i);
-            }
-            new_shape[0] = product;
-            for (int i = 0; i < std::min(4, static_cast<int>(input_tensor.dim())); i++) {
-                new_shape[i+1] = input_tensor.size(input_tensor.dim() - 4 + i);
-            }
-            input_tensor = input_tensor.reshape(new_shape);
+        // CircularPad3d requires 4D or 5D input
+        int64_t numel = input_tensor.numel();
+        
+        if (numel == 0) {
+            return 0;
         }
         
-        // Parse padding values from the remaining data
-        std::vector<int64_t> padding(6, 0);
-        for (int i = 0; i < 6 && offset + sizeof(int64_t) <= Size; i++) {
-            int64_t pad_value;
-            std::memcpy(&pad_value, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        // Flatten and reshape to 5D
+        input_tensor = input_tensor.flatten();
+        
+        // Create reasonable dimensions
+        int64_t batch = 1;
+        int64_t channels = 1;
+        int64_t depth = std::max(int64_t(1), std::min(int64_t(8), numel));
+        int64_t height = std::max(int64_t(1), std::min(int64_t(8), numel / depth));
+        int64_t width = std::max(int64_t(1), numel / (depth * height));
+        
+        int64_t needed = batch * channels * depth * height * width;
+        if (needed > numel) {
+            // Adjust to fit
+            width = numel / (batch * channels * depth * height);
+            if (width < 1) width = 1;
+            needed = batch * channels * depth * height * width;
+        }
+        
+        input_tensor = input_tensor.narrow(0, 0, needed).reshape({batch, channels, depth, height, width});
+        
+        // Parse padding values from remaining data - bound them to reasonable values
+        int64_t padding[6] = {1, 1, 1, 1, 1, 1};
+        for (int i = 0; i < 6 && offset < Size; i++) {
+            // Use single byte for padding, bounded to tensor dimensions
+            int64_t max_pad;
+            if (i < 2) {
+                max_pad = width - 1;  // width padding
+            } else if (i < 4) {
+                max_pad = height - 1; // height padding
+            } else {
+                max_pad = depth - 1;  // depth padding
+            }
+            max_pad = std::max(int64_t(0), max_pad);
             
-            // Allow negative padding values to test edge cases
-            padding[i] = pad_value;
+            padding[i] = Data[offset++] % (max_pad + 1);
         }
         
-        // Apply circular padding using torch::nn::functional::pad
+        // Get configuration byte
+        uint8_t config = 0;
+        if (offset < Size) {
+            config = Data[offset++];
+        }
+        
         torch::Tensor output;
         
-        // Try different padding configurations
-        if (offset + 1 <= Size) {
-            uint8_t pad_config = Data[offset++];
-            
-            if (pad_config % 3 == 0) {
-                // Single integer padding
-                int64_t pad_value = padding[0];
-                output = torch::nn::functional::pad(input_tensor, 
-                    torch::nn::functional::PadFuncOptions({pad_value, pad_value, pad_value, pad_value, pad_value, pad_value})
-                    .mode(torch::kCircular));
-            }
-            else if (pad_config % 3 == 1) {
-                // Tuple of 6 integers (left, right, top, bottom, front, back)
-                output = torch::nn::functional::pad(input_tensor, 
+        // torch::nn::CircularPad3d module doesn't exist in C++ frontend
+        // Use functional API with circular mode instead
+        // The functional pad with kCircular mode provides equivalent functionality
+        
+        if (config % 3 == 0) {
+            // Test with 6-value padding (left, right, top, bottom, front, back)
+            try {
+                output = torch::nn::functional::pad(input_tensor,
                     torch::nn::functional::PadFuncOptions({padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]})
                     .mode(torch::kCircular));
+            } catch (const c10::Error&) {
+                // Expected for invalid configurations
+                return 0;
             }
-            else {
-                // Tuple of 3 pairs (depth_padding, height_padding, width_padding)
-                output = torch::nn::functional::pad(input_tensor, 
-                    torch::nn::functional::PadFuncOptions({padding[4], padding[5], padding[2], padding[3], padding[0], padding[1]})
+        } else if (config % 3 == 1) {
+            // Test with 4-value padding (left, right, top, bottom)
+            try {
+                output = torch::nn::functional::pad(input_tensor,
+                    torch::nn::functional::PadFuncOptions({padding[0], padding[1], padding[2], padding[3]})
                     .mode(torch::kCircular));
+            } catch (const c10::Error&) {
+                // Expected for invalid configurations
+                return 0;
             }
-        }
-        else {
-            // Default padding if not enough data
-            output = torch::nn::functional::pad(input_tensor, 
-                torch::nn::functional::PadFuncOptions({1, 1, 1, 1, 1, 1})
-                .mode(torch::kCircular));
+        } else {
+            // Test with 2-value padding (left, right)
+            try {
+                output = torch::nn::functional::pad(input_tensor,
+                    torch::nn::functional::PadFuncOptions({padding[0], padding[1]})
+                    .mode(torch::kCircular));
+            } catch (const c10::Error&) {
+                // Expected for invalid configurations
+                return 0;
+            }
         }
         
-        // Force computation to catch any errors
+        // Force computation
         output.sum().item<float>();
+        
+        // Test with 4D input (unbatched: channels, depth, height, width)
+        if (config % 8 >= 4 && input_tensor.dim() == 5) {
+            try {
+                auto input_4d = input_tensor.squeeze(0);
+                auto output_4d = torch::nn::functional::pad(input_4d,
+                    torch::nn::functional::PadFuncOptions({padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]})
+                    .mode(torch::kCircular));
+                output_4d.sum().item<float>();
+            } catch (const c10::Error&) {
+                // Expected for some configurations
+            }
+        }
+        
+        // Test with different tensor dtypes
+        if (config % 16 >= 8) {
+            try {
+                auto input_double = input_tensor.to(torch::kDouble);
+                auto output_double = torch::nn::functional::pad(input_double,
+                    torch::nn::functional::PadFuncOptions({padding[0], padding[1], padding[2], padding[3], padding[4], padding[5]})
+                    .mode(torch::kCircular));
+                output_double.sum().item<double>();
+            } catch (const c10::Error&) {
+                // Expected for some configurations
+            }
+        }
         
         return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

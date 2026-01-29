@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -33,21 +37,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             reduction_selector = Data[offset++];
         }
         
-        torch::nn::functional::L1LossFuncOptions::reduction_t reduction_mode;
-        switch (reduction_selector % 3) {
+        // Track which reduction mode was selected
+        int reduction_choice = reduction_selector % 3;
+        
+        torch::nn::L1LossOptions options;
+        switch (reduction_choice) {
             case 0:
-                reduction_mode = torch::kNone;
+                options.reduction(torch::kNone);
                 break;
             case 1:
-                reduction_mode = torch::kMean;
+                options.reduction(torch::kMean);
                 break;
             case 2:
-                reduction_mode = torch::kSum;
+                options.reduction(torch::kSum);
                 break;
         }
         
         // Create L1Loss module
-        torch::nn::L1LossOptions options = torch::nn::L1LossOptions().reduction(reduction_mode);
         torch::nn::L1Loss l1_loss(options);
         
         // Apply L1Loss
@@ -55,12 +61,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Try backward pass if tensors require grad
         if (offset < Size && Data[offset++] % 2 == 0) {
-            // Set requires_grad for input
-            auto input_requires_grad = input.clone().set_requires_grad(true);
-            auto target_requires_grad = target.clone().set_requires_grad(true);
+            // Create tensors with requires_grad
+            auto input_requires_grad = input.clone().to(torch::kFloat).requires_grad_(true);
+            auto target_no_grad = target.clone().to(torch::kFloat);
             
             // Recompute loss with tensors that require grad
-            auto new_loss = l1_loss(input_requires_grad, target_requires_grad);
+            auto new_loss = l1_loss(input_requires_grad, target_no_grad);
+            
+            // For backward pass, we need a scalar. If reduction is None, sum the loss first.
+            if (reduction_choice == 0) {
+                new_loss = new_loss.sum();
+            }
             
             // Perform backward pass
             new_loss.backward();
@@ -72,7 +83,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto empty_target = torch::empty({0});
             try {
                 auto empty_loss = l1_loss(empty_input, empty_target);
-            } catch (const std::exception& e) {
+            } catch (...) {
                 // Expected exception for empty tensors
             }
         }
@@ -85,7 +96,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 auto mismatched_input = torch::ones(shape1);
                 auto mismatched_target = torch::ones(shape2);
                 auto mismatched_loss = l1_loss(mismatched_input, mismatched_target);
-            } catch (const std::exception& e) {
+            } catch (...) {
                 // Expected exception for mismatched shapes
             }
         }
@@ -96,9 +107,26 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 auto float_input = torch::ones({2, 2}, torch::kFloat);
                 auto int_target = torch::ones({2, 2}, torch::kInt);
                 auto dtype_loss = l1_loss(float_input, int_target);
-            } catch (const std::exception& e) {
+            } catch (...) {
                 // May throw for incompatible dtypes
             }
+        }
+        
+        // Test functional API as well
+        if (offset < Size && Data[offset++] % 3 == 0) {
+            torch::nn::functional::L1LossFuncOptions func_options;
+            switch (reduction_choice) {
+                case 0:
+                    func_options.reduction(torch::kNone);
+                    break;
+                case 1:
+                    func_options.reduction(torch::kMean);
+                    break;
+                case 2:
+                    func_options.reduction(torch::kSum);
+                    break;
+            }
+            auto func_loss = torch::nn::functional::l1_loss(input, target, func_options);
         }
     }
     catch (const std::exception &e)

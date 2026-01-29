@@ -1,11 +1,17 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstring>        // For memcpy
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,35 +21,44 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Parse low and high values for randint
-        int64_t low = 0;
-        int64_t high = 0;
+        // Parse low and high values for randint - use smaller integers to avoid overflow
+        int32_t low_val = 0;
+        int32_t high_val = 0;
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&low, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + sizeof(int32_t) <= Size) {
+            std::memcpy(&low_val, Data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
         }
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&high, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + sizeof(int32_t) <= Size) {
+            std::memcpy(&high_val, Data + offset, sizeof(int32_t));
+            offset += sizeof(int32_t);
         }
+        
+        // Clamp to reasonable range to avoid overflow issues
+        low_val = low_val % 10000;
+        high_val = high_val % 10000;
         
         // Ensure high > low (randint requires this)
+        int64_t low = static_cast<int64_t>(std::min(low_val, high_val));
+        int64_t high = static_cast<int64_t>(std::max(low_val, high_val));
         if (high <= low) {
-            std::swap(high, low);
-            high = low + 1; // Ensure they're different
+            high = low + 1;
         }
         
-        // Create output tensor shape
-        torch::Tensor shape_tensor;
-        if (offset < Size) {
-            shape_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // Parse shape dimensions from remaining data
+        std::vector<int64_t> fuzz_shape;
+        while (offset + 1 <= Size && fuzz_shape.size() < 4) {
+            uint8_t dim_byte = Data[offset++];
+            int64_t dim = (dim_byte % 10) + 1; // Dimensions 1-10
+            fuzz_shape.push_back(dim);
+        }
+        if (fuzz_shape.empty()) {
+            fuzz_shape.push_back(3);
+            fuzz_shape.push_back(4);
         }
         
-        // Try different variants of randint
-        
-        // Variant 1: Basic randint with scalar shape
+        // Variant 1: Basic randint with scalar shape (0-d tensor)
         try {
             auto result1 = torch::randint(low, high, {});
         } catch (...) {}
@@ -53,23 +68,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto result2 = torch::randint(low, high, {3, 4});
         } catch (...) {}
         
-        // Variant 3: randint with shape from tensor
-        if (shape_tensor.defined()) {
-            try {
-                std::vector<int64_t> shape_vec;
-                for (int i = 0; i < shape_tensor.numel() && i < 8; i++) {
-                    int64_t dim = std::abs(shape_tensor.data_ptr<float>()[i]) + 1;
-                    if (dim > 1000) dim = 1000; // Limit dimension size
-                    shape_vec.push_back(dim);
-                }
-                
-                if (!shape_vec.empty()) {
-                    auto result3 = torch::randint(low, high, shape_vec);
-                }
-            } catch (...) {}
-        }
+        // Variant 3: randint with shape from fuzzer
+        try {
+            auto result3 = torch::randint(low, high, fuzz_shape);
+        } catch (...) {}
         
-        // Variant 4: randint with options
+        // Variant 4: randint with options - different dtypes
         try {
             auto options = torch::TensorOptions().dtype(torch::kFloat32);
             auto result4 = torch::randint(low, high, {2, 3}, options);
@@ -80,46 +84,71 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             auto result5 = torch::randint(low, high, {5}, options);
         } catch (...) {}
         
-        // Variant 5: Edge cases
         try {
-            // Empty shape
-            auto result6 = torch::randint(low, high, {0});
+            auto options = torch::TensorOptions().dtype(torch::kInt32);
+            auto result6 = torch::randint(low, high, {3, 3}, options);
         } catch (...) {}
         
         try {
-            // Large shape
-            auto result7 = torch::randint(low, high, {1000, 1});
+            auto options = torch::TensorOptions().dtype(torch::kInt16);
+            auto result7 = torch::randint(low, high, {4}, options);
         } catch (...) {}
         
         try {
-            // Negative bounds (should be handled by the swap above)
-            auto result8 = torch::randint(low, high, {2, 2});
+            auto options = torch::TensorOptions().dtype(torch::kInt8);
+            auto result8 = torch::randint(low, high, {2, 2}, options);
+        } catch (...) {}
+        
+        // Variant 5: Single argument form (0 to high)
+        try {
+            int64_t single_high = std::abs(high) + 1;
+            auto result9 = torch::randint(single_high, {2, 2});
         } catch (...) {}
         
         try {
-            // Different dtypes
-            auto options1 = torch::TensorOptions().dtype(torch::kInt8);
-            auto result9 = torch::randint(low, high, {3}, options1);
-            
-            auto options2 = torch::TensorOptions().dtype(torch::kInt16);
-            auto result10 = torch::randint(low, high, {3}, options2);
-            
-            auto options3 = torch::TensorOptions().dtype(torch::kInt32);
-            auto result11 = torch::randint(low, high, {3}, options3);
-            
-            auto options4 = torch::TensorOptions().dtype(torch::kFloat16);
-            auto result12 = torch::randint(low, high, {3}, options4);
+            int64_t single_high = std::abs(high) + 1;
+            auto result10 = torch::randint(single_high, fuzz_shape);
         } catch (...) {}
         
-        // Variant 6: Single value randint
+        // Variant 6: Edge cases with shapes
         try {
-            auto result13 = torch::randint(high, {2, 2});
+            // 1-D tensor
+            auto result11 = torch::randint(low, high, {10});
+        } catch (...) {}
+        
+        try {
+            // Higher dimensional
+            auto result12 = torch::randint(low, high, {2, 3, 4});
+        } catch (...) {}
+        
+        try {
+            // Large 1-D
+            auto result13 = torch::randint(low, high, {1000});
+        } catch (...) {}
+        
+        // Variant 7: randint_like (if a tensor exists)
+        try {
+            auto base_tensor = torch::zeros({3, 4}, torch::kInt64);
+            auto result14 = torch::randint_like(base_tensor, low, high);
+        } catch (...) {}
+        
+        try {
+            auto base_tensor = torch::zeros(fuzz_shape, torch::kInt32);
+            int64_t single_high = std::abs(high) + 1;
+            auto result15 = torch::randint_like(base_tensor, single_high);
+        } catch (...) {}
+        
+        // Variant 8: With generator (use default)
+        try {
+            auto gen = torch::make_generator<torch::CPUGeneratorImpl>();
+            auto options = torch::TensorOptions().dtype(torch::kInt64);
+            auto result16 = torch::randint(low, high, {4, 4}, gen, options);
         } catch (...) {}
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

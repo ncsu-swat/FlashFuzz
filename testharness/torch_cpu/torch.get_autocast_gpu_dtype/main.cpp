@@ -1,12 +1,17 @@
 #include "fuzzer_utils.h"   // General fuzzing utilities
 #include <ATen/autocast_mode.h>
 #include <iostream>         // For cerr
-#include <tuple>            // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -48,32 +53,63 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             
             // Test the get_autocast_gpu_dtype function
-            if (enable_autocast) {
-                at::autocast::set_autocast_enabled(at::kCUDA, true);
-            } else {
-                at::autocast::set_autocast_enabled(at::kCUDA, false);
+            // Note: We test both CUDA and CPU autocast APIs for coverage
+            // The GPU dtype query should work even without CUDA being available
+            
+            // Test setting autocast state
+            try {
+                if (enable_autocast) {
+                    at::autocast::set_autocast_enabled(at::kCUDA, true);
+                } else {
+                    at::autocast::set_autocast_enabled(at::kCUDA, false);
+                }
+            } catch (...) {
+                // CUDA may not be available, continue with the test
             }
             
-            // Get the autocast GPU dtype
+            // Get the autocast GPU dtype - this is the main API under test
             // Keep target keyword torch.get_autocast_gpu_dtype for harness checks.
             torch::ScalarType autocast_dtype = at::autocast::get_autocast_gpu_dtype();
             
-            // Create a tensor with the original dtype
+            // Also test setting the GPU dtype to exercise more code paths
+            try {
+                at::autocast::set_autocast_gpu_dtype(dtype);
+                torch::ScalarType new_dtype = at::autocast::get_autocast_gpu_dtype();
+                (void)new_dtype; // Use the result to prevent optimization
+            } catch (...) {
+                // Some dtypes may not be valid for autocast
+            }
+            
+            // Create a tensor with the original dtype for additional coverage
             torch::Tensor tensor;
             if (offset < Size) {
                 tensor = fuzzer_utils::createTensor(Data, Size, offset);
             } else {
                 // Create a simple tensor if we don't have enough data
-                tensor = torch::ones({2, 2}, torch::TensorOptions().dtype(dtype));
+                tensor = torch::ones({2, 2}, torch::TensorOptions().dtype(torch::kFloat));
             }
             
-            // Test casting the tensor to the autocast dtype
+            // Test casting the tensor to the autocast dtype (only if valid on CPU)
             if (tensor.defined()) {
-                torch::Tensor casted_tensor = tensor.to(autocast_dtype);
+                try {
+                    // Only cast to CPU-compatible dtypes
+                    if (autocast_dtype == torch::kFloat || 
+                        autocast_dtype == torch::kDouble ||
+                        autocast_dtype == torch::kBFloat16) {
+                        torch::Tensor casted_tensor = tensor.to(autocast_dtype);
+                        (void)casted_tensor; // Use the result
+                    }
+                } catch (...) {
+                    // Casting may fail for some dtype combinations
+                }
             }
             
             // Reset autocast state
-            at::autocast::set_autocast_enabled(at::kCUDA, false);
+            try {
+                at::autocast::set_autocast_enabled(at::kCUDA, false);
+            } catch (...) {
+                // Ignore cleanup errors
+            }
         }
     }
     catch (const std::exception &e)

@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,14 +24,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create scalar or tensor for the "other" parameter
+        // Create another tensor for the "other" parameter
         torch::Tensor other;
-        if (offset < Size) {
-            // Create another tensor for "other" parameter
+        if (offset + 4 <= Size) {
             other = fuzzer_utils::createTensor(Data, Size, offset);
         } else {
-            // Use a scalar value if we don't have enough data
-            other = torch::tensor(2.0);
+            // Use a scalar tensor if we don't have enough data
+            other = torch::tensor(2.0, input.options());
         }
         
         // Get alpha value from remaining data if available
@@ -33,68 +38,114 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&alpha, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize alpha to avoid NaN/Inf issues that aren't bugs
+            if (!std::isfinite(alpha)) {
+                alpha = 1.0;
+            }
         }
         
-        // Apply rsub operation in different ways to maximize coverage
+        // 1. Basic rsub: computes other - input
+        // torch::rsub(input, other) = other - input
+        try {
+            torch::Tensor result1 = torch::rsub(input, other);
+            (void)result1;
+        } catch (const std::exception &) {
+            // Shape/dtype mismatches are expected
+        }
         
-        // 1. Basic rsub: other - input
-        torch::Tensor result1 = torch::rsub(input, other);
+        // 2. rsub with alpha: computes other - input * alpha
+        try {
+            torch::Tensor result2 = torch::rsub(input, other, alpha);
+            (void)result2;
+        } catch (const std::exception &) {
+            // Expected for incompatible tensors
+        }
         
-        // 2. rsub with alpha: other - input * alpha
-        torch::Tensor result2 = torch::rsub(input, other, alpha);
-        
-        // 3. rsub with scalar
-        torch::Tensor result3;
-        if (offset < Size) {
-            double scalar_value;
-            std::memcpy(&scalar_value, Data + offset, sizeof(double));
-            result3 = torch::rsub(input, scalar_value);
+        // 3. rsub with Scalar value
+        try {
+            double scalar_value = 5.0;
+            if (offset + sizeof(double) <= Size) {
+                std::memcpy(&scalar_value, Data + offset, sizeof(double));
+                offset += sizeof(double);
+                if (!std::isfinite(scalar_value)) {
+                    scalar_value = 5.0;
+                }
+            }
+            // rsub with scalar: scalar - input
+            torch::Tensor result3 = torch::rsub(input, torch::Scalar(scalar_value));
+            (void)result3;
+        } catch (const std::exception &) {
+            // Expected for some dtypes
         }
         
         // 4. rsub with scalar and alpha
-        torch::Tensor result4;
-        if (offset + sizeof(double) <= Size) {
-            double scalar_value;
-            std::memcpy(&scalar_value, Data + offset, sizeof(double));
-            result4 = torch::rsub(input, scalar_value, alpha);
-        }
-        
-        // 5. In-place version using assignment
-        if (other.sizes() == input.sizes() && other.dtype() == input.dtype()) {
-            try {
-                torch::Tensor input_copy = input.clone();
-                input_copy = torch::rsub(input_copy, other, alpha);
-            } catch (const std::exception &) {
-                // Ignore exceptions from in-place operations
-            }
-        }
-        
-        // 6. Test with extreme values for alpha
-        if (offset + sizeof(double) <= Size) {
-            double extreme_alpha;
-            std::memcpy(&extreme_alpha, Data + offset, sizeof(double));
-            // Make it potentially very large or very small
-            extreme_alpha = std::pow(10.0, extreme_alpha);
-            try {
-                torch::Tensor result_extreme = torch::rsub(input, other, extreme_alpha);
-            } catch (const std::exception &) {
-                // Ignore exceptions from extreme values
-            }
-        }
-        
-        // 7. Test with scalar tensors
         try {
-            if (input.numel() == 1) {
-                torch::Tensor scalar_result = torch::rsub(input, 5.0);
+            double scalar_value = 3.0;
+            if (offset + sizeof(double) <= Size) {
+                std::memcpy(&scalar_value, Data + offset, sizeof(double));
+                offset += sizeof(double);
+                if (!std::isfinite(scalar_value)) {
+                    scalar_value = 3.0;
+                }
             }
+            torch::Tensor result4 = torch::rsub(input, torch::Scalar(scalar_value), torch::Scalar(alpha));
+            (void)result4;
         } catch (const std::exception &) {
-            // Ignore exceptions
+            // Expected
+        }
+        
+        // 5. Test with different tensor types - broadcast scenario
+        try {
+            // Create a 1D tensor that can broadcast
+            auto options = torch::TensorOptions().dtype(input.dtype());
+            torch::Tensor broadcast_other = torch::ones({1}, options);
+            torch::Tensor result5 = torch::rsub(input, broadcast_other);
+            (void)result5;
+        } catch (const std::exception &) {
+            // Expected for some cases
+        }
+        
+        // 6. Test with zero-dimensional tensor (scalar tensor)
+        try {
+            auto options = torch::TensorOptions().dtype(input.dtype());
+            torch::Tensor scalar_tensor = torch::tensor(2.5, options);
+            torch::Tensor result6 = torch::rsub(input, scalar_tensor, alpha);
+            (void)result6;
+        } catch (const std::exception &) {
+            // Expected
+        }
+        
+        // 7. Test with same-shape tensors
+        try {
+            torch::Tensor same_shape = torch::ones_like(input);
+            torch::Tensor result7 = torch::rsub(input, same_shape);
+            (void)result7;
+        } catch (const std::exception &) {
+            // Expected
+        }
+        
+        // 8. Test with negative alpha
+        try {
+            torch::Tensor result8 = torch::rsub(input, other, -alpha);
+            (void)result8;
+        } catch (const std::exception &) {
+            // Expected
+        }
+        
+        // 9. Test rsub on integer tensors
+        try {
+            torch::Tensor int_input = input.to(torch::kInt32);
+            torch::Tensor int_other = torch::ones_like(int_input) * 10;
+            torch::Tensor result9 = torch::rsub(int_input, int_other);
+            (void)result9;
+        } catch (const std::exception &) {
+            // Expected for some cases
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

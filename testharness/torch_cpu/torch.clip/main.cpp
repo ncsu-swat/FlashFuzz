@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <limits>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -25,69 +31,144 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&min_val, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Handle NaN - replace with default
+            if (std::isnan(min_val)) min_val = -10.0;
         }
         
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&max_val, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Handle NaN - replace with default
+            if (std::isnan(max_val)) max_val = 10.0;
         }
         
-        // Test different variants of torch::clip
+        // Ensure min <= max for valid clipping
+        if (min_val > max_val) {
+            std::swap(min_val, max_val);
+        }
         
-        // Variant 1: clip with both min and max
-        torch::Tensor result1 = torch::clip(input, min_val, max_val);
+        // Variant 1: clip with both min and max using Scalars
+        try {
+            torch::Tensor result1 = torch::clip(input, 
+                c10::optional<at::Scalar>(min_val), 
+                c10::optional<at::Scalar>(max_val));
+        } catch (const std::exception &) {
+            // Shape or dtype issues - ignore
+        }
         
-        // Variant 2: clip with only min (max = None)
-        torch::Tensor result2 = torch::clip(input, min_val, std::numeric_limits<double>::infinity());
+        // Variant 2: clip with only min (max = nullopt)
+        try {
+            torch::Tensor result2 = torch::clip(input, 
+                c10::optional<at::Scalar>(min_val), 
+                c10::nullopt);
+        } catch (const std::exception &) {
+            // Ignore
+        }
         
-        // Variant 3: clip with only max (min = None)
-        torch::Tensor result3 = torch::clip(input, -std::numeric_limits<double>::infinity(), max_val);
+        // Variant 3: clip with only max (min = nullopt)
+        try {
+            torch::Tensor result3 = torch::clip(input, 
+                c10::nullopt, 
+                c10::optional<at::Scalar>(max_val));
+        } catch (const std::exception &) {
+            // Ignore
+        }
         
-        // Variant 4: in-place clipping
-        torch::Tensor input_copy = input.clone();
-        torch::Tensor result4 = torch::clip_(input_copy, min_val, max_val);
+        // Variant 4: in-place clipping using member function
+        try {
+            torch::Tensor input_copy = input.clone();
+            input_copy.clip_(
+                c10::optional<at::Scalar>(min_val), 
+                c10::optional<at::Scalar>(max_val));
+        } catch (const std::exception &) {
+            // Ignore
+        }
         
         // Variant 5: clip with tensor min/max values if we have enough data
-        if (offset < Size) {
+        if (offset + 4 < Size) {
             try {
                 torch::Tensor min_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                torch::Tensor max_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Ensure min_tensor and max_tensor are broadcastable to input
-                if (min_tensor.dim() <= input.dim() && max_tensor.dim() <= input.dim()) {
-                    torch::Tensor result5 = torch::clip(input, min_tensor, max_tensor);
+                if (offset + 4 < Size) {
+                    torch::Tensor max_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                    
+                    // Use the tensor overload
+                    torch::Tensor result5 = torch::clip(input, 
+                        c10::optional<at::Tensor>(min_tensor), 
+                        c10::optional<at::Tensor>(max_tensor));
                 }
             } catch (const std::exception &) {
-                // Ignore exceptions from creating additional tensors
+                // Ignore exceptions from tensor creation or shape mismatches
             }
         }
         
-        // Variant 6: clip with scalar Tensor min/max
-        torch::Tensor min_scalar = torch::tensor(min_val);
-        torch::Tensor max_scalar = torch::tensor(max_val);
-        torch::Tensor result6 = torch::clip(input, min_scalar, max_scalar);
-        
-        // Variant 7: clip with swapped min/max (should handle this gracefully)
-        if (min_val > max_val) {
-            torch::Tensor result7 = torch::clip(input, max_val, min_val);
+        // Variant 6: clip with scalar tensor min only
+        try {
+            torch::Tensor min_tensor = torch::tensor(min_val);
+            torch::Tensor result6 = torch::clip(input, 
+                c10::optional<at::Tensor>(min_tensor), 
+                c10::optional<at::Tensor>(c10::nullopt));
+        } catch (const std::exception &) {
+            // Ignore
         }
         
-        // Variant 8: clip with same min/max
-        if (offset + sizeof(double) <= Size) {
-            double same_val;
-            std::memcpy(&same_val, Data + offset, sizeof(double));
-            torch::Tensor result8 = torch::clip(input, same_val, same_val);
+        // Variant 7: clip with scalar tensor max only
+        try {
+            torch::Tensor max_tensor = torch::tensor(max_val);
+            torch::Tensor result7 = torch::clip(input, 
+                c10::optional<at::Tensor>(c10::nullopt), 
+                c10::optional<at::Tensor>(max_tensor));
+        } catch (const std::exception &) {
+            // Ignore
         }
         
-        // Variant 9: clip with extreme values
-        torch::Tensor result9 = torch::clip(input, 
-                                           -std::numeric_limits<double>::max(),
-                                           std::numeric_limits<double>::max());
+        // Variant 8: clip with same min/max (produces constant tensor)
+        try {
+            double same_val = (min_val + max_val) / 2.0;
+            torch::Tensor result8 = torch::clip(input, 
+                c10::optional<at::Scalar>(same_val), 
+                c10::optional<at::Scalar>(same_val));
+        } catch (const std::exception &) {
+            // Ignore
+        }
+        
+        // Variant 9: clip with integer scalars
+        try {
+            int64_t int_min = static_cast<int64_t>(min_val);
+            int64_t int_max = static_cast<int64_t>(max_val);
+            torch::Tensor result9 = torch::clip(input, 
+                c10::optional<at::Scalar>(int_min), 
+                c10::optional<at::Scalar>(int_max));
+        } catch (const std::exception &) {
+            // Ignore
+        }
+        
+        // Variant 10: clamp (alias for clip)
+        try {
+            torch::Tensor result10 = torch::clamp(input, 
+                c10::optional<at::Scalar>(min_val), 
+                c10::optional<at::Scalar>(max_val));
+        } catch (const std::exception &) {
+            // Ignore
+        }
+        
+        // Variant 11: clamp_min
+        try {
+            torch::Tensor result11 = torch::clamp_min(input, min_val);
+        } catch (const std::exception &) {
+            // Ignore
+        }
+        
+        // Variant 12: clamp_max
+        try {
+            torch::Tensor result12 = torch::clamp_max(input, max_val);
+        } catch (const std::exception &) {
+            // Ignore
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,94 +1,148 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <vector>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to create tensors
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
-        
-        // Determine number of tensors to create (1-4)
-        uint8_t num_tensors = (Size > 0) ? (Data[0] % 4) + 1 : 1;
-        offset++;
-        
-        // Create a vector to hold our tensors
+
+        size_t offset = 0;
+
+        // Determine number of tensors to create (2-4 for meaningful dstack)
+        uint8_t num_tensors = (Data[offset++] % 3) + 2;
+
+        // Parse common dimensions for compatible tensors
+        // dstack stacks along the third dimension, so dims 0 and 1 must match
+        uint8_t dim0 = (Data[offset++] % 4) + 1;  // 1-4
+        uint8_t dim1 = (Data[offset++] % 4) + 1;  // 1-4
+
+        // Parse dtype
+        auto dtype = fuzzer_utils::parseDataType(Data[offset++]);
+
+        // Create a vector to hold our tensors with compatible shapes
         std::vector<torch::Tensor> tensors;
-        
-        // Create tensors
+
         for (uint8_t i = 0; i < num_tensors && offset < Size; ++i) {
+            // Vary the third dimension (or create 1D/2D tensors that will be broadcast)
+            uint8_t tensor_type = Data[offset++] % 4;
+
+            torch::Tensor tensor;
             try {
-                torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                if (tensor_type == 0) {
+                    // 1D tensor (will be reshaped to 1 x 1 x len by dstack)
+                    int64_t len = dim0;
+                    tensor = torch::randn({len}, torch::TensorOptions().dtype(dtype));
+                } else if (tensor_type == 1) {
+                    // 2D tensor (will be reshaped to dim0 x dim1 x 1 by dstack)
+                    tensor = torch::randn({dim0, dim1}, torch::TensorOptions().dtype(dtype));
+                } else if (tensor_type == 2) {
+                    // 3D tensor with varying depth
+                    uint8_t dim2 = (offset < Size) ? (Data[offset++] % 4) + 1 : 1;
+                    tensor = torch::randn({dim0, dim1, dim2}, torch::TensorOptions().dtype(dtype));
+                } else {
+                    // 3D tensor with depth 1
+                    tensor = torch::randn({dim0, dim1, 1}, torch::TensorOptions().dtype(dtype));
+                }
                 tensors.push_back(tensor);
-            } catch (const std::exception& e) {
-                // If we can't create a tensor, just continue with what we have
-                break;
+            } catch (...) {
+                // Silently skip if tensor creation fails
+                continue;
             }
         }
-        
-        // Need at least one tensor to proceed
+
         if (tensors.empty()) {
             return 0;
         }
-        
-        // Apply torch.dstack operation
-        torch::Tensor result;
-        
-        // Test different scenarios based on number of tensors
-        if (tensors.size() == 1) {
-            // Single tensor case - dstack with itself in different ways
-            result = torch::dstack({tensors[0]});
-        } else {
-            // Multiple tensors case
-            result = torch::dstack(tensors);
-        }
-        
-        // Optional: Test edge cases with empty tensors if we have enough tensors
-        if (tensors.size() >= 2) {
-            // Create an empty tensor with same dtype as first tensor
-            std::vector<int64_t> empty_shape = {0};
-            torch::Tensor empty_tensor = torch::empty(empty_shape, tensors[0].options());
-            
-            // Try dstacking with an empty tensor
-            std::vector<torch::Tensor> tensors_with_empty = tensors;
-            tensors_with_empty.push_back(empty_tensor);
-            
-            torch::Tensor result_with_empty = torch::dstack(tensors_with_empty);
-        }
-        
-        // Test with tensors that have different dtypes if we have multiple tensors
-        if (tensors.size() >= 2 && offset + 1 < Size) {
-            uint8_t dtype_selector = Data[offset++];
-            auto new_dtype = fuzzer_utils::parseDataType(dtype_selector);
-            
-            // Convert one tensor to a different dtype
-            torch::Tensor converted = tensors[0].to(new_dtype);
-            std::vector<torch::Tensor> mixed_tensors = {converted};
-            
-            // Add the rest of the tensors
-            for (size_t i = 1; i < tensors.size(); ++i) {
-                mixed_tensors.push_back(tensors[i]);
-            }
-            
-            // Try dstacking tensors with mixed dtypes
+
+        // Test 1: dstack with single tensor
+        if (tensors.size() >= 1) {
             try {
-                torch::Tensor mixed_result = torch::dstack(mixed_tensors);
-            } catch (const std::exception& e) {
-                // Expected to potentially fail with dtype mismatch
+                torch::Tensor result = torch::dstack({tensors[0]});
+                (void)result;
+            } catch (...) {
+                // Shape issues possible, silently continue
             }
+        }
+
+        // Test 2: dstack with multiple tensors of same base shape
+        if (tensors.size() >= 2) {
+            // Create tensors with guaranteed compatible shapes
+            std::vector<torch::Tensor> compatible_tensors;
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                // Reshape all to 2D with same dim0 x dim1, let dstack handle the rest
+                try {
+                    torch::Tensor t = torch::randn({dim0, dim1}, torch::TensorOptions().dtype(dtype));
+                    compatible_tensors.push_back(t);
+                } catch (...) {
+                    continue;
+                }
+            }
+            if (compatible_tensors.size() >= 2) {
+                try {
+                    torch::Tensor result = torch::dstack(compatible_tensors);
+                    (void)result;
+                } catch (...) {
+                    // Silently handle
+                }
+            }
+        }
+
+        // Test 3: dstack with 1D tensors (special case - treated as 1x1xN after broadcast)
+        if (offset + 2 < Size) {
+            int64_t len = (Data[offset++] % 8) + 1;
+            std::vector<torch::Tensor> tensors_1d;
+            for (int i = 0; i < 3; ++i) {
+                tensors_1d.push_back(torch::randn({len}, torch::TensorOptions().dtype(dtype)));
+            }
+            try {
+                torch::Tensor result = torch::dstack(tensors_1d);
+                (void)result;
+            } catch (...) {
+                // Silently handle
+            }
+        }
+
+        // Test 4: dstack with 3D tensors of same dim0, dim1 but different dim2
+        if (offset + 4 < Size) {
+            std::vector<torch::Tensor> tensors_3d;
+            for (int i = 0; i < 3 && offset < Size; ++i) {
+                int64_t depth = (Data[offset++] % 5) + 1;
+                tensors_3d.push_back(torch::randn({dim0, dim1, depth}, torch::TensorOptions().dtype(dtype)));
+            }
+            if (tensors_3d.size() >= 2) {
+                try {
+                    torch::Tensor result = torch::dstack(tensors_3d);
+                    (void)result;
+                } catch (...) {
+                    // Silently handle
+                }
+            }
+        }
+
+        // Test 5: Use the original fuzzed tensors directly
+        try {
+            torch::Tensor result = torch::dstack(tensors);
+            (void)result;
+        } catch (...) {
+            // Shape mismatch expected, silently continue
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+
+    return 0;
 }

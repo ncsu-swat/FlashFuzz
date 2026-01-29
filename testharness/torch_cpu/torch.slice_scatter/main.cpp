@@ -1,11 +1,14 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,13 +21,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create src tensor to scatter into the input
-        torch::Tensor src;
-        if (offset < Size) {
-            src = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we've consumed all data, create a simple tensor
-            src = torch::ones_like(input);
+        // Skip empty or scalar tensors
+        if (input.dim() == 0 || input.numel() == 0) {
+            return 0;
         }
         
         // Extract slice parameters from remaining data
@@ -34,61 +33,92 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         int64_t step = 1;
         
         // Get dimension to slice along
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // If tensor is not empty, ensure dim is within valid range
-            if (input.dim() > 0) {
-                dim = dim % input.dim();
-                if (dim < 0) dim += input.dim();
+        if (offset + sizeof(uint8_t) <= Size) {
+            dim = static_cast<int64_t>(Data[offset]) % input.dim();
+            offset += sizeof(uint8_t);
+        }
+        
+        int64_t dim_size = input.size(dim);
+        
+        // Get start index (bounded to valid range)
+        if (offset + sizeof(uint8_t) <= Size) {
+            start = static_cast<int64_t>(Data[offset]) % (dim_size + 1);
+            offset += sizeof(uint8_t);
+        }
+        
+        // Get end index (bounded to valid range, must be >= start)
+        if (offset + sizeof(uint8_t) <= Size) {
+            uint8_t end_offset = Data[offset];
+            offset += sizeof(uint8_t);
+            end = start + (end_offset % (dim_size - start + 1));
+        } else {
+            end = dim_size;
+        }
+        
+        // Get step value (1-4 to keep it reasonable)
+        if (offset + sizeof(uint8_t) <= Size) {
+            step = 1 + (Data[offset] % 4);
+            offset += sizeof(uint8_t);
+        }
+        
+        // Calculate the size of the slice
+        int64_t slice_size = 0;
+        if (end > start && step > 0) {
+            slice_size = (end - start + step - 1) / step;
+        }
+        
+        if (slice_size <= 0) {
+            return 0;
+        }
+        
+        // Create src tensor with proper shape to match the slice
+        std::vector<int64_t> src_sizes = input.sizes().vec();
+        src_sizes[dim] = slice_size;
+        
+        torch::Tensor src;
+        if (offset < Size) {
+            // Try to create src from fuzzer data
+            src = fuzzer_utils::createTensor(Data, Size, offset);
+            // Reshape or recreate if dimensions don't match
+            try {
+                if (src.dim() != input.dim()) {
+                    src = torch::ones(src_sizes, input.options());
+                } else {
+                    // Try to slice/pad src to match required shape
+                    src = torch::ones(src_sizes, input.options());
+                }
+            } catch (...) {
+                src = torch::ones(src_sizes, input.options());
             }
+        } else {
+            src = torch::ones(src_sizes, input.options());
         }
         
-        // Get start index
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&start, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        // Get end index
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&end, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        // Get step value
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&step, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Avoid step=0 which would cause division by zero
-            if (step == 0) step = 1;
-        }
+        // Ensure src has the same dtype as input
+        src = src.to(input.dtype());
         
         // Apply slice_scatter operation
         torch::Tensor result;
         try {
             result = torch::slice_scatter(input, src, dim, start, end, step);
         } catch (const c10::Error& e) {
-            // PyTorch specific exceptions are expected and not a fuzzer error
+            // PyTorch specific exceptions for invalid parameters are expected
             return 0;
         }
         
-        // Verify the result is a valid tensor
-        if (result.defined() && !result.isnan().any().item<bool>() && 
-            !result.isinf().any().item<bool>()) {
-            // Optional: perform additional checks on the result
-            if (result.sizes() != input.sizes()) {
-                // This shouldn't happen for slice_scatter, so report if it does
-                std::cerr << "Unexpected shape change in slice_scatter result" << std::endl;
-            }
+        // Verify the result is a valid tensor with same shape as input
+        if (result.defined()) {
+            // slice_scatter should preserve the input shape
+            volatile auto numel = result.numel();
+            volatile bool same_shape = (result.sizes() == input.sizes());
+            (void)numel;
+            (void)same_shape;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

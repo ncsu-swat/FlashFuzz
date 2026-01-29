@@ -1,12 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 #include <torch/torch.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -47,13 +52,20 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     .keepdim(keepdim)
             );
             
-            auto output = pairwise_distance->forward(x1, x2);
+            try {
+                auto output = pairwise_distance->forward(x1, x2);
+            } catch (const c10::Error &e) {
+                // Shape mismatch or other expected errors
+            }
         }
         // Test CosineSimilarity module
         else if (module_selector % 3 == 1) {
             int64_t dim = param_byte % 4;
             if (x1.dim() > 0 && dim >= x1.dim()) {
                 dim = x1.dim() - 1;
+            }
+            if (dim < 0) {
+                dim = 0;
             }
             
             double eps = 1e-8;
@@ -64,7 +76,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     .eps(eps)
             );
             
-            auto output = cosine_similarity->forward(x1, x2);
+            try {
+                auto output = cosine_similarity->forward(x1, x2);
+            } catch (const c10::Error &e) {
+                // Shape mismatch or other expected errors
+            }
         }
         // Test CosineEmbeddingLoss module
         else {
@@ -87,11 +103,11 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     .reduction(reduction_enum)
             );
             
-            // Create target tensor with values -1 or 1
+            // Create target tensor with values -1 or 1 (must be float type)
             std::vector<int64_t> target_shape;
             if (x1.dim() > 0 && x2.dim() > 0) {
                 for (int i = 0; i < x1.dim() - 1; i++) {
-                    if (i < x1.sizes().size()) {
+                    if (i < static_cast<int>(x1.sizes().size())) {
                         target_shape.push_back(x1.size(i));
                     }
                 }
@@ -104,14 +120,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor target;
             if (offset < Size) {
                 // Use remaining data to create target values
-                std::vector<int64_t> target_values;
+                std::vector<float> target_values;
                 int64_t num_elements = 1;
-                for (auto dim : target_shape) {
-                    num_elements *= dim;
+                for (auto d : target_shape) {
+                    num_elements *= d;
                 }
                 
                 for (int64_t i = 0; i < num_elements && offset < Size; i++) {
-                    target_values.push_back(Data[offset++] % 2 == 0 ? 1 : -1);
+                    target_values.push_back(Data[offset++] % 2 == 0 ? 1.0f : -1.0f);
                 }
                 
                 if (!target_values.empty()) {
@@ -123,12 +139,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 target = torch::ones(target_shape);
             }
             
-            auto output = cosine_embedding_loss->forward(x1, x2, target);
+            try {
+                auto output = cosine_embedding_loss->forward(x1, x2, target);
+            } catch (const c10::Error &e) {
+                // Shape mismatch or other expected errors
+            }
         }
     }
     catch (const std::exception &e)
     {
-        return 0;
+        std::cerr << "Exception caught: " << e.what() << std::endl;
+        return -1;
     }
     return 0;
 }

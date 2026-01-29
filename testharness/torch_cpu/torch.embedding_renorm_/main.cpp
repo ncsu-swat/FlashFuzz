@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -27,50 +32,50 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
+        // Ensure weight is float type (embedding_renorm_ requires floating point)
+        if (!weight.is_floating_point()) {
+            weight = weight.to(torch::kFloat32);
+        }
+        
         // Extract parameters for embedding_renorm_
         // Get max_norm parameter (should be positive)
-        float max_norm = 0.0f;
+        float max_norm = 1.0f;
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&max_norm, Data + offset, sizeof(float));
             offset += sizeof(float);
-            // Ensure max_norm is positive (can be any positive value)
-            max_norm = std::abs(max_norm) + 1e-6f;
-        } else {
-            max_norm = 1.0f; // Default value
+            // Ensure max_norm is positive and finite
+            if (!std::isfinite(max_norm) || max_norm <= 0) {
+                max_norm = 1.0f;
+            }
         }
         
         // Get norm_type parameter
-        float norm_type = 0.0f;
+        float norm_type = 2.0f;
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&norm_type, Data + offset, sizeof(float));
             offset += sizeof(float);
-        } else {
-            norm_type = 2.0f; // Default to L2 norm
+            // Ensure norm_type is finite and reasonable (typically 1.0 or 2.0)
+            if (!std::isfinite(norm_type)) {
+                norm_type = 2.0f;
+            }
         }
         
         // Create indices tensor for which embeddings to renormalize
         std::vector<int64_t> indices_vec;
-        int num_indices = 0;
+        int num_indices = 1;
         
-        if (offset + sizeof(int) <= Size) {
-            std::memcpy(&num_indices, Data + offset, sizeof(int));
-            offset += sizeof(int);
-            
-            // Ensure num_indices is reasonable
-            num_indices = std::abs(num_indices) % 10 + 1;
-            
-            // Generate indices within the valid range
-            int64_t num_embeddings = weight.size(0);
-            
-            for (int i = 0; i < num_indices && offset + sizeof(int64_t) <= Size; i++) {
-                int64_t idx = 0;
-                std::memcpy(&idx, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
-                
-                // Ensure index is within bounds
-                idx = std::abs(idx) % std::max<int64_t>(1, num_embeddings);
-                indices_vec.push_back(idx);
-            }
+        if (offset + sizeof(uint8_t) <= Size) {
+            num_indices = (Data[offset] % 10) + 1;
+            offset += sizeof(uint8_t);
+        }
+        
+        // Generate indices within the valid range
+        int64_t num_embeddings = weight.size(0);
+        
+        for (int i = 0; i < num_indices && offset + sizeof(uint8_t) <= Size; i++) {
+            int64_t idx = Data[offset] % std::max<int64_t>(1, num_embeddings);
+            offset += sizeof(uint8_t);
+            indices_vec.push_back(idx);
         }
         
         // If we couldn't extract any indices, create a default one
@@ -81,24 +86,41 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create indices tensor
         torch::Tensor indices = torch::tensor(indices_vec, torch::kInt64);
         
-        // Apply embedding_renorm_
-        torch::embedding_renorm_(weight, indices, max_norm, norm_type);
+        // Apply embedding_renorm_ (in-place operation)
+        try {
+            torch::embedding_renorm_(weight, indices, max_norm, norm_type);
+        } catch (...) {
+            // Silently catch expected failures (shape mismatches, etc.)
+        }
         
         // Try with different parameters to increase coverage
-        if (offset + sizeof(float) <= Size) {
-            float new_max_norm;
-            std::memcpy(&new_max_norm, Data + offset, sizeof(float));
-            offset += sizeof(float);
-            new_max_norm = std::abs(new_max_norm) + 1e-6f;
+        if (offset + sizeof(uint8_t) <= Size) {
+            float new_max_norm = static_cast<float>(Data[offset] % 100 + 1) / 10.0f;
+            offset += sizeof(uint8_t);
             
-            // Try with different norm_type
-            float new_norm_type = 1.0f; // L1 norm
-            if (norm_type == 1.0f) {
-                new_norm_type = 2.0f; // L2 norm
+            // Try with different norm_type values
+            float norm_types[] = {1.0f, 2.0f, 0.5f, 3.0f};
+            int norm_idx = 0;
+            if (offset < Size) {
+                norm_idx = Data[offset] % 4;
+                offset++;
             }
             
-            // Apply with different parameters
-            torch::embedding_renorm_(weight, indices, new_max_norm, new_norm_type);
+            try {
+                torch::embedding_renorm_(weight, indices, new_max_norm, norm_types[norm_idx]);
+            } catch (...) {
+                // Silently catch expected failures
+            }
+        }
+        
+        // Test with contiguous weight tensor
+        if (offset < Size && !weight.is_contiguous()) {
+            try {
+                torch::Tensor contiguous_weight = weight.contiguous();
+                torch::embedding_renorm_(contiguous_weight, indices, max_norm, norm_type);
+            } catch (...) {
+                // Silently catch expected failures
+            }
         }
     }
     catch (const std::exception &e)

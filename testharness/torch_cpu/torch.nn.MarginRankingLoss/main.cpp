@@ -1,17 +1,22 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For std::isfinite
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to create tensors
-        if (Size < 3) {
+        // Need at least some data to create tensors and parameters
+        if (Size < 10) {
             return 0;
         }
         
@@ -25,18 +30,52 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Check if we have enough data left for the target tensor
-        if (offset >= Size) {
-            return 0;
+        // Ensure input1 and input2 have the same shape
+        // If shapes don't match, reshape input2 to match input1
+        if (input1.sizes() != input2.sizes()) {
+            try {
+                input2 = input2.reshape(input1.sizes());
+            } catch (...) {
+                // If reshape fails, create a tensor with matching size
+                input2 = torch::randn(input1.sizes());
+            }
         }
         
-        torch::Tensor target = fuzzer_utils::createTensor(Data, Size, offset);
+        // Create target tensor with values -1 or 1
+        // Target must have the same shape as inputs
+        torch::Tensor target;
+        if (offset < Size) {
+            // Use fuzzer data to determine target values
+            target = torch::empty(input1.sizes());
+            auto target_accessor = target.flatten();
+            int64_t num_elements = target_accessor.numel();
+            for (int64_t i = 0; i < num_elements && (offset + i) < Size; i++) {
+                // Map byte to -1 or 1
+                float val = (Data[(offset + i) % Size] % 2 == 0) ? -1.0f : 1.0f;
+                target_accessor[i] = val;
+            }
+            // Fill remaining elements if any
+            for (int64_t i = Size - offset; i < num_elements; i++) {
+                target_accessor[i] = (i % 2 == 0) ? -1.0f : 1.0f;
+            }
+            target = target_accessor.reshape(input1.sizes());
+            offset += std::min(static_cast<size_t>(num_elements), Size - offset);
+        } else {
+            // Default target with alternating -1 and 1
+            target = torch::ones(input1.sizes());
+        }
         
         // Get margin value from the remaining data
         float margin = 0.0f;
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&margin, Data + offset, sizeof(float));
             offset += sizeof(float);
+            // Clamp margin to reasonable range if not finite
+            if (!std::isfinite(margin)) {
+                margin = 0.0f;
+            }
+            // Clamp to reasonable range to avoid numerical issues
+            margin = std::max(-100.0f, std::min(100.0f, margin));
         }
         
         // Get reduction mode from the remaining data
@@ -45,34 +84,51 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             reduction_selector = Data[offset++];
         }
         
-        // Map reduction_selector to one of the three reduction modes
-        torch::nn::MarginRankingLossOptions::reduction_t reduction_mode;
+        // Create MarginRankingLoss module with different reduction modes
+        // Use torch::kNone, torch::kMean, torch::kSum for reduction_t type
+        torch::Tensor loss;
         switch (reduction_selector % 3) {
-            case 0:
-                reduction_mode = torch::kNone;
+            case 0: {
+                auto options = torch::nn::MarginRankingLossOptions()
+                                   .margin(margin)
+                                   .reduction(torch::kNone);
+                auto loss_fn = torch::nn::MarginRankingLoss(options);
+                loss = loss_fn(input1, input2, target);
                 break;
-            case 1:
-                reduction_mode = torch::kMean;
+            }
+            case 1: {
+                auto options = torch::nn::MarginRankingLossOptions()
+                                   .margin(margin)
+                                   .reduction(torch::kMean);
+                auto loss_fn = torch::nn::MarginRankingLoss(options);
+                loss = loss_fn(input1, input2, target);
                 break;
-            case 2:
-                reduction_mode = torch::kSum;
+            }
+            case 2: {
+                auto options = torch::nn::MarginRankingLossOptions()
+                                   .margin(margin)
+                                   .reduction(torch::kSum);
+                auto loss_fn = torch::nn::MarginRankingLoss(options);
+                loss = loss_fn(input1, input2, target);
                 break;
-            default:
-                reduction_mode = torch::kMean; // Default
+            }
+            default: {
+                auto options = torch::nn::MarginRankingLossOptions()
+                                   .margin(margin)
+                                   .reduction(torch::kMean);
+                auto loss_fn = torch::nn::MarginRankingLoss(options);
+                loss = loss_fn(input1, input2, target);
+                break;
+            }
         }
         
-        // Create MarginRankingLoss module with the margin and reduction mode
-        auto options = torch::nn::MarginRankingLossOptions()
-                           .margin(margin)
-                           .reduction(reduction_mode);
-        
-        auto loss_fn = torch::nn::MarginRankingLoss(options);
-        
-        // Apply the loss function
-        torch::Tensor loss = loss_fn(input1, input2, target);
-        
         // Ensure computation is performed
-        loss.item<float>();
+        if (loss.numel() == 1) {
+            loss.item<float>();
+        } else {
+            // For reduction=None, sum the result to force computation
+            loss.sum().item<float>();
+        }
     }
     catch (const std::exception &e)
     {

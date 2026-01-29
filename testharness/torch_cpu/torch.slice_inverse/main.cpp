@@ -1,99 +1,144 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <algorithm>      // For std::max
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <algorithm>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Create the source tensor (the "original" tensor shape we want to inverse into)
+        torch::Tensor src = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Extract parameters for slice_inverse
-        // We need: input, dim, start, end, step
+        if (src.dim() == 0 || src.numel() == 0) {
+            return 0;
+        }
         
-        // Get dim parameter (can be negative)
+        // Extract dim parameter
         int64_t dim = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + sizeof(int8_t) <= Size) {
+            int8_t dim_byte;
+            std::memcpy(&dim_byte, Data + offset, sizeof(int8_t));
+            offset += sizeof(int8_t);
+            dim = dim_byte % src.dim();
+            if (dim < 0) dim += src.dim();
         }
         
-        // Get start parameter (can be negative)
+        int64_t dim_size = src.size(dim);
+        if (dim_size == 0) {
+            return 0;
+        }
+        
+        // Extract start parameter
         int64_t start = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&start, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + sizeof(int16_t) <= Size) {
+            int16_t start_raw;
+            std::memcpy(&start_raw, Data + offset, sizeof(int16_t));
+            offset += sizeof(int16_t);
+            start = start_raw % (dim_size + 1);
+            if (start < 0) start += dim_size;
         }
         
-        // Get end parameter (can be negative)
-        int64_t end = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&end, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        // Extract end parameter  
+        int64_t end = dim_size;
+        if (offset + sizeof(int16_t) <= Size) {
+            int16_t end_raw;
+            std::memcpy(&end_raw, Data + offset, sizeof(int16_t));
+            offset += sizeof(int16_t);
+            end = end_raw % (dim_size + 1);
+            if (end < 0) end += dim_size;
         }
         
-        // Get step parameter (should be non-zero)
+        // Extract step parameter (must be positive non-zero)
         int64_t step = 1;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&step, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            if (step == 0) step = 1; // Avoid division by zero
+        if (offset + sizeof(uint8_t) <= Size) {
+            uint8_t step_raw;
+            std::memcpy(&step_raw, Data + offset, sizeof(uint8_t));
+            offset += sizeof(uint8_t);
+            step = (step_raw % 4) + 1; // step between 1-4
         }
         
-        // Create a values tensor to be inserted
-        torch::Tensor values;
-        if (offset < Size) {
-            values = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            // If we don't have enough data, create a simple tensor
-            values = torch::ones_like(input);
+        // Ensure start < end for positive step
+        if (start > end) {
+            std::swap(start, end);
         }
         
-        // Apply slice_inverse operation
+        // First perform a slice to get the shape of the sliced tensor
+        torch::Tensor sliced;
+        try {
+            sliced = torch::slice(src, dim, start, end, step);
+        } catch (...) {
+            return 0;
+        }
+        
+        if (sliced.numel() == 0) {
+            return 0;
+        }
+        
+        // Create input tensor with same shape as sliced tensor
+        // This is the tensor we want to "inverse" back
+        torch::Tensor input = torch::randn_like(sliced);
+        
+        // Apply slice_inverse: places input back into a src-shaped tensor
+        // at the positions corresponding to slice(src, dim, start, end, step)
         torch::Tensor result;
-        
-        // Handle potential edge cases
-        if (input.dim() > 0) {
-            // Normalize dim to be within valid range
-            if (dim < 0) {
-                dim = input.dim() + dim;
-            }
-            dim = dim % std::max(static_cast<int64_t>(1), input.dim());
-            
-            // Apply slice_inverse with optional parameters
-            std::optional<int64_t> start_opt = (start != 0) ? std::optional<int64_t>(start) : std::nullopt;
-            std::optional<int64_t> end_opt = (end != 0) ? std::optional<int64_t>(end) : std::nullopt;
-            
-            result = torch::slice_inverse(input, values, dim, start_opt, end_opt, step);
-        } else {
-            // For scalar tensors, just return the input as slice_inverse may not be applicable
-            result = input;
+        try {
+            result = torch::slice_inverse(input, src, dim, start, end, step);
+        } catch (const c10::Error &e) {
+            // Expected for some invalid parameter combinations
+            return 0;
         }
         
-        // Ensure the result is valid
-        if (result.defined()) {
-            // Access some elements to ensure computation is done
-            if (result.numel() > 0) {
-                auto sum = result.sum().item<float>();
-                (void)sum; // Prevent unused variable warning
+        // Verify result
+        if (result.defined() && result.numel() > 0) {
+            // Check result has same shape as src
+            if (result.sizes() != src.sizes()) {
+                std::cerr << "Shape mismatch in result!" << std::endl;
+            }
+            auto sum = result.sum().item<float>();
+            (void)sum;
+        }
+        
+        // Test with optional none values
+        if (offset < Size && (Data[offset % Size] & 0x1)) {
+            try {
+                auto result2 = torch::slice_inverse(input, src, dim, c10::nullopt, end, step);
+                if (result2.defined() && result2.numel() > 0) {
+                    auto s = result2.sum().item<float>();
+                    (void)s;
+                }
+            } catch (...) {
+                // Expected for some combinations
+            }
+        }
+        
+        if (offset < Size && (Data[offset % Size] & 0x2)) {
+            try {
+                auto result3 = torch::slice_inverse(input, src, dim, start, c10::nullopt, step);
+                if (result3.defined() && result3.numel() > 0) {
+                    auto s = result3.sum().item<float>();
+                    (void)s;
+                }
+            } catch (...) {
+                // Expected for some combinations
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

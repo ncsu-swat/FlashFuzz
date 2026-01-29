@@ -1,84 +1,118 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <torch/csrc/jit/frontend/parser.h>
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <torch/script.h>
+#include <torch/csrc/jit/ir/irparser.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least a few bytes to create a meaningful test
         if (Size < 4) {
             return 0;
         }
         
         // Create a string from the input data to use as IR
-        std::string ir_string;
-        if (Size > 0) {
-            // Use the data as a string, ensuring it's null-terminated
-            size_t string_length = std::min(Size, static_cast<size_t>(1024)); // Limit string size
-            ir_string = std::string(reinterpret_cast<const char*>(Data), string_length);
-        } else {
-            ir_string = "";
-        }
+        size_t string_length = std::min(Size, static_cast<size_t>(4096)); // Limit string size
+        std::string ir_string(reinterpret_cast<const char*>(Data), string_length);
         
-        // Try to parse the IR string
+        // Try to parse the IR string into a new graph
         try {
-            torch::jit::parseIR(ir_string, nullptr);
+            auto graph = std::make_shared<torch::jit::Graph>();
+            torch::jit::parseIR(ir_string, graph.get());
         } catch (...) {
-            // Parsing errors are expected for random data, just continue
+            // Parsing errors are expected for random/malformed data
         }
         
-        // Try with some additional context
+        // Try parsing with different string prefixes that might be valid IR
+        if (Size > 50) {
+            try {
+                // TorchScript IR typically starts with "graph"
+                std::string prefixed_ir = "graph():\n  " + ir_string;
+                auto graph = std::make_shared<torch::jit::Graph>();
+                torch::jit::parseIR(prefixed_ir, graph.get());
+            } catch (...) {
+                // Parsing errors are expected
+            }
+        }
+        
+        // Try with a more structured IR template
+        if (Size > 20) {
+            try {
+                // Create a simple graph structure with the fuzzed content as an operation
+                std::string structured_ir = "graph(%x : Tensor):\n";
+                
+                // Use first byte to select an operation type
+                uint8_t op_selector = Data[0] % 5;
+                switch (op_selector) {
+                    case 0:
+                        structured_ir += "  %r = aten::relu(%x)\n";
+                        break;
+                    case 1:
+                        structured_ir += "  %r = aten::sigmoid(%x)\n";
+                        break;
+                    case 2:
+                        structured_ir += "  %r = aten::tanh(%x)\n";
+                        break;
+                    case 3:
+                        structured_ir += "  %r = aten::neg(%x)\n";
+                        break;
+                    default:
+                        structured_ir += "  %r = aten::abs(%x)\n";
+                        break;
+                }
+                structured_ir += "  return (%r)\n";
+                
+                auto graph = std::make_shared<torch::jit::Graph>();
+                torch::jit::parseIR(structured_ir, graph.get());
+            } catch (...) {
+                // Parsing errors are expected
+            }
+        }
+        
+        // Try parsing with fuzzed graph structure
         if (Size > 100) {
             try {
-                // Create a simple module as context
-                auto module = std::make_shared<torch::jit::Module>();
-                torch::jit::parseIR(ir_string, module.get());
-            } catch (...) {
-                // Parsing errors are expected for random data, just continue
-            }
-        }
-        
-        // Try with different source name
-        if (Size > 200) {
-            try {
-                std::string source_name = "test_source";
-                if (Size > 220) {
-                    source_name = std::string(reinterpret_cast<const char*>(Data + 200), 
-                                             std::min(Size - 200, static_cast<size_t>(20)));
+                // Extract parts of fuzzed data for graph components
+                size_t name_len = std::min(static_cast<size_t>(Data[0] % 32 + 1), Size - 1);
+                std::string var_name(reinterpret_cast<const char*>(Data + 1), name_len);
+                
+                // Sanitize variable name (only alphanumeric and underscore)
+                for (char& c : var_name) {
+                    if (!std::isalnum(c) && c != '_') {
+                        c = '_';
+                    }
                 }
-                torch::jit::parseIR(ir_string, nullptr, source_name);
-            } catch (...) {
-                // Parsing errors are expected for random data, just continue
-            }
-        }
-        
-        // Try with a tensor as input
-        if (Size > 300) {
-            try {
-                // Create a tensor from the remaining data
-                torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                if (!var_name.empty() && std::isdigit(var_name[0])) {
+                    var_name[0] = 'v';
+                }
+                if (var_name.empty()) {
+                    var_name = "x";
+                }
                 
-                // Convert tensor to string representation and try to parse it
-                std::stringstream ss;
-                ss << tensor;
-                std::string tensor_str = ss.str();
+                std::string fuzzed_graph = "graph(%" + var_name + " : Tensor):\n";
+                fuzzed_graph += "  %out = aten::clone(%" + var_name + ")\n";
+                fuzzed_graph += "  return (%out)\n";
                 
-                torch::jit::parseIR(tensor_str, nullptr);
+                auto graph = std::make_shared<torch::jit::Graph>();
+                torch::jit::parseIR(fuzzed_graph, graph.get());
             } catch (...) {
-                // Errors are expected, just continue
+                // Parsing errors are expected
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
+    return 0;
 }

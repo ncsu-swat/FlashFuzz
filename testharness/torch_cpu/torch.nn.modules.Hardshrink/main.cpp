@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -20,61 +25,87 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Extract lambda parameter for Hardshrink if we have more data
         double lambda = 0.5; // Default value
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&lambda, Data + offset, sizeof(double));
-            offset += sizeof(double);
+        if (offset + sizeof(float) <= Size) {
+            float lambda_f;
+            std::memcpy(&lambda_f, Data + offset, sizeof(float));
+            offset += sizeof(float);
             
-            // Ensure lambda is a reasonable value
-            lambda = std::abs(lambda);
-            if (std::isnan(lambda) || std::isinf(lambda)) {
-                lambda = 0.5;
+            // Ensure lambda is a reasonable positive value
+            if (!std::isnan(lambda_f) && !std::isinf(lambda_f)) {
+                lambda = std::abs(static_cast<double>(lambda_f));
+                // Clamp to reasonable range
+                if (lambda > 100.0) lambda = 100.0;
             }
         }
         
-        // Create Hardshrink module with the lambda parameter
-        torch::nn::Hardshrink hardshrink_module(lambda);
+        // Create Hardshrink module with the lambda parameter using options
+        torch::nn::Hardshrink hardshrink_module(torch::nn::HardshrinkOptions().lambda(lambda));
         
         // Apply Hardshrink operation
         torch::Tensor output = hardshrink_module->forward(input);
         
         // Try functional version as well
-        torch::Tensor output_functional = torch::hardshrink(input, lambda);
-        
-        // Try inplace version if available
-        if (offset < Size && Data[offset] % 2 == 0) {
-            torch::Tensor input_clone = input.clone();
-            input_clone = torch::hardshrink(input_clone, lambda);
+        try {
+            torch::Tensor output_functional = torch::hardshrink(input, lambda);
+        } catch (...) {
+            // Silently catch expected failures
         }
         
         // Try with different lambda values if we have more data
-        if (offset + sizeof(double) <= Size) {
-            double another_lambda;
-            std::memcpy(&another_lambda, Data + offset, sizeof(double));
-            offset += sizeof(double);
+        if (offset + sizeof(float) <= Size) {
+            float another_lambda_f;
+            std::memcpy(&another_lambda_f, Data + offset, sizeof(float));
+            offset += sizeof(float);
             
-            // Ensure lambda is a reasonable value
-            another_lambda = std::abs(another_lambda);
-            if (!std::isnan(another_lambda) && !std::isinf(another_lambda)) {
-                torch::nn::Hardshrink another_hardshrink(another_lambda);
-                torch::Tensor another_output = another_hardshrink->forward(input);
+            double another_lambda = std::abs(static_cast<double>(another_lambda_f));
+            if (!std::isnan(another_lambda_f) && !std::isinf(another_lambda_f) && another_lambda <= 100.0) {
+                try {
+                    torch::nn::Hardshrink another_hardshrink(
+                        torch::nn::HardshrinkOptions().lambda(another_lambda));
+                    torch::Tensor another_output = another_hardshrink->forward(input);
+                } catch (...) {
+                    // Silently catch expected failures
+                }
             }
         }
         
         // Try with zero lambda
-        torch::nn::Hardshrink zero_hardshrink(0.0);
-        torch::Tensor zero_output = zero_hardshrink->forward(input);
+        try {
+            torch::nn::Hardshrink zero_hardshrink(torch::nn::HardshrinkOptions().lambda(0.0));
+            torch::Tensor zero_output = zero_hardshrink->forward(input);
+        } catch (...) {
+            // Silently catch expected failures
+        }
         
-        // Try with negative lambda (should be handled by abs() in the implementation)
-        if (offset < Size) {
-            double neg_lambda = -1.0 * std::abs(static_cast<double>(Data[offset]));
-            torch::nn::Hardshrink neg_hardshrink(neg_lambda);
-            torch::Tensor neg_output = neg_hardshrink->forward(input);
+        // Try with default options
+        try {
+            torch::nn::Hardshrink default_hardshrink;
+            torch::Tensor default_output = default_hardshrink->forward(input);
+        } catch (...) {
+            // Silently catch expected failures
+        }
+        
+        // Test with different tensor types
+        if (offset < Size && input.numel() > 0) {
+            try {
+                torch::Tensor float_input = input.to(torch::kFloat32);
+                torch::Tensor float_output = hardshrink_module->forward(float_input);
+            } catch (...) {
+                // Silently catch expected failures
+            }
+            
+            try {
+                torch::Tensor double_input = input.to(torch::kFloat64);
+                torch::Tensor double_output = hardshrink_module->forward(double_input);
+            } catch (...) {
+                // Silently catch expected failures
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

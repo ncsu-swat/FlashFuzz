@@ -7,7 +7,12 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -97,14 +102,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     
                     // If create_graph is true, we can compute higher-order gradients
                     if (create_graph && sum.requires_grad()) {
-                        auto grad_grad = torch::autograd::grad(
-                            {sum},
-                            {input},
-                            {},
-                            false,
-                            retain_graph,
-                            allow_unused
-                        );
+                        try {
+                            auto grad_grad = torch::autograd::grad(
+                                {sum},
+                                {input},
+                                {},
+                                false,
+                                retain_graph,
+                                allow_unused
+                            );
+                        } catch (...) {
+                            // Higher-order gradient computation may fail
+                        }
                     }
                 }
             } catch (const c10::Error& e) {

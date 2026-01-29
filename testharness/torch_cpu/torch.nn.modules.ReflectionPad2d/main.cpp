@@ -1,88 +1,102 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least a few bytes to create a tensor
-        if (Size < 4) {
+        // Need enough bytes for configuration
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Extract padding values from the remaining data
-        std::vector<int64_t> padding;
-        for (int i = 0; i < 4 && offset + sizeof(int64_t) <= Size; i++) {
-            int64_t pad_value;
-            std::memcpy(&pad_value, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // No need to restrict padding to positive values - let the API handle it
-            padding.push_back(pad_value);
-        }
+        // Extract dimensions for a 4D tensor (N, C, H, W)
+        uint8_t batch = (Data[offset++] % 4) + 1;      // 1-4
+        uint8_t channels = (Data[offset++] % 4) + 1;   // 1-4
+        uint8_t height = (Data[offset++] % 16) + 4;    // 4-19 (need room for padding)
+        uint8_t width = (Data[offset++] % 16) + 4;     // 4-19 (need room for padding)
         
-        // If we don't have enough data for 4 padding values, use defaults
-        while (padding.size() < 4) {
-            // Use the next byte as padding if available
-            if (offset < Size) {
-                padding.push_back(static_cast<int64_t>(Data[offset++]));
-            } else {
-                padding.push_back(1); // Default padding
+        // Extract padding values - must be <= min dimension for reflection
+        uint8_t pad_left = Data[offset++] % (width / 2 + 1);
+        uint8_t pad_right = Data[offset++] % (width / 2 + 1);
+        uint8_t pad_top = Data[offset++] % (height / 2 + 1);
+        uint8_t pad_bottom = Data[offset++] % (height / 2 + 1);
+        
+        // Create 4D input tensor suitable for ReflectionPad2d
+        torch::Tensor input = torch::randn({batch, channels, height, width});
+        
+        // Mix in some fuzzer data if available
+        if (offset + sizeof(float) <= Size) {
+            float scale;
+            std::memcpy(&scale, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            if (std::isfinite(scale) && std::abs(scale) < 100.0f) {
+                input = input * scale;
             }
         }
         
         // Create ReflectionPad2d module with different configurations
         torch::nn::ReflectionPad2d pad_module = nullptr;
         
-        // Use a byte to determine which constructor to use
-        if (offset < Size) {
-            uint8_t constructor_choice = Data[offset++];
-            
-            if (constructor_choice % 2 == 0) {
-                // Use the constructor with a single padding value
-                int64_t single_pad = padding[0];
-                pad_module = torch::nn::ReflectionPad2d(single_pad);
-            } else {
-                // Use the constructor with separate padding values
-                pad_module = torch::nn::ReflectionPad2d(
-                    torch::nn::ReflectionPad2dOptions(padding));
-            }
-        } else {
-            // Default to using all four padding values
+        uint8_t constructor_choice = (offset < Size) ? Data[offset++] : 0;
+        
+        if (constructor_choice % 3 == 0 && pad_left == pad_right && pad_top == pad_bottom && pad_left == pad_top) {
+            // Use single padding value constructor (uniform padding)
+            pad_module = torch::nn::ReflectionPad2d(static_cast<int64_t>(pad_left));
+        } else if (constructor_choice % 3 == 1) {
+            // Use vector of 4 values: {left, right, top, bottom}
+            std::vector<int64_t> padding = {pad_left, pad_right, pad_top, pad_bottom};
             pad_module = torch::nn::ReflectionPad2d(
                 torch::nn::ReflectionPad2dOptions(padding));
+        } else {
+            // Use expand_as_needed style with tuple
+            pad_module = torch::nn::ReflectionPad2d(
+                torch::nn::ReflectionPad2dOptions({pad_left, pad_right, pad_top, pad_bottom}));
         }
         
         // Apply the padding operation
         torch::Tensor output = pad_module->forward(input);
         
-        // Access some properties of the output tensor to ensure it's computed
+        // Verify output dimensions
         auto output_sizes = output.sizes();
-        auto output_dtype = output.dtype();
         
-        // Try to access the first element if tensor is not empty
+        // Access output to ensure computation
         if (output.numel() > 0) {
-            auto first_element = output.flatten()[0];
-        }
-        
-        // Try to perform additional operations on the output
-        if (output.numel() > 0) {
+            torch::Tensor flattened = output.flatten();
+            auto first_element = flattened[0].item<float>();
+            (void)first_element;
+            
+            // Additional operations to improve coverage
             torch::Tensor squared = output * output;
             torch::Tensor summed = torch::sum(output);
+            (void)summed;
+        }
+        
+        // Test with 3D input as well (C, H, W)
+        if (offset < Size && Data[offset] % 2 == 0) {
+            torch::Tensor input_3d = torch::randn({channels, height, width});
+            try {
+                torch::Tensor output_3d = pad_module->forward(input_3d);
+                (void)output_3d.sizes();
+            } catch (...) {
+                // 3D input might fail in some configurations, that's expected
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

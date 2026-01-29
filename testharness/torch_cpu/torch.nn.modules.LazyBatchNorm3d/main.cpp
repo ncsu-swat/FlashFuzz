@@ -1,11 +1,14 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,73 +18,25 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Determine dimensions from fuzzer data
+        int64_t batch_size = (Data[offset++] % 8) + 1;
+        int64_t num_channels = (Data[offset++] % 64) + 1;
+        int64_t depth = (Data[offset++] % 8) + 1;
+        int64_t height = (Data[offset++] % 8) + 1;
+        int64_t width = (Data[offset++] % 8) + 1;
         
-        // Ensure the input tensor has 5 dimensions (N, C, D, H, W) for BatchNorm3d
-        // If not, reshape it to a 5D tensor
-        if (input.dim() != 5) {
-            // Extract values to determine new shape
-            uint8_t num_features = 0;
-            if (offset < Size) {
-                num_features = Data[offset++] % 64 + 1; // Ensure at least 1 feature
-            } else {
-                num_features = 3; // Default
-            }
-            
-            // Create a new shape with 5 dimensions
-            std::vector<int64_t> new_shape;
-            
-            // Batch size
-            int64_t batch_size = 1;
-            if (offset < Size) {
-                batch_size = (Data[offset++] % 8) + 1;
-            }
-            new_shape.push_back(batch_size);
-            
-            // Channels (num_features)
-            new_shape.push_back(num_features);
-            
-            // Depth, Height, Width
-            for (int i = 0; i < 3; i++) {
-                int64_t dim_size = 2;
-                if (offset < Size) {
-                    dim_size = (Data[offset++] % 8) + 1;
-                }
-                new_shape.push_back(dim_size);
-            }
-            
-            // Reshape or create new tensor
-            if (input.numel() > 0) {
-                // Calculate total elements in new shape
-                int64_t total_elements = 1;
-                for (const auto& dim : new_shape) {
-                    total_elements *= dim;
-                }
-                
-                // If original tensor has enough elements, reshape it
-                if (input.numel() >= total_elements) {
-                    input = input.reshape(new_shape);
-                } else {
-                    // Create new tensor with the desired shape
-                    input = torch::ones(new_shape, input.options());
-                }
-            } else {
-                // Create new tensor with the desired shape
-                input = torch::ones(new_shape, input.options());
-            }
-        }
+        // Create input tensor with 5 dimensions (N, C, D, H, W) for BatchNorm3d
+        std::vector<int64_t> input_shape = {batch_size, num_channels, depth, height, width};
+        torch::Tensor input = torch::randn(input_shape);
         
-        // Get number of features (channels dimension)
-        int64_t num_features = input.size(1);
-        
-        // Create BatchNorm3d module (LazyBatchNorm3d doesn't exist, use regular BatchNorm3d)
-        auto bn_options = torch::nn::BatchNorm3dOptions(num_features);
+        // Create BatchNorm3d module options
+        // Note: LazyBatchNorm3d is not available in C++ API, using BatchNorm3d instead
+        auto bn_options = torch::nn::BatchNorm3dOptions(num_channels);
         
         // Configure module parameters based on remaining data
         if (offset + 3 < Size) {
             // Set eps (small value added to variance for numerical stability)
-            double eps = static_cast<double>(Data[offset++]) / 255.0 * 0.1;
+            double eps = static_cast<double>(Data[offset++]) / 255.0 * 0.1 + 1e-5;
             bn_options.eps(eps);
             
             // Set momentum
@@ -102,30 +57,73 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Apply the BatchNorm3d to the input tensor
         torch::Tensor output = bn->forward(input);
         
-        // Test the module in training and evaluation modes
+        // Verify output shape matches input shape
+        if (output.sizes() != input.sizes()) {
+            std::cerr << "Shape mismatch after forward" << std::endl;
+        }
+        
+        // Test the module in training mode
         bn->train();
         torch::Tensor output_train = bn->forward(input);
         
+        // Test in evaluation mode
         bn->eval();
         torch::Tensor output_eval = bn->forward(input);
         
-        // Test with different data types if possible
-        if (offset < Size && input.scalar_type() != torch::kHalf && input.scalar_type() != torch::kBFloat16) {
-            // Try with float16 if available
+        // Test with a second input of same channel dimension but different spatial dims
+        if (offset + 3 < Size) {
+            std::vector<int64_t> new_shape2;
+            new_shape2.push_back((Data[offset++] % 4) + 1);  // batch
+            new_shape2.push_back(num_channels);  // same channels
+            new_shape2.push_back((Data[offset++] % 8) + 1);  // D
+            new_shape2.push_back((Data[offset++] % 8) + 1);  // H
+            new_shape2.push_back((Data[offset++] % 8) + 1);  // W
+            
+            torch::Tensor input2 = torch::randn(new_shape2);
+            torch::Tensor output2 = bn->forward(input2);
+        }
+        
+        // Test double precision
+        try {
+            auto input_double = torch::randn(input_shape, torch::kFloat64);
+            torch::nn::BatchNorm3d bn_double(torch::nn::BatchNorm3dOptions(num_channels));
+            auto output_double = bn_double->forward(input_double);
+        } catch (...) {
+            // Ignore errors with double precision
+        }
+        
+        // Test half precision if available
+        try {
+            auto input_half = torch::randn(input_shape, torch::kFloat16);
+            torch::nn::BatchNorm3d bn_half(torch::nn::BatchNorm3dOptions(num_channels));
+            auto output_half = bn_half->forward(input_half);
+        } catch (...) {
+            // Ignore errors with half precision
+        }
+        
+        // Test with different input using createTensor from fuzzer
+        torch::Tensor fuzz_input = fuzzer_utils::createTensor(Data, Size, offset);
+        if (fuzz_input.numel() > 0) {
+            // Reshape to 5D with matching channels
+            int64_t total = fuzz_input.numel();
+            int64_t spatial = std::max<int64_t>(1, total / num_channels);
+            int64_t side = std::max<int64_t>(1, static_cast<int64_t>(std::cbrt(spatial)));
+            
             try {
-                auto input_fp16 = input.to(torch::kHalf);
-                auto bn_fp16_options = torch::nn::BatchNorm3dOptions(num_features);
-                torch::nn::BatchNorm3d bn_fp16(bn_fp16_options);
-                auto output_fp16 = bn_fp16->forward(input_fp16);
+                auto reshaped = fuzz_input.reshape({1, num_channels, side, side, side});
+                if (!reshaped.is_floating_point()) {
+                    reshaped = reshaped.to(torch::kFloat32);
+                }
+                auto fuzz_output = bn->forward(reshaped);
             } catch (...) {
-                // Ignore errors with half precision
+                // Shape may not work out, ignore
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -17,18 +21,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Get the number of dimensions
         int64_t ndim = input_tensor.dim();
         
+        // Handle scalar case (0-dim tensor)
+        if (ndim == 0) {
+            try {
+                torch::Tensor output = input_tensor.permute({});
+                // Scalar permute should return the same tensor
+            } catch (...) {
+                // Expected for some edge cases
+            }
+            return 0;
+        }
+        
         // Create permutation dimensions
         std::vector<int64_t> permutation;
         
         // Parse permutation dimensions from the input data
         for (int64_t i = 0; i < ndim && offset < Size; ++i) {
-            // Use the next byte to determine a dimension index
             if (offset < Size) {
                 int64_t dim_idx = static_cast<int64_t>(Data[offset++]) % ndim;
                 
                 // Check if this dimension is already in the permutation
                 bool already_exists = false;
-                for (int64_t j = 0; j < permutation.size(); ++j) {
+                for (size_t j = 0; j < permutation.size(); ++j) {
                     if (permutation[j] == dim_idx) {
                         already_exists = true;
                         break;
@@ -42,25 +56,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // If we didn't get a complete permutation, fill in the missing dimensions
-        if (permutation.size() < ndim) {
-            for (int64_t i = 0; i < ndim; ++i) {
-                bool exists = false;
-                for (int64_t j = 0; j < permutation.size(); ++j) {
-                    if (permutation[j] == i) {
-                        exists = true;
-                        break;
-                    }
+        // Fill in the missing dimensions to ensure a complete permutation
+        for (int64_t i = 0; i < ndim; ++i) {
+            bool exists = false;
+            for (size_t j = 0; j < permutation.size(); ++j) {
+                if (permutation[j] == i) {
+                    exists = true;
+                    break;
                 }
-                if (!exists) {
-                    permutation.push_back(i);
-                }
+            }
+            if (!exists) {
+                permutation.push_back(i);
             }
         }
         
-        // Also test with negative indices
-        if (offset < Size && Data[offset++] % 2 == 0 && !permutation.empty()) {
-            for (int64_t i = 0; i < permutation.size() && offset < Size; ++i) {
+        // Test with negative indices sometimes
+        if (offset < Size && Data[offset++] % 2 == 0) {
+            for (size_t i = 0; i < permutation.size() && offset < Size; ++i) {
                 if (Data[offset++] % 3 == 0) {
                     permutation[i] = permutation[i] - ndim; // Convert to negative index
                 }
@@ -71,77 +83,90 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::Tensor output;
         
         // Test different ways to call permute
+        uint8_t call_type = 1; // default
         if (offset < Size) {
-            uint8_t call_type = Data[offset++] % 3;
-            
-            switch (call_type) {
-                case 0: {
-                    // Call permute with individual dimensions
-                    if (ndim == 0) {
-                        output = input_tensor.permute({}); // Scalar case
-                    } else if (ndim == 1) {
-                        output = input_tensor.permute({permutation[0]});
-                    } else if (ndim == 2) {
-                        output = input_tensor.permute({permutation[0], permutation[1]});
-                    } else if (ndim == 3) {
-                        output = input_tensor.permute({permutation[0], permutation[1], permutation[2]});
-                    } else {
-                        output = input_tensor.permute({permutation[0], permutation[1], permutation[2], permutation[3]});
-                    }
-                    break;
-                }
-                case 1: {
-                    // Call permute with vector of dimensions
-                    output = input_tensor.permute(permutation);
-                    break;
-                }
-                case 2: {
-                    // Call permute with IntArrayRef
-                    output = input_tensor.permute(c10::IntArrayRef(permutation));
-                    break;
-                }
+            call_type = Data[offset++] % 3;
+        }
+        
+        switch (call_type) {
+            case 0: {
+                // Call permute with IntArrayRef from vector
+                output = input_tensor.permute(c10::IntArrayRef(permutation));
+                break;
             }
-        } else {
-            // Default case if we don't have enough data
-            output = input_tensor.permute(permutation);
+            case 1: {
+                // Call permute with vector of dimensions
+                output = input_tensor.permute(permutation);
+                break;
+            }
+            case 2: {
+                // Test torch::permute function
+                output = torch::permute(input_tensor, permutation);
+                break;
+            }
+            default: {
+                output = input_tensor.permute(permutation);
+                break;
+            }
         }
         
         // Verify the output has the expected shape
         auto input_sizes = input_tensor.sizes().vec();
         auto output_sizes = output.sizes().vec();
         
-        if (input_sizes.size() != output_sizes.size()) {
-            throw std::runtime_error("Input and output tensor dimensions don't match");
+        if (static_cast<int64_t>(input_sizes.size()) != ndim || 
+            static_cast<int64_t>(output_sizes.size()) != ndim) {
+            throw std::runtime_error("Dimension count mismatch");
         }
         
+        // Verify shape consistency
         for (size_t i = 0; i < permutation.size(); ++i) {
             int64_t perm_idx = permutation[i];
             if (perm_idx < 0) perm_idx += ndim;
             
-            if (perm_idx >= 0 && perm_idx < ndim && i < output_sizes.size() && perm_idx < input_sizes.size()) {
+            if (perm_idx >= 0 && perm_idx < ndim) {
                 if (output_sizes[i] != input_sizes[perm_idx]) {
                     throw std::runtime_error("Output shape doesn't match expected permutation");
                 }
             }
         }
         
-        // Test that permute is correctly implemented by checking data consistency
+        // Test contiguous operation on permuted tensor
         if (!output.is_contiguous()) {
             auto contiguous_output = output.contiguous();
+            (void)contiguous_output; // Use the result
+        }
+        
+        // Test double permute (should be reversible)
+        if (offset < Size && Data[offset++] % 4 == 0) {
+            // Create inverse permutation
+            std::vector<int64_t> inverse_perm(ndim);
+            for (int64_t i = 0; i < ndim; ++i) {
+                int64_t perm_idx = permutation[i];
+                if (perm_idx < 0) perm_idx += ndim;
+                inverse_perm[perm_idx] = i;
+            }
             
-            // Verify some elements to ensure data is correctly permuted
-            if (output.numel() > 0) {
-                // Check first element
-                if (input_tensor.item<float>() != output.item<float>()) {
-                    throw std::runtime_error("First element mismatch after permute");
+            try {
+                torch::Tensor restored = output.permute(inverse_perm);
+                // Verify shapes match original
+                if (restored.sizes() != input_tensor.sizes()) {
+                    throw std::runtime_error("Inverse permutation failed");
                 }
+            } catch (...) {
+                // Silently catch - inverse permutation edge cases
             }
         }
+        
+        // Exercise stride information
+        auto strides = output.strides();
+        (void)strides;
+        
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

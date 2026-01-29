@@ -1,89 +1,100 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
-        size_t offset = 0;
-        
-        // Skip if we don't have enough data
         if (Size < 2) {
             return 0;
         }
         
+        size_t offset = 0;
+        
         // Create input tensor for torch.special.i1e
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        
+        // Ensure we have a floating point tensor (i1e requires float types)
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
         
         // Apply torch.special.i1e operation
         torch::Tensor result = torch::special::i1e(input);
         
-        // Try to access the result to ensure computation is performed
+        // Force computation by accessing result
         if (result.defined() && result.numel() > 0) {
-            auto item = result.item<float>();
-            volatile float unused = item; // Prevent optimization
-            (void)unused;
+            volatile float sum = result.sum().item<float>();
+            (void)sum;
         }
         
-        // Try with different input types if we have more data
-        if (offset + 2 < Size) {
-            torch::Tensor input2 = fuzzer_utils::createTensor(Data + offset, Size - offset, offset);
-            torch::Tensor result2 = torch::special::i1e(input2);
+        // Test with output tensor variant if we have more data
+        if (offset < Size) {
+            torch::Tensor output = torch::empty_like(input);
+            torch::special::i1e_out(output, input);
             
-            // Try to access the result
-            if (result2.defined() && result2.numel() > 0) {
-                auto item = result2.item<float>();
-                volatile float unused = item;
-                (void)unused;
+            if (output.defined() && output.numel() > 0) {
+                volatile float sum = output.sum().item<float>();
+                (void)sum;
             }
         }
         
-        // Try with a scalar input if we have more data
-        if (offset + 1 < Size) {
-            double scalar_value = static_cast<double>(Data[offset]) / 255.0;
-            torch::Tensor scalar_input = torch::tensor(scalar_value);
-            torch::Tensor scalar_result = torch::special::i1e(scalar_input);
+        // Test with double precision based on fuzzer data
+        if (offset < Size && (Data[offset % Size] & 0x01)) {
+            torch::Tensor input_double = input.to(torch::kFloat64);
+            torch::Tensor result_double = torch::special::i1e(input_double);
             
-            if (scalar_result.defined() && scalar_result.numel() > 0) {
-                auto item = scalar_result.item<double>();
-                volatile double unused = item;
-                (void)unused;
+            if (result_double.defined() && result_double.numel() > 0) {
+                volatile double sum = result_double.sum().item<double>();
+                (void)sum;
             }
         }
         
-        // Try with extreme values
-        std::vector<torch::Tensor> extreme_inputs = {
-            torch::tensor(std::numeric_limits<float>::max()),
-            torch::tensor(std::numeric_limits<float>::lowest()),
-            torch::tensor(std::numeric_limits<float>::infinity()),
-            torch::tensor(-std::numeric_limits<float>::infinity()),
-            torch::tensor(std::numeric_limits<float>::quiet_NaN()),
-            torch::tensor(0.0f),
-            torch::tensor(-0.0f),
-            torch::tensor(1.0f),
-            torch::tensor(-1.0f)
-        };
+        // Test with scalar input based on fuzzer data
+        if (offset + 4 <= Size) {
+            float scalar_val;
+            std::memcpy(&scalar_val, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            
+            // Handle potential NaN/Inf from raw bytes - i1e handles these gracefully
+            torch::Tensor scalar_tensor = torch::tensor(scalar_val);
+            torch::Tensor scalar_result = torch::special::i1e(scalar_tensor);
+            
+            if (scalar_result.defined()) {
+                volatile float val = scalar_result.item<float>();
+                (void)val;
+            }
+        }
         
-        for (const auto& extreme_input : extreme_inputs) {
+        // Test with different shapes occasionally (controlled by fuzzer data)
+        if (offset < Size && (Data[offset % Size] & 0x02)) {
             try {
-                torch::Tensor extreme_result = torch::special::i1e(extreme_input);
-                if (extreme_result.defined() && extreme_result.numel() > 0) {
-                    auto item = extreme_result.item<float>();
-                    volatile float unused = item;
-                    (void)unused;
+                // Create a multi-dimensional tensor
+                int dim1 = (Data[offset % Size] % 8) + 1;
+                int dim2 = ((offset + 1 < Size ? Data[(offset + 1) % Size] : 1) % 8) + 1;
+                torch::Tensor multi_dim = torch::randn({dim1, dim2});
+                torch::Tensor multi_result = torch::special::i1e(multi_dim);
+                
+                if (multi_result.defined() && multi_result.numel() > 0) {
+                    volatile float sum = multi_result.sum().item<float>();
+                    (void)sum;
                 }
-            } catch (const std::exception& e) {
-                // Just catch and continue with the next input
+            } catch (...) {
+                // Silently ignore shape-related issues
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

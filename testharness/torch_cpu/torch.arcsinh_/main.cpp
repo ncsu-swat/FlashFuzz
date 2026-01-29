@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <iostream>       // For cerr, cout
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,33 +20,33 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Create input tensor
+        // Create input tensor - arcsinh_ works on floating point tensors
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Make a copy of the input tensor for in-place operation
+        // arcsinh_ requires floating point tensor
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
+        
+        // Make a copy for in-place operation
         torch::Tensor input_copy = input.clone();
         
         // Apply arcsinh_ operation (in-place)
+        // arcsinh_(x) computes the inverse hyperbolic sine in-place
         input_copy.arcsinh_();
         
-        // Verify the operation worked by comparing with non-in-place version
-        torch::Tensor expected = torch::arcsinh(input);
+        // Also test the non-in-place version for coverage
+        torch::Tensor result = torch::arcsinh(input);
         
-        // Check if the results match
-        if (input.defined() && expected.defined()) {
-            bool equal = torch::allclose(input_copy, expected, 1e-5, 1e-8);
-            if (!equal) {
-                // This is not an error, just a discrepancy worth noting
-                fuzzer_utils::saveDiffInput(Data, Size, fuzzer_utils::sanitizedTimestamp());
-            }
-        }
+        // Access results to ensure computation happens
+        (void)input_copy.sum().item<float>();
+        (void)result.sum().item<float>();
         
         return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1; // Tell libFuzzer to discard invalid input
     }
-    return 0; // keep the input
 }

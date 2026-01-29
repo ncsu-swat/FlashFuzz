@@ -1,166 +1,218 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        if (Size < 10) {
+        if (Size < 20) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        // Read num_features from fuzzer data
+        int64_t num_features = static_cast<int64_t>(Data[offset] % 16) + 1;
+        offset++;
         
-        // Ensure input has at least 4 dimensions for BatchNorm2d
-        if (input.dim() < 4) {
-            input = input.reshape({1, 1, 1, 1});
-        }
+        // Read batch size and spatial dimensions
+        int64_t batch_size = static_cast<int64_t>(Data[offset] % 4) + 1;
+        offset++;
+        int64_t height = static_cast<int64_t>(Data[offset] % 8) + 1;
+        offset++;
+        int64_t width = static_cast<int64_t>(Data[offset] % 8) + 1;
+        offset++;
         
-        // Get number of channels (second dimension)
-        int64_t num_features = input.size(1);
-        if (num_features <= 0) {
-            num_features = 1;
-        }
+        // Create input tensor with proper 4D shape for BatchNorm2d (N, C, H, W)
+        torch::Tensor input = torch::randn({batch_size, num_features, height, width});
         
-        // Create scale and zero_point for quantization
-        double scale = 0.1;
+        // Read scale and zero_point for quantization
+        float scale = 0.1f;
         int64_t zero_point = 0;
         
-        if (offset + 8 < Size) {
-            memcpy(&scale, Data + offset, sizeof(double));
-            offset += sizeof(double);
+        if (offset + sizeof(float) <= Size) {
+            memcpy(&scale, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            scale = std::abs(scale);
+            if (scale < 1e-5f || !std::isfinite(scale)) {
+                scale = 0.1f;
+            }
+            if (scale > 1e5f) {
+                scale = 1.0f;
+            }
         }
         
-        if (offset + 8 < Size) {
-            memcpy(&zero_point, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + 1 <= Size) {
+            zero_point = static_cast<int64_t>(Data[offset]) % 256;
+            offset++;
         }
         
-        // Ensure scale is positive and not too small
-        scale = std::abs(scale);
-        if (scale < 1e-5) {
-            scale = 1e-5;
-        }
-        
-        // Create quantized tensor
-        torch::Tensor q_input;
-        try {
-            q_input = torch::quantize_per_tensor(
-                input.to(torch::kFloat), 
-                scale, 
-                zero_point, 
-                torch::kQUInt8);
-        } catch (...) {
-            // If quantization fails, create a simple quantized tensor
-            q_input = torch::quantize_per_tensor(
-                torch::ones({1, num_features, 2, 2}), 
-                0.1, 
-                0, 
-                torch::kQUInt8);
-        }
-        
-        // Create BatchNorm2d parameters
+        // Read eps and momentum
         double eps = 1e-5;
         double momentum = 0.1;
         
-        if (offset + 8 < Size) {
-            memcpy(&eps, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            eps = std::abs(eps);
-            if (eps < 1e-10) eps = 1e-5;
+        if (offset + 1 <= Size) {
+            uint8_t eps_byte = Data[offset];
+            offset++;
+            eps = 1e-5 + (eps_byte / 255.0) * 1e-3;
         }
         
-        if (offset + 8 < Size) {
-            memcpy(&momentum, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            momentum = std::abs(momentum);
-            if (momentum > 1.0) momentum = 0.1;
+        if (offset + 1 <= Size) {
+            uint8_t momentum_byte = Data[offset];
+            offset++;
+            momentum = (momentum_byte / 255.0) * 0.5;
         }
         
-        // Create running_mean and running_var
-        torch::Tensor running_mean = torch::zeros(num_features);
-        torch::Tensor running_var = torch::ones(num_features);
+        // Create BatchNorm2d module (non-quantized) and set to eval mode
+        torch::nn::BatchNorm2d bn_module(torch::nn::BatchNorm2dOptions(num_features).eps(eps).momentum(momentum));
+        bn_module->eval();
         
-        // Create weight and bias
-        torch::Tensor weight = torch::ones(num_features);
-        torch::Tensor bias = torch::zeros(num_features);
+        // Initialize running stats with some variance
+        bn_module->running_mean.copy_(torch::zeros(num_features));
+        bn_module->running_var.copy_(torch::ones(num_features));
         
-        // Use functional API for quantized batch norm
-        torch::Tensor output = torch::nn::functional::batch_norm(
-            q_input.dequantize(),
-            weight,
-            bias,
-            running_mean,
-            running_var,
-            true,  // training
-            momentum,
-            eps
-        );
+        // Test 1: Standard batch norm forward pass
+        torch::Tensor output;
+        {
+            torch::NoGradGuard no_grad;
+            output = bn_module->forward(input);
+        }
         
-        // Quantize the output
-        output = torch::quantize_per_tensor(output, scale, zero_point, torch::kQUInt8);
-        
-        // Try with eval mode
-        torch::Tensor output_eval = torch::nn::functional::batch_norm(
-            q_input.dequantize(),
-            weight,
-            bias,
-            running_mean,
-            running_var,
-            false,  // training = false (eval mode)
-            momentum,
-            eps
-        );
-        
-        output_eval = torch::quantize_per_tensor(output_eval, scale, zero_point, torch::kQUInt8);
-        
-        // Try with different scale and zero_point
-        if (offset + 16 < Size) {
-            double new_scale;
-            int64_t new_zero_point;
+        // Test 2: Quantize input, dequantize, run through batch norm, requantize
+        // This simulates quantized batch norm behavior
+        try {
+            torch::Tensor q_input = torch::quantize_per_tensor(
+                input, 
+                scale, 
+                zero_point, 
+                torch::kQUInt8);
             
-            memcpy(&new_scale, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            new_scale = std::abs(new_scale);
-            if (new_scale < 1e-5) new_scale = 1e-5;
+            torch::Tensor dequantized = q_input.dequantize();
             
-            memcpy(&new_zero_point, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+            torch::Tensor bn_output;
+            {
+                torch::NoGradGuard no_grad;
+                bn_output = bn_module->forward(dequantized);
+            }
+            
+            // Requantize output
+            torch::Tensor q_output = torch::quantize_per_tensor(
+                bn_output,
+                scale,
+                zero_point,
+                torch::kQUInt8);
+            
+            // Access quantized tensor properties
+            (void)q_output.q_scale();
+            (void)q_output.q_zero_point();
+            (void)q_output.int_repr();
+        } catch (...) {
+            // Quantization may fail for certain parameters, silently continue
+        }
+        
+        // Test 3: Try with different quantization dtype (QInt8)
+        try {
+            int64_t signed_zero_point = static_cast<int64_t>(static_cast<int8_t>(zero_point % 128));
+            
+            torch::Tensor q_input_signed = torch::quantize_per_tensor(
+                input,
+                scale,
+                signed_zero_point,
+                torch::kQInt8);
+            
+            torch::Tensor dequantized_signed = q_input_signed.dequantize();
+            
+            torch::Tensor bn_output_signed;
+            {
+                torch::NoGradGuard no_grad;
+                bn_output_signed = bn_module->forward(dequantized_signed);
+            }
+            
+            torch::Tensor q_output_signed = torch::quantize_per_tensor(
+                bn_output_signed,
+                scale,
+                signed_zero_point,
+                torch::kQInt8);
+        } catch (...) {
+            // Silently handle quantization errors
+        }
+        
+        // Test 4: Per-channel quantization (more relevant for batch norm)
+        try {
+            torch::Tensor scales = torch::full({num_features}, scale);
+            torch::Tensor zero_points = torch::full({num_features}, zero_point, torch::kLong);
+            
+            torch::Tensor q_input_per_channel = torch::quantize_per_channel(
+                input,
+                scales,
+                zero_points,
+                1,  // axis = 1 (channel dimension)
+                torch::kQUInt8);
+            
+            torch::Tensor dequantized_per_channel = q_input_per_channel.dequantize();
+            
+            torch::Tensor bn_output_per_channel;
+            {
+                torch::NoGradGuard no_grad;
+                bn_output_per_channel = bn_module->forward(dequantized_per_channel);
+            }
+        } catch (...) {
+            // Per-channel quantization may fail, silently continue
+        }
+        
+        // Test 5: Training mode batch norm
+        if (offset < Size && (Data[offset] % 2 == 0)) {
+            torch::nn::BatchNorm2d bn_train(torch::nn::BatchNorm2dOptions(num_features).eps(eps).momentum(momentum));
+            bn_train->train();
             
             try {
-                torch::Tensor q_input2 = torch::quantize_per_tensor(
-                    input.to(torch::kFloat), 
-                    new_scale, 
-                    new_zero_point, 
-                    torch::kQUInt8);
+                torch::Tensor train_output = bn_train->forward(input);
                 
-                torch::Tensor output2 = torch::nn::functional::batch_norm(
-                    q_input2.dequantize(),
-                    weight,
-                    bias,
-                    running_mean,
-                    running_var,
-                    true,
-                    momentum,
-                    eps
-                );
-                
-                output2 = torch::quantize_per_tensor(output2, new_scale, new_zero_point, torch::kQUInt8);
+                // Check that running stats were updated
+                (void)bn_train->running_mean;
+                (void)bn_train->running_var;
             } catch (...) {
-                // Ignore errors from this test case
+                // Training mode may have different requirements
             }
+        }
+        
+        // Test 6: Batch norm with affine=false
+        try {
+            torch::nn::BatchNorm2d bn_no_affine(
+                torch::nn::BatchNorm2dOptions(num_features).eps(eps).momentum(momentum).affine(false));
+            bn_no_affine->eval();
+            bn_no_affine->running_mean.copy_(torch::zeros(num_features));
+            bn_no_affine->running_var.copy_(torch::ones(num_features));
+            
+            torch::NoGradGuard no_grad;
+            torch::Tensor output_no_affine = bn_no_affine->forward(input);
+        } catch (...) {
+            // Silently handle errors
+        }
+        
+        // Test 7: Batch norm with track_running_stats=false
+        try {
+            torch::nn::BatchNorm2d bn_no_track(
+                torch::nn::BatchNorm2dOptions(num_features).eps(eps).momentum(momentum).track_running_stats(false));
+            bn_no_track->eval();
+            
+            torch::NoGradGuard no_grad;
+            torch::Tensor output_no_track = bn_no_track->forward(input);
+        } catch (...) {
+            // Silently handle errors
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

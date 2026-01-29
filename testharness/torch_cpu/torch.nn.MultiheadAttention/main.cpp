@@ -1,96 +1,143 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <tuple>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        // Need enough bytes for parameters
+        if (Size < 8) {
+            return 0;
+        }
+
         size_t offset = 0;
-        
-        // Need at least a few bytes for basic parameters
-        if (Size < 10) {
-            return 0;
+
+        // Parse dimensions from fuzzer data
+        int64_t batch_size = static_cast<int64_t>(Data[offset++] % 8) + 1;      // 1-8
+        int64_t seq_len_q = static_cast<int64_t>(Data[offset++] % 16) + 1;      // 1-16
+        int64_t seq_len_kv = static_cast<int64_t>(Data[offset++] % 16) + 1;     // 1-16
+        int64_t num_heads = static_cast<int64_t>(Data[offset++] % 4) + 1;       // 1-4
+        int64_t head_dim = static_cast<int64_t>(Data[offset++] % 8) + 1;        // 1-8
+        int64_t embed_dim = num_heads * head_dim;  // Ensure embed_dim is divisible by num_heads
+
+        // Parse boolean options
+        bool add_bias_kv = (offset < Size) && (Data[offset++] % 2 == 0);
+        bool add_zero_attn = (offset < Size) && (Data[offset++] % 2 == 0);
+        bool use_masks = (offset < Size) && (Data[offset++] % 2 == 0);
+
+        // Create MultiheadAttention module
+        auto options = torch::nn::MultiheadAttentionOptions(embed_dim, num_heads)
+            .bias(true)
+            .add_bias_kv(add_bias_kv)
+            .add_zero_attn(add_zero_attn)
+            .dropout(0.0);  // Use 0 dropout for deterministic fuzzing
+
+        torch::nn::MultiheadAttention mha(options);
+
+        // Create properly shaped tensors for attention
+        // MultiheadAttention expects (L, N, E) format by default (batch_first=false)
+        torch::Tensor query = torch::randn({seq_len_q, batch_size, embed_dim});
+        torch::Tensor key = torch::randn({seq_len_kv, batch_size, embed_dim});
+        torch::Tensor value = torch::randn({seq_len_kv, batch_size, embed_dim});
+
+        // Use remaining fuzzer data to perturb tensor values
+        if (offset < Size) {
+            float scale = static_cast<float>(Data[offset++]) / 25.5f - 5.0f;
+            query = query * scale;
         }
-        
-        // Create query, key, value tensors
-        torch::Tensor query = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Ensure we have enough data left for the next tensors
-        if (offset >= Size - 5) {
-            return 0;
+        if (offset < Size) {
+            float scale = static_cast<float>(Data[offset++]) / 25.5f - 5.0f;
+            key = key * scale;
         }
-        
-        torch::Tensor key = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        if (offset >= Size - 5) {
-            return 0;
+        if (offset < Size) {
+            float scale = static_cast<float>(Data[offset++]) / 25.5f - 5.0f;
+            value = value * scale;
         }
-        
-        torch::Tensor value = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Parse embed_dim and num_heads from remaining data
-        if (offset + 2 <= Size) {
-            int64_t embed_dim = static_cast<int64_t>(Data[offset++]) + 1; // Ensure non-zero
-            int64_t num_heads = static_cast<int64_t>(Data[offset++]) + 1; // Ensure non-zero
-            
-            // Create MultiheadAttention module
-            torch::nn::MultiheadAttention mha(
-                torch::nn::MultiheadAttentionOptions(embed_dim, num_heads)
-            );
-            
-            // Parse additional options if we have more data
-            if (offset + 3 <= Size) {
-                bool add_bias_kv = Data[offset++] % 2 == 0;
-                bool add_zero_attn = Data[offset++] % 2 == 0;
-                double dropout_p = static_cast<double>(Data[offset++]) / 255.0;
-                
-                mha = torch::nn::MultiheadAttention(
-                    torch::nn::MultiheadAttentionOptions(embed_dim, num_heads)
-                        .bias(true)
-                        .add_bias_kv(add_bias_kv)
-                        .add_zero_attn(add_zero_attn)
-                        .dropout(dropout_p)
+
+        // Create optional masks
+        torch::Tensor key_padding_mask;
+        torch::Tensor attn_mask;
+
+        if (use_masks) {
+            // key_padding_mask: (N, S) where S is source sequence length
+            key_padding_mask = torch::zeros({batch_size, seq_len_kv}, torch::kBool);
+            // Randomly mask some positions based on fuzzer data
+            if (offset < Size) {
+                int mask_count = Data[offset++] % (seq_len_kv + 1);
+                for (int i = 0; i < mask_count && i < seq_len_kv; i++) {
+                    int batch_idx = (offset < Size) ? (Data[offset++] % batch_size) : 0;
+                    key_padding_mask[batch_idx][i] = true;
+                }
+            }
+
+            // attn_mask: (L, S) where L is target seq len, S is source seq len
+            // Using additive mask (float type with -inf for masked positions)
+            attn_mask = torch::zeros({seq_len_q, seq_len_kv});
+            if (offset < Size && Data[offset++] % 2 == 0) {
+                // Create causal mask
+                attn_mask = torch::triu(
+                    torch::full({seq_len_q, seq_len_kv}, -std::numeric_limits<float>::infinity()),
+                    /*diagonal=*/1
                 );
             }
-            
-            // Parse key_padding_mask and attn_mask if we have more data
-            torch::Tensor key_padding_mask;
-            torch::Tensor attn_mask;
-            
-            if (offset < Size - 5) {
-                key_padding_mask = fuzzer_utils::createTensor(Data, Size, offset);
-            }
-            
-            if (offset < Size - 5) {
-                attn_mask = fuzzer_utils::createTensor(Data, Size, offset);
-            }
-            
-            // Apply MultiheadAttention
-            try {
-                auto result = mha->forward(query, key, value, key_padding_mask, true, attn_mask);
-                
-                // Access the result to ensure computation is performed
-                auto attn_output = std::get<0>(result);
-                auto attn_weights = std::get<1>(result);
-                
-                // Perform some operation on the output to ensure it's used
-                auto sum = attn_output.sum();
-                if (attn_weights.defined()) {
-                    sum += attn_weights.sum();
-                }
-            } catch (const c10::Error& e) {
-                // PyTorch-specific exceptions are expected and not a fuzzer error
+        }
+
+        // Apply MultiheadAttention with need_weights=true
+        try {
+            auto result = mha->forward(
+                query, key, value,
+                key_padding_mask.defined() ? key_padding_mask : torch::Tensor(),
+                /*need_weights=*/true,
+                attn_mask.defined() ? attn_mask : torch::Tensor()
+            );
+
+            auto attn_output = std::get<0>(result);
+            auto attn_weights = std::get<1>(result);
+
+            // Verify output shapes
+            if (attn_output.dim() != 3) {
                 return 0;
             }
+
+            // Force computation
+            auto sum = attn_output.sum();
+            if (attn_weights.defined()) {
+                sum = sum + attn_weights.sum();
+            }
+            (void)sum.item<float>();
+
+        } catch (const c10::Error& e) {
+            // Expected PyTorch errors (shape mismatches, etc.)
+            return 0;
+        }
+
+        // Test with need_weights=false
+        try {
+            auto result2 = mha->forward(
+                query, key, value,
+                torch::Tensor(),
+                /*need_weights=*/false,
+                torch::Tensor()
+            );
+
+            auto attn_output2 = std::get<0>(result2);
+            (void)attn_output2.sum().item<float>();
+
+        } catch (const c10::Error& e) {
+            return 0;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

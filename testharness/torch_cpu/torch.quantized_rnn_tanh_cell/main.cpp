@@ -1,92 +1,120 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
-        size_t offset = 0;
-        
-        // Need at least some data to proceed
-        if (Size < 4) {
+        // Need sufficient data for parameters
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Create hidden state tensor
-        torch::Tensor hx = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract dimensions from fuzzer data
+        int64_t batch_size = 1 + (Data[offset++] % 8);      // 1-8
+        int64_t input_size = 1 + (Data[offset++] % 32);     // 1-32
+        int64_t hidden_size = 1 + (Data[offset++] % 32);    // 1-32
         
-        // Create weight tensor
-        torch::Tensor w_ih = fuzzer_utils::createTensor(Data, Size, offset);
+        // Create input tensor: [batch, input_size]
+        torch::Tensor input = torch::randn({batch_size, input_size}, torch::kFloat32);
         
-        // Create recurrent weight tensor
-        torch::Tensor w_hh = fuzzer_utils::createTensor(Data, Size, offset);
+        // Create hidden state tensor: [batch, hidden_size]
+        torch::Tensor hx = torch::randn({batch_size, hidden_size}, torch::kFloat32);
         
-        // Create bias tensor (optional)
-        torch::Tensor b_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor b_hh = fuzzer_utils::createTensor(Data, Size, offset);
+        // Create weight tensors with correct shapes
+        // w_ih: [hidden_size, input_size]
+        // w_hh: [hidden_size, hidden_size]
+        torch::Tensor w_ih = torch::randn({hidden_size, input_size}, torch::kFloat32);
+        torch::Tensor w_hh = torch::randn({hidden_size, hidden_size}, torch::kFloat32);
         
-        // Create packed tensors
-        torch::Tensor packed_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor packed_hh = fuzzer_utils::createTensor(Data, Size, offset);
+        // Create bias tensors: [hidden_size]
+        torch::Tensor b_ih = torch::randn({hidden_size}, torch::kFloat32);
+        torch::Tensor b_hh = torch::randn({hidden_size}, torch::kFloat32);
         
-        // Create column offset tensors
-        torch::Tensor col_offsets_ih = fuzzer_utils::createTensor(Data, Size, offset);
-        torch::Tensor col_offsets_hh = fuzzer_utils::createTensor(Data, Size, offset);
+        // For quantized operations, we need quantized packed weights
+        // These are typically created by quantization utilities
+        // packed_ih and packed_hh should be the quantized/packed versions
+        torch::Tensor packed_ih = torch::randn({hidden_size, input_size}, torch::kFloat32);
+        torch::Tensor packed_hh = torch::randn({hidden_size, hidden_size}, torch::kFloat32);
         
-        // Parse scale parameters for quantization
-        double scale_ih = 1.0;
-        double scale_hh = 1.0;
+        // Column offsets for quantized matmul
+        torch::Tensor col_offsets_ih = torch::zeros({hidden_size}, torch::kInt32);
+        torch::Tensor col_offsets_hh = torch::zeros({hidden_size}, torch::kInt32);
+        
+        // Parse scale and zero point parameters
+        double scale_ih = 0.1;
+        double scale_hh = 0.1;
         int64_t zero_point_ih = 0;
         int64_t zero_point_hh = 0;
         
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&scale_ih, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            scale_ih = std::abs(scale_ih) + 1e-6; // Ensure positive scale
+        if (offset + sizeof(float) <= Size) {
+            float tmp;
+            std::memcpy(&tmp, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            if (std::isfinite(tmp) && tmp != 0.0f) {
+                scale_ih = std::abs(tmp);
+            }
         }
         
-        if (offset + sizeof(double) <= Size) {
-            std::memcpy(&scale_hh, Data + offset, sizeof(double));
-            offset += sizeof(double);
-            scale_hh = std::abs(scale_hh) + 1e-6; // Ensure positive scale
+        if (offset + sizeof(float) <= Size) {
+            float tmp;
+            std::memcpy(&tmp, Data + offset, sizeof(float));
+            offset += sizeof(float);
+            if (std::isfinite(tmp) && tmp != 0.0f) {
+                scale_hh = std::abs(tmp);
+            }
         }
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&zero_point_ih, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + 1 <= Size) {
+            zero_point_ih = static_cast<int64_t>(Data[offset++]) - 128;
         }
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&zero_point_hh, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        if (offset + 1 <= Size) {
+            zero_point_hh = static_cast<int64_t>(Data[offset++]) - 128;
         }
         
-        // Try to call the quantized_rnn_tanh_cell function
-        torch::Tensor result = torch::quantized_rnn_tanh_cell(
-            input, hx, w_ih, w_hh, b_ih, b_hh,
-            packed_ih, packed_hh, col_offsets_ih, col_offsets_hh,
-            scale_ih, scale_hh, zero_point_ih, zero_point_hh
-        );
+        // Seed random with fuzzer data for reproducibility
+        if (offset + 4 <= Size) {
+            uint32_t seed;
+            std::memcpy(&seed, Data + offset, sizeof(uint32_t));
+            torch::manual_seed(seed);
+            offset += sizeof(uint32_t);
+        }
         
-        // Perform some operations on the result to ensure it's used
-        if (result.defined()) {
-            auto sum = result.sum();
-            if (sum.numel() > 0) {
-                volatile double val = sum.item<double>();
+        // Call the quantized_rnn_tanh_cell function
+        // Note: This is a low-level quantized operation
+        try {
+            torch::Tensor result = torch::quantized_rnn_tanh_cell(
+                input, hx, w_ih, w_hh, b_ih, b_hh,
+                packed_ih, packed_hh, col_offsets_ih, col_offsets_hh,
+                scale_ih, scale_hh, zero_point_ih, zero_point_hh
+            );
+            
+            // Verify result
+            if (result.defined()) {
+                volatile float val = result.sum().item<float>();
                 (void)val;
             }
+        }
+        catch (const c10::Error&) {
+            // Expected failures due to quantization constraints - silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,11 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
+#include <limits>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,27 +24,44 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // Skip empty tensors for certain operations
+        if (input.numel() == 0) {
+            return 0;
+        }
+        
         // Extract min_val and max_val from the remaining data
         float min_val = -1.0f;
         float max_val = 1.0f;
         
-        // If we have enough data left, use it to set min_val and max_val
         if (offset + sizeof(float) <= Size) {
             float extracted_val;
             std::memcpy(&extracted_val, Data + offset, sizeof(float));
             offset += sizeof(float);
-            min_val = extracted_val;
+            // Sanitize: avoid NaN/Inf in parameters
+            if (std::isfinite(extracted_val)) {
+                min_val = extracted_val;
+            }
         }
         
         if (offset + sizeof(float) <= Size) {
             float extracted_val;
             std::memcpy(&extracted_val, Data + offset, sizeof(float));
             offset += sizeof(float);
-            max_val = extracted_val;
+            // Sanitize: avoid NaN/Inf in parameters
+            if (std::isfinite(extracted_val)) {
+                max_val = extracted_val;
+            }
         }
         
-        // Create Hardtanh module with various configurations
-        torch::nn::Hardtanh hardtanh_module(torch::nn::HardtanhOptions().min_val(min_val).max_val(max_val));
+        // Ensure min_val <= max_val for valid Hardtanh
+        if (min_val > max_val) {
+            std::swap(min_val, max_val);
+        }
+        
+        // Create Hardtanh module with fuzzed parameters
+        torch::nn::Hardtanh hardtanh_module(
+            torch::nn::HardtanhOptions().min_val(min_val).max_val(max_val)
+        );
         
         // Apply Hardtanh to the input tensor
         torch::Tensor output = hardtanh_module->forward(input);
@@ -49,14 +72,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::nn::functional::HardtanhFuncOptions().min_val(min_val).max_val(max_val)
         );
         
-        // Try inplace version if we have enough data left
+        // Try inplace version
         if (offset < Size) {
             uint8_t inplace_flag = Data[offset++];
             if (inplace_flag % 2 == 0) {
                 torch::Tensor input_clone = input.clone();
-                input_clone = torch::nn::functional::hardtanh(
+                torch::nn::functional::hardtanh(
                     input_clone, 
-                    torch::nn::functional::HardtanhFuncOptions().min_val(min_val).max_val(max_val)
+                    torch::nn::functional::HardtanhFuncOptions()
+                        .min_val(min_val)
+                        .max_val(max_val)
+                        .inplace(true)
                 );
             }
         }
@@ -68,38 +94,52 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Try with edge case parameters
         if (offset < Size) {
             uint8_t edge_case = Data[offset++];
-            if (edge_case % 5 == 0) {
-                // Case where min_val > max_val
-                torch::nn::Hardtanh inverted_hardtanh(torch::nn::HardtanhOptions().min_val(max_val).max_val(min_val));
-                torch::Tensor output_inverted = inverted_hardtanh->forward(input);
-            } else if (edge_case % 5 == 1) {
-                // Case with very large values
-                torch::nn::Hardtanh large_hardtanh(torch::nn::HardtanhOptions().min_val(-1e10).max_val(1e10));
-                torch::Tensor output_large = large_hardtanh->forward(input);
-            } else if (edge_case % 5 == 2) {
-                // Case with very small range
-                torch::nn::Hardtanh small_hardtanh(torch::nn::HardtanhOptions().min_val(-1e-10).max_val(1e-10));
-                torch::Tensor output_small = small_hardtanh->forward(input);
-            } else if (edge_case % 5 == 3) {
-                // Case with equal min and max
-                torch::nn::Hardtanh equal_hardtanh(torch::nn::HardtanhOptions().min_val(min_val).max_val(min_val));
-                torch::Tensor output_equal = equal_hardtanh->forward(input);
-            } else {
-                // Case with NaN values if supported by the tensor type
-                if (input.scalar_type() == torch::kFloat || 
-                    input.scalar_type() == torch::kDouble || 
-                    input.scalar_type() == torch::kHalf) {
-                    torch::Tensor nan_input = input.clone();
-                    nan_input.index_put_({0}, std::numeric_limits<float>::quiet_NaN());
-                    torch::Tensor output_nan = hardtanh_module->forward(nan_input);
+            
+            try {
+                if (edge_case % 4 == 0) {
+                    // Case with very large values
+                    torch::nn::Hardtanh large_hardtanh(
+                        torch::nn::HardtanhOptions().min_val(-1e10).max_val(1e10)
+                    );
+                    torch::Tensor output_large = large_hardtanh->forward(input);
+                } else if (edge_case % 4 == 1) {
+                    // Case with very small range
+                    torch::nn::Hardtanh small_hardtanh(
+                        torch::nn::HardtanhOptions().min_val(-1e-10).max_val(1e-10)
+                    );
+                    torch::Tensor output_small = small_hardtanh->forward(input);
+                } else if (edge_case % 4 == 2) {
+                    // Case with equal min and max (clamps all values to single point)
+                    torch::nn::Hardtanh equal_hardtanh(
+                        torch::nn::HardtanhOptions().min_val(0.0).max_val(0.0)
+                    );
+                    torch::Tensor output_equal = equal_hardtanh->forward(input);
+                } else {
+                    // Test with different dtype inputs
+                    if (input.scalar_type() == torch::kFloat) {
+                        torch::Tensor double_input = input.to(torch::kDouble);
+                        torch::Tensor output_double = hardtanh_module->forward(double_input);
+                    }
                 }
+            } catch (const std::exception &) {
+                // Silently catch expected failures from edge cases
             }
+        }
+        
+        // Test Hardtanh6 variant (commonly used ReLU6-like activation)
+        try {
+            torch::nn::Hardtanh hardtanh6(
+                torch::nn::HardtanhOptions().min_val(0.0).max_val(6.0)
+            );
+            torch::Tensor output6 = hardtanh6->forward(input);
+        } catch (const std::exception &) {
+            // Silently catch
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

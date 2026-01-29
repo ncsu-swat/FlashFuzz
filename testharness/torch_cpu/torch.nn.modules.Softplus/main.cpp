@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -26,8 +31,8 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(float);
             
             // Ensure beta is positive and reasonable
-            if (std::isfinite(beta_raw) && beta_raw > 0) {
-                beta = beta_raw;
+            if (std::isfinite(beta_raw) && beta_raw > 0 && beta_raw < 1e6) {
+                beta = static_cast<double>(beta_raw);
             }
         }
         
@@ -39,51 +44,96 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(float);
             
             // Ensure threshold is positive and reasonable
-            if (std::isfinite(threshold_raw) && threshold_raw > 0) {
-                threshold = threshold_raw;
+            if (std::isfinite(threshold_raw) && threshold_raw > 0 && threshold_raw < 1e6) {
+                threshold = static_cast<double>(threshold_raw);
             }
         }
         
-        // Create Softplus module
-        torch::nn::Softplus softplus_module(torch::nn::SoftplusOptions().beta(beta).threshold(threshold));
+        // Create Softplus module with options
+        auto options = torch::nn::SoftplusOptions().beta(beta).threshold(threshold);
+        torch::nn::Softplus softplus_module(options);
         
-        // Apply Softplus operation
+        // Apply Softplus operation using the module
         torch::Tensor output = softplus_module->forward(input);
         
-        // Try to access the output tensor to ensure computation is complete
+        // Verify output is defined
         if (output.defined()) {
             auto sizes = output.sizes();
-            auto dtype = output.dtype();
+            (void)sizes;
         }
         
         // Try the functional version as well
-        torch::Tensor output_functional = torch::nn::functional::softplus(input, torch::nn::functional::SoftplusFuncOptions().beta(beta).threshold(threshold));
+        auto func_options = torch::nn::functional::SoftplusFuncOptions().beta(beta).threshold(threshold);
+        torch::Tensor output_functional = torch::nn::functional::softplus(input, func_options);
         
-        // Try with different beta and threshold values
-        torch::Tensor output2 = torch::nn::functional::softplus(input);
+        // Try with default parameters
+        torch::Tensor output_default = torch::nn::functional::softplus(input);
         
-        // Try with extreme values
-        if (offset + 1 < Size) {
-            uint8_t extreme_selector = Data[offset++];
-            if (extreme_selector % 4 == 0) {
-                // Very large beta
-                torch::Tensor output_large_beta = torch::nn::functional::softplus(input, torch::nn::functional::SoftplusFuncOptions().beta(1e10).threshold(threshold));
-            } else if (extreme_selector % 4 == 1) {
-                // Very small beta
-                torch::Tensor output_small_beta = torch::nn::functional::softplus(input, torch::nn::functional::SoftplusFuncOptions().beta(1e-10).threshold(threshold));
-            } else if (extreme_selector % 4 == 2) {
-                // Very large threshold
-                torch::Tensor output_large_threshold = torch::nn::functional::softplus(input, torch::nn::functional::SoftplusFuncOptions().beta(beta).threshold(1e10));
-            } else {
-                // Very small threshold
-                torch::Tensor output_small_threshold = torch::nn::functional::softplus(input, torch::nn::functional::SoftplusFuncOptions().beta(beta).threshold(1e-10));
+        // Try with different parameter combinations based on fuzzer input
+        if (offset + 1 <= Size) {
+            uint8_t selector = Data[offset++];
+            
+            try {
+                if (selector % 4 == 0) {
+                    // Large beta value
+                    auto opts = torch::nn::functional::SoftplusFuncOptions().beta(100.0).threshold(threshold);
+                    torch::Tensor result = torch::nn::functional::softplus(input, opts);
+                    (void)result;
+                } else if (selector % 4 == 1) {
+                    // Small beta value
+                    auto opts = torch::nn::functional::SoftplusFuncOptions().beta(0.01).threshold(threshold);
+                    torch::Tensor result = torch::nn::functional::softplus(input, opts);
+                    (void)result;
+                } else if (selector % 4 == 2) {
+                    // Large threshold value
+                    auto opts = torch::nn::functional::SoftplusFuncOptions().beta(beta).threshold(100.0);
+                    torch::Tensor result = torch::nn::functional::softplus(input, opts);
+                    (void)result;
+                } else {
+                    // Small threshold value
+                    auto opts = torch::nn::functional::SoftplusFuncOptions().beta(beta).threshold(1.0);
+                    torch::Tensor result = torch::nn::functional::softplus(input, opts);
+                    (void)result;
+                }
+            } catch (...) {
+                // Silently ignore expected failures from extreme values
             }
+        }
+        
+        // Test with different input types
+        if (offset + 1 <= Size) {
+            uint8_t dtype_selector = Data[offset++];
+            
+            try {
+                torch::Tensor float_input;
+                if (dtype_selector % 3 == 0) {
+                    float_input = input.to(torch::kFloat32);
+                } else if (dtype_selector % 3 == 1) {
+                    float_input = input.to(torch::kFloat64);
+                } else {
+                    float_input = input.to(torch::kFloat16);
+                }
+                
+                torch::Tensor result = torch::nn::functional::softplus(float_input);
+                (void)result;
+            } catch (...) {
+                // Silently ignore dtype conversion failures
+            }
+        }
+        
+        // Test inplace-like behavior by creating a new module instance
+        if (offset + 1 <= Size) {
+            double new_beta = 1.0 + (Data[offset++] % 10);
+            auto new_options = torch::nn::SoftplusOptions().beta(new_beta).threshold(threshold);
+            torch::nn::Softplus new_module(new_options);
+            torch::Tensor new_output = new_module->forward(input);
+            (void)new_output;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

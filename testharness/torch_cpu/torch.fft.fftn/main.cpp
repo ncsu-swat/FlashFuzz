@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cstring>        // For std::memcpy
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,19 +23,29 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
+        // FFT requires at least 1D tensor
+        if (input_tensor.dim() == 0) {
+            return 0;
+        }
+        
+        // Convert to float/complex type if needed (FFT requires floating point)
+        if (!input_tensor.is_floating_point() && !input_tensor.is_complex()) {
+            input_tensor = input_tensor.to(torch::kFloat32);
+        }
+        
         // Parse FFT parameters from the remaining data
         std::vector<int64_t> s;
         std::vector<int64_t> dim;
         std::string norm = "backward";
         
-        // Parse 's' parameter (shape of output)
+        // Parse 's' parameter (shape of output) - must be positive values
         if (offset + 1 < Size) {
             uint8_t s_rank = Data[offset++] % 4; // Limit to reasonable rank
+            s_rank = std::min(s_rank, static_cast<uint8_t>(input_tensor.dim()));
             
-            for (uint8_t i = 0; i < s_rank && offset + sizeof(int64_t) <= Size; i++) {
-                int64_t dim_size;
-                std::memcpy(&dim_size, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
+            for (uint8_t i = 0; i < s_rank && offset < Size; i++) {
+                // Use single byte to get reasonable positive sizes
+                int64_t dim_size = (Data[offset++] % 64) + 1; // 1 to 64
                 s.push_back(dim_size);
             }
         }
@@ -38,12 +53,22 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Parse 'dim' parameter (dimensions to transform)
         if (offset + 1 < Size) {
             uint8_t dim_count = Data[offset++] % (input_tensor.dim() + 1);
+            dim_count = std::min(dim_count, static_cast<uint8_t>(input_tensor.dim()));
             
-            for (uint8_t i = 0; i < dim_count && offset + sizeof(int64_t) <= Size; i++) {
-                int64_t dim_val;
-                std::memcpy(&dim_val, Data + offset, sizeof(int64_t));
-                offset += sizeof(int64_t);
-                dim.push_back(dim_val);
+            for (uint8_t i = 0; i < dim_count && offset < Size; i++) {
+                // Map to valid dimension indices
+                int64_t dim_val = Data[offset++] % input_tensor.dim();
+                // Avoid duplicates
+                bool duplicate = false;
+                for (auto d : dim) {
+                    if (d == dim_val) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (!duplicate) {
+                    dim.push_back(dim_val);
+                }
             }
         }
         
@@ -57,34 +82,64 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Apply FFT operation with different parameter combinations
         torch::Tensor result;
         
         // Case 1: Basic fftn call
-        result = torch::fft::fftn(input_tensor);
+        try {
+            result = torch::fft::fftn(input_tensor);
+        } catch (...) {
+            // Expected failures for edge cases
+        }
         
         // Case 2: With s parameter
         if (!s.empty()) {
-            result = torch::fft::fftn(input_tensor, s);
+            try {
+                result = torch::fft::fftn(input_tensor, s);
+            } catch (...) {
+                // Expected failures for invalid s values
+            }
         }
         
         // Case 3: With dim parameter
         if (!dim.empty()) {
-            result = torch::fft::fftn(input_tensor, c10::nullopt, dim);
+            try {
+                result = torch::fft::fftn(input_tensor, c10::nullopt, dim);
+            } catch (...) {
+                // Expected failures for invalid dim values
+            }
         }
         
         // Case 4: With norm parameter
-        result = torch::fft::fftn(input_tensor, c10::nullopt, c10::nullopt, norm);
+        try {
+            result = torch::fft::fftn(input_tensor, c10::nullopt, c10::nullopt, norm);
+        } catch (...) {
+            // Expected failures
+        }
         
-        // Case 5: With all parameters
+        // Case 5: With s and dim parameters (ensure matching sizes)
         if (!s.empty() && !dim.empty()) {
-            result = torch::fft::fftn(input_tensor, s, dim, norm);
+            // Adjust s to match dim length
+            std::vector<int64_t> s_adjusted;
+            for (size_t i = 0; i < dim.size() && i < s.size(); i++) {
+                s_adjusted.push_back(s[i]);
+            }
+            if (!s_adjusted.empty()) {
+                try {
+                    result = torch::fft::fftn(input_tensor, s_adjusted, dim, norm);
+                } catch (...) {
+                    // Expected failures
+                }
+            }
         }
         
         // Ensure the result is used to prevent optimization
         if (result.defined()) {
-            volatile float sum = result.sum().item<float>();
-            (void)sum;
+            try {
+                volatile float sum = result.abs().sum().item<float>();
+                (void)sum;
+            } catch (...) {
+                // Complex sum might fail, ignore
+            }
         }
     }
     catch (const std::exception &e)

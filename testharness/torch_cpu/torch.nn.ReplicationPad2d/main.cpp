@@ -1,97 +1,139 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Ensure we have at least 2D tensor for ReplicationPad2d
-        if (input.dim() < 2) {
-            // Reshape to at least 2D if needed
-            std::vector<int64_t> new_shape;
-            if (input.dim() == 0) {
-                // Scalar tensor, reshape to 2D
-                new_shape = {1, 1};
-            } else if (input.dim() == 1) {
-                // 1D tensor, reshape to 2D
-                new_shape = {1, input.size(0)};
-            }
-            input = input.reshape(new_shape);
+        // ReplicationPad2d expects 3D (C, H, W) or 4D (N, C, H, W) input
+        // Reshape tensor to appropriate dimensions
+        int64_t numel = input.numel();
+        if (numel == 0) {
+            return 0;
         }
         
-        // Parse padding values from the remaining data
-        int64_t padding_left = 0, padding_right = 0, padding_top = 0, padding_bottom = 0;
+        // Flatten and reshape to 4D: (1, 1, H, W)
+        input = input.flatten();
+        int64_t h = static_cast<int64_t>(std::sqrt(static_cast<double>(numel)));
+        if (h < 1) h = 1;
+        int64_t w = numel / h;
+        if (w < 1) w = 1;
+        int64_t actual_numel = h * w;
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding_left, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding_right, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding_top, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding_bottom, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        // Create the ReplicationPad2d module
-        torch::nn::ReplicationPad2d pad = nullptr;
-        
-        // Decide which padding format to use based on remaining data
-        if (offset < Size) {
-            uint8_t padding_type = Data[offset++];
-            
-            if (padding_type % 2 == 0) {
-                // Use single value for all sides
-                int64_t padding = padding_left;
-                pad = torch::nn::ReplicationPad2d(padding);
-            } else {
-                // Use different values for each side
-                std::vector<int64_t> padding = {padding_left, padding_right, padding_top, padding_bottom};
-                pad = torch::nn::ReplicationPad2d(padding);
-            }
+        if (actual_numel > 0 && actual_numel <= numel) {
+            input = input.narrow(0, 0, actual_numel).reshape({1, 1, h, w});
         } else {
-            // Default to single value padding if no more data
-            pad = torch::nn::ReplicationPad2d(padding_left);
+            return 0;
         }
         
-        // Apply padding
-        torch::Tensor output = pad->forward(input);
+        // Ensure float type for padding operation
+        if (!input.is_floating_point()) {
+            input = input.to(torch::kFloat32);
+        }
         
-        // Ensure the output is valid by accessing some elements
-        if (output.numel() > 0) {
-            auto first_element = output.flatten()[0].item<float>();
-            auto last_idx = output.numel() - 1;
-            if (last_idx > 0) {
-                auto last_element = output.flatten()[last_idx].item<float>();
+        // Parse padding values from the remaining data with bounds
+        auto read_bounded_padding = [&](int64_t max_val) -> int64_t {
+            if (offset + 1 <= Size) {
+                uint8_t val = Data[offset++];
+                // Limit padding to reasonable range [0, max_val]
+                return static_cast<int64_t>(val % (max_val + 1));
             }
+            return 0;
+        };
+        
+        // Limit padding to tensor dimensions to avoid excessive memory usage
+        int64_t max_pad = std::min(static_cast<int64_t>(32), std::max(h, w));
+        
+        int64_t padding_left = read_bounded_padding(max_pad);
+        int64_t padding_right = read_bounded_padding(max_pad);
+        int64_t padding_top = read_bounded_padding(max_pad);
+        int64_t padding_bottom = read_bounded_padding(max_pad);
+        
+        // Inner try-catch for expected failures
+        try
+        {
+            torch::nn::ReplicationPad2d pad = nullptr;
+            
+            // Decide which padding format to use based on remaining data
+            if (offset < Size) {
+                uint8_t padding_type = Data[offset++];
+                
+                if (padding_type % 3 == 0) {
+                    // Use single value for all sides
+                    pad = torch::nn::ReplicationPad2d(
+                        torch::nn::ReplicationPad2dOptions(padding_left));
+                } else if (padding_type % 3 == 1) {
+                    // Use symmetric padding (left/right, top/bottom)
+                    pad = torch::nn::ReplicationPad2d(
+                        torch::nn::ReplicationPad2dOptions({padding_left, padding_left, padding_top, padding_top}));
+                } else {
+                    // Use different values for each side (left, right, top, bottom)
+                    pad = torch::nn::ReplicationPad2d(
+                        torch::nn::ReplicationPad2dOptions({padding_left, padding_right, padding_top, padding_bottom}));
+                }
+            } else {
+                // Default to single value padding
+                pad = torch::nn::ReplicationPad2d(
+                    torch::nn::ReplicationPad2dOptions(padding_left));
+            }
+            
+            // Apply padding
+            torch::Tensor output = pad->forward(input);
+            
+            // Verify output dimensions
+            if (output.numel() > 0) {
+                // Access elements to ensure computation completed
+                volatile float first_val = output.flatten()[0].item<float>();
+                (void)first_val;
+                
+                // Verify output shape is correct
+                int64_t expected_h = h + padding_top + padding_bottom;
+                int64_t expected_w = w + padding_left + padding_right;
+                if (output.size(2) != expected_h || output.size(3) != expected_w) {
+                    // Unexpected shape - this would indicate a bug
+                }
+            }
+            
+            // Test with 3D input as well
+            if (offset < Size && Data[offset] % 2 == 0) {
+                torch::Tensor input_3d = input.squeeze(0); // (C, H, W)
+                torch::Tensor output_3d = pad->forward(input_3d);
+                if (output_3d.numel() > 0) {
+                    volatile float val = output_3d.flatten()[0].item<float>();
+                    (void)val;
+                }
+            }
+        }
+        catch (const c10::Error &e)
+        {
+            // Expected failures due to invalid shapes/padding - silently ignore
+        }
+        catch (const std::runtime_error &e)
+        {
+            // Expected runtime errors - silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

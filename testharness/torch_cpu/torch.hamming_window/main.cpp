@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include <cmath>          // For isnan, isinf
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -15,7 +20,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             return 0;
         }
         
-        // Parse window_length from the first byte
+        // Parse window_length from fuzzer data
         int64_t window_length = 0;
         if (offset + sizeof(int64_t) <= Size) {
             std::memcpy(&window_length, Data + offset, sizeof(int64_t));
@@ -23,6 +28,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         } else {
             window_length = static_cast<int64_t>(Data[offset++]);
         }
+        
+        // Constrain window_length to reasonable range [0, 10000] to avoid OOM
+        // and ensure it's non-negative (negative values always throw)
+        window_length = std::abs(window_length) % 10001;
         
         // Parse periodic flag (if available)
         bool periodic = false;
@@ -35,6 +44,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&alpha, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize alpha to avoid NaN/Inf
+            if (std::isnan(alpha) || std::isinf(alpha)) {
+                alpha = 0.54;
+            }
+            // Clamp to reasonable range
+            alpha = std::fmod(std::abs(alpha), 10.0);
         }
         
         // Parse beta parameter (if available)
@@ -42,53 +57,72 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         if (offset + sizeof(double) <= Size) {
             std::memcpy(&beta, Data + offset, sizeof(double));
             offset += sizeof(double);
+            // Sanitize beta to avoid NaN/Inf
+            if (std::isnan(beta) || std::isinf(beta)) {
+                beta = 0.46;
+            }
+            // Clamp to reasonable range
+            beta = std::fmod(std::abs(beta), 10.0);
         }
         
-        // Parse device type (if available)
-        torch::Device device(torch::kCPU);
+        // Parse dtype (if available) - only use float types for window functions
+        torch::ScalarType dtype = torch::kFloat;
         if (offset < Size) {
-            // Use the byte to determine if we should use CUDA (if available)
-            bool use_cuda = (Data[offset++] & 0x1) && torch::cuda::is_available();
-            if (use_cuda) {
-                device = torch::Device(torch::kCUDA);
+            uint8_t dtype_byte = Data[offset++] % 4;
+            switch (dtype_byte) {
+                case 0: dtype = torch::kFloat; break;
+                case 1: dtype = torch::kDouble; break;
+                case 2: dtype = torch::kHalf; break;
+                case 3: dtype = torch::kBFloat16; break;
             }
         }
         
-        // Parse dtype (if available)
-        torch::ScalarType dtype = torch::kFloat;
-        if (offset < Size) {
-            dtype = fuzzer_utils::parseDataType(Data[offset++]);
-        }
-        
-        // Create options
-        auto options = torch::TensorOptions().dtype(dtype).device(device);
+        // Create options (CPU only for this fuzzer)
+        auto options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
         
         // Call hamming_window with different parameter combinations
+        // Use inner try-catch for expected parameter validation failures
         torch::Tensor result;
         
         // Basic call with just window_length
-        result = torch::hamming_window(window_length);
+        try {
+            result = torch::hamming_window(window_length);
+        } catch (...) {}
         
         // Call with periodic flag
-        result = torch::hamming_window(window_length, periodic);
+        try {
+            result = torch::hamming_window(window_length, periodic);
+        } catch (...) {}
         
         // Call with periodic and alpha
-        result = torch::hamming_window(window_length, periodic, alpha);
+        try {
+            result = torch::hamming_window(window_length, periodic, alpha);
+        } catch (...) {}
         
         // Call with all parameters
-        result = torch::hamming_window(window_length, periodic, alpha, beta);
+        try {
+            result = torch::hamming_window(window_length, periodic, alpha, beta);
+        } catch (...) {}
         
         // Call with options
-        result = torch::hamming_window(window_length, options);
+        try {
+            result = torch::hamming_window(window_length, options);
+        } catch (...) {}
         
         // Call with options and periodic
-        result = torch::hamming_window(window_length, periodic, options);
+        try {
+            result = torch::hamming_window(window_length, periodic, options);
+        } catch (...) {}
         
         // Call with options, periodic, and alpha
-        result = torch::hamming_window(window_length, periodic, alpha, options);
+        try {
+            result = torch::hamming_window(window_length, periodic, alpha, options);
+        } catch (...) {}
         
         // Call with all parameters and options
-        result = torch::hamming_window(window_length, periodic, alpha, beta, options);
+        try {
+            result = torch::hamming_window(window_length, periodic, alpha, beta, options);
+        } catch (...) {}
         
         // Try to access the result to ensure computation is performed
         if (result.defined() && result.numel() > 0) {

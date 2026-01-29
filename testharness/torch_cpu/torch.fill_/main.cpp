@@ -1,11 +1,15 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -59,7 +63,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     break;
                 }
                 case 4: {
-                    // Fill with a tensor scalar
+                    // Fill with a tensor scalar (0-dim tensor)
                     auto scalar_tensor = torch::tensor(fill_value);
                     tensor.fill_(scalar_tensor);
                     break;
@@ -70,15 +74,17 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             tensor.fill_(fill_value);
         }
         
-        // Try to access elements to ensure the operation completed
+        // Verify the operation completed by checking the tensor is valid
+        // Use sum() instead of item() since item() only works on single-element tensors
         if (tensor.numel() > 0) {
-            auto item = tensor.item();
+            auto sum_result = tensor.sum();
+            (void)sum_result;  // Suppress unused variable warning
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;  // Tell libFuzzer to discard invalid input
     }
     return 0; // keep the input
 }

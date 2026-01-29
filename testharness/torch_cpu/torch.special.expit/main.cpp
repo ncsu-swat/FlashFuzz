@@ -1,11 +1,18 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
+#include <limits>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,7 +25,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor for torch.special.expit
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Apply torch.special.expit operation
+        // Apply torch.special.expit operation (sigmoid function)
         torch::Tensor result = torch::special::expit(input);
         
         // Try some edge cases with modified tensors if we have enough data
@@ -80,8 +87,12 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
             
             // Convert input to different dtype and apply expit
-            torch::Tensor converted_input = input.to(target_dtype);
-            torch::Tensor converted_result = torch::special::expit(converted_input);
+            try {
+                torch::Tensor converted_input = input.to(target_dtype);
+                torch::Tensor converted_result = torch::special::expit(converted_input);
+            } catch (...) {
+                // Some dtype conversions may fail, silently ignore
+            }
         }
         
         // Try with a scalar tensor if we have enough data
@@ -90,11 +101,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor scalar_tensor = torch::tensor(static_cast<float>(scalar_value));
             torch::Tensor scalar_result = torch::special::expit(scalar_tensor);
         }
+        
+        // Try with negative infinity
+        if (offset < Size) {
+            torch::Tensor neg_inf_input = torch::full_like(input, -std::numeric_limits<float>::infinity());
+            torch::Tensor neg_inf_result = torch::special::expit(neg_inf_input);
+        }
+        
+        // Try with out parameter variant if available
+        if (offset < Size) {
+            torch::Tensor out_tensor = torch::empty_like(input);
+            torch::special::expit_out(out_tensor, input);
+        }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

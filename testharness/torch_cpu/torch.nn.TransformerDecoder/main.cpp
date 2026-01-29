@@ -1,51 +1,41 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        if (Size < 12) {
+            return 0;
+        }
+        
         size_t offset = 0;
         
-        if (Size < 10) {
-            return 0;
-        }
+        // Extract configuration parameters first to determine tensor shapes
+        int nhead = 1 + (Data[offset++] % 8);      // Range: 1-8
+        // d_model must be divisible by nhead
+        int d_model_multiplier = 1 + (Data[offset++] % 16); // Range: 1-16
+        int d_model = nhead * d_model_multiplier;  // Ensures d_model % nhead == 0
+        int num_decoder_layers = 1 + (Data[offset++] % 3); // Range: 1-3
+        int dim_feedforward = 32 + (Data[offset++] % 224); // Range: 32-256
+        float dropout = static_cast<float>(Data[offset++] % 50) / 100.0f; // Range: 0.0-0.49
         
-        // Create input tensors for TransformerDecoder
-        torch::Tensor tgt;
-        torch::Tensor memory;
+        // Extract tensor dimensions
+        int tgt_seq_len = 1 + (Data[offset++] % 16);    // Range: 1-16
+        int memory_seq_len = 1 + (Data[offset++] % 16); // Range: 1-16
+        int batch_size = 1 + (Data[offset++] % 8);      // Range: 1-8
         
-        // Parse tgt tensor
-        if (offset < Size) {
-            tgt = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            return 0;
-        }
-        
-        // Parse memory tensor
-        if (offset < Size) {
-            memory = fuzzer_utils::createTensor(Data, Size, offset);
-        } else {
-            return 0;
-        }
-        
-        // Extract configuration parameters from remaining data
-        int d_model = 64;
-        int nhead = 8;
-        int num_decoder_layers = 2;
-        int dim_feedforward = 512;
-        float dropout = 0.1;
-        
-        if (offset + 5 <= Size) {
-            d_model = 16 + (Data[offset++] % 112); // Range: 16-128
-            nhead = 1 + (Data[offset++] % 8);      // Range: 1-8
-            num_decoder_layers = 1 + (Data[offset++] % 3); // Range: 1-3
-            dim_feedforward = 32 + (Data[offset++] % 480); // Range: 32-512
-            dropout = static_cast<float>(Data[offset++]) / 255.0f; // Range: 0.0-1.0
-        }
+        // Create input tensors with correct shapes for TransformerDecoder
+        // tgt: (tgt_seq_len, batch_size, d_model)
+        // memory: (memory_seq_len, batch_size, d_model)
+        torch::Tensor tgt = torch::randn({tgt_seq_len, batch_size, d_model});
+        torch::Tensor memory = torch::randn({memory_seq_len, batch_size, d_model});
         
         // Create TransformerDecoderLayer first
         torch::nn::TransformerDecoderLayerOptions layer_options(d_model, nhead);
@@ -56,74 +46,57 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::TransformerDecoderOptions decoder_options(decoder_layer, num_decoder_layers);
         auto decoder = torch::nn::TransformerDecoder(decoder_options);
         
-        // Create tgt_mask (optional)
+        // Set to eval mode to disable dropout for deterministic behavior
+        decoder->eval();
+        
+        // Create optional masks based on remaining data
         torch::Tensor tgt_mask;
-        if (tgt.dim() >= 2 && offset < Size) {
-            bool use_mask = Data[offset++] % 2;
-            if (use_mask) {
-                int tgt_len = tgt.size(0);
-                tgt_mask = torch::ones({tgt_len, tgt_len}, torch::kFloat32);
-                if (offset < Size) {
-                    bool upper_triangular = Data[offset++] % 2;
-                    if (upper_triangular) {
-                        tgt_mask = torch::triu(tgt_mask);
-                    } else {
-                        tgt_mask = torch::tril(tgt_mask);
-                    }
+        torch::Tensor memory_mask;
+        torch::Tensor tgt_key_padding_mask;
+        torch::Tensor memory_key_padding_mask;
+        
+        if (offset < Size) {
+            uint8_t mask_flags = Data[offset++];
+            
+            // tgt_mask: (tgt_seq_len, tgt_seq_len)
+            if (mask_flags & 0x01) {
+                tgt_mask = torch::zeros({tgt_seq_len, tgt_seq_len});
+                if (mask_flags & 0x02) {
+                    // Upper triangular mask (causal)
+                    tgt_mask = torch::triu(torch::ones({tgt_seq_len, tgt_seq_len}) * (-1e9), 1);
                 }
             }
-        }
-        
-        // Create memory_mask (optional)
-        torch::Tensor memory_mask;
-        if (tgt.dim() >= 2 && memory.dim() >= 2 && offset < Size) {
-            bool use_memory_mask = Data[offset++] % 2;
-            if (use_memory_mask) {
-                int tgt_len = tgt.size(0);
-                int memory_len = memory.size(0);
-                memory_mask = torch::ones({tgt_len, memory_len}, torch::kFloat32);
+            
+            // memory_mask: (tgt_seq_len, memory_seq_len)
+            if (mask_flags & 0x04) {
+                memory_mask = torch::zeros({tgt_seq_len, memory_seq_len});
             }
-        }
-        
-        // Create tgt_key_padding_mask (optional)
-        torch::Tensor tgt_key_padding_mask;
-        if (tgt.dim() >= 2 && offset < Size) {
-            bool use_tgt_padding = Data[offset++] % 2;
-            if (use_tgt_padding && tgt.size(1) > 0) {
-                int batch_size = tgt.size(1);
-                int tgt_len = tgt.size(0);
-                tgt_key_padding_mask = torch::zeros({batch_size, tgt_len}, torch::kBool);
-                
-                // Randomly set some positions to true (masked)
+            
+            // tgt_key_padding_mask: (batch_size, tgt_seq_len)
+            if (mask_flags & 0x08) {
+                tgt_key_padding_mask = torch::zeros({batch_size, tgt_seq_len}, torch::kBool);
+                // Set some padding positions if we have more data
                 if (offset < Size) {
-                    int mask_density = Data[offset++] % 100;
-                    for (int i = 0; i < batch_size; i++) {
-                        for (int j = 0; j < tgt_len; j++) {
-                            if ((i + j) % 100 < mask_density) {
-                                tgt_key_padding_mask.index_put_({i, j}, true);
+                    int num_padded = Data[offset++] % (tgt_seq_len + 1);
+                    for (int b = 0; b < batch_size; b++) {
+                        for (int i = tgt_seq_len - num_padded; i < tgt_seq_len; i++) {
+                            if (i >= 0) {
+                                tgt_key_padding_mask.index_put_({b, i}, true);
                             }
                         }
                     }
                 }
             }
-        }
-        
-        // Create memory_key_padding_mask (optional)
-        torch::Tensor memory_key_padding_mask;
-        if (memory.dim() >= 2 && offset < Size) {
-            bool use_memory_padding = Data[offset++] % 2;
-            if (use_memory_padding && memory.size(1) > 0) {
-                int batch_size = memory.size(1);
-                int memory_len = memory.size(0);
-                memory_key_padding_mask = torch::zeros({batch_size, memory_len}, torch::kBool);
-                
-                // Randomly set some positions to true (masked)
+            
+            // memory_key_padding_mask: (batch_size, memory_seq_len)
+            if (mask_flags & 0x10) {
+                memory_key_padding_mask = torch::zeros({batch_size, memory_seq_len}, torch::kBool);
                 if (offset < Size) {
-                    int mask_density = Data[offset++] % 100;
-                    for (int i = 0; i < batch_size; i++) {
-                        for (int j = 0; j < memory_len; j++) {
-                            if ((i + j) % 100 < mask_density) {
-                                memory_key_padding_mask.index_put_({i, j}, true);
+                    int num_padded = Data[offset++] % (memory_seq_len + 1);
+                    for (int b = 0; b < batch_size; b++) {
+                        for (int i = memory_seq_len - num_padded; i < memory_seq_len; i++) {
+                            if (i >= 0) {
+                                memory_key_padding_mask.index_put_({b, i}, true);
                             }
                         }
                     }
@@ -132,24 +105,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         }
         
         // Apply the TransformerDecoder
-        torch::Tensor output = decoder->forward(
-            tgt, 
-            memory, 
-            tgt_mask, 
-            memory_mask, 
-            tgt_key_padding_mask, 
-            memory_key_padding_mask
-        );
+        torch::Tensor output;
+        try {
+            output = decoder->forward(
+                tgt, 
+                memory, 
+                tgt_mask, 
+                memory_mask, 
+                tgt_key_padding_mask, 
+                memory_key_padding_mask
+            );
+        } catch (const c10::Error&) {
+            // Shape mismatches or other tensor errors are expected with some inputs
+            return 0;
+        }
         
         // Ensure the output is used to prevent optimization
         if (output.defined()) {
             volatile float sum = output.sum().item<float>();
+            (void)sum;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,102 +1,139 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
+        // Need sufficient data for tensor creation and parameters
+        if (Size < 16) {
+            return 0;
+        }
+        
         size_t offset = 0;
         
-        // Need at least 2 tensors for cross product
-        if (Size < 10) {
-            return 0;
-        }
+        // Extract batch size (1-8) and dim choice from fuzzer data
+        uint8_t batch_param = Data[offset++] % 8 + 1;
+        uint8_t dim_choice = Data[offset++];
         
-        // Create input tensors
-        torch::Tensor input1 = fuzzer_utils::createTensor(Data, Size, offset);
+        // Cross product requires vectors of size 3 in the specified dimension
+        // Create tensors with shape that guarantees a dimension of size 3
         
-        // Ensure we have enough data for the second tensor
-        if (offset >= Size) {
-            return 0;
-        }
-        
-        torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Get dim parameter (optional)
-        int64_t dim = -1;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
-        
-        // Try different variants of the cross product operation
-        try {
-            // Variant 1: Default dim
-            torch::Tensor result1 = torch::cross(input1, input2);
-        } catch (...) {
-            // Ignore exceptions from this variant
-        }
+        // Variant based on fuzzer input
+        int variant = dim_choice % 5;
         
         try {
-            // Variant 2: With explicit dim
-            torch::Tensor result2 = torch::cross(input1, input2, dim);
-        } catch (...) {
-            // Ignore exceptions from this variant
-        }
-        
-        // Try with named arguments
-        try {
-            torch::Tensor result3 = torch::cross(input1, input2, c10::nullopt);
-        } catch (...) {
-            // Ignore exceptions from this variant
-        }
-        
-        // Try with different data types
-        try {
-            auto input1_float = input1.to(torch::kFloat);
-            auto input2_float = input2.to(torch::kFloat);
-            torch::Tensor result4 = torch::cross(input1_float, input2_float);
-        } catch (...) {
-            // Ignore exceptions from this variant
-        }
-        
-        // Try with different shapes
-        try {
-            // Reshape tensors if possible
-            if (input1.numel() >= 3 && input2.numel() >= 3) {
-                auto reshaped1 = input1.reshape({-1, 3});
-                auto reshaped2 = input2.reshape({-1, 3});
-                torch::Tensor result5 = torch::cross(reshaped1, reshaped2);
-            }
-        } catch (...) {
-            // Ignore exceptions from this variant
-        }
-        
-        // Try with broadcasting
-        try {
-            if (input1.dim() > 0 && input2.dim() > 0) {
-                // Attempt to create broadcastable tensors
-                auto shape1 = input1.sizes().vec();
-                auto shape2 = input2.sizes().vec();
-                
-                if (!shape1.empty() && !shape2.empty()) {
-                    shape1[0] = 1;
-                    auto broadcasted1 = input1.expand(shape2);
-                    auto broadcasted2 = input2.expand(shape1);
-                    torch::Tensor result6 = torch::cross(broadcasted1, broadcasted2);
+            torch::Tensor input1, input2;
+            int64_t dim = -1;
+            
+            switch (variant) {
+                case 0: {
+                    // Simple 1D vectors of size 3
+                    input1 = torch::randn({3});
+                    input2 = torch::randn({3});
+                    // dim defaults to -1 (last dimension)
+                    torch::Tensor result = torch::cross(input1, input2);
+                    break;
+                }
+                case 1: {
+                    // 2D tensors with last dim = 3
+                    int64_t batch = static_cast<int64_t>(batch_param);
+                    input1 = torch::randn({batch, 3});
+                    input2 = torch::randn({batch, 3});
+                    dim = 1;
+                    torch::Tensor result = torch::cross(input1, input2, dim);
+                    break;
+                }
+                case 2: {
+                    // 2D tensors with first dim = 3
+                    int64_t batch = static_cast<int64_t>(batch_param);
+                    input1 = torch::randn({3, batch});
+                    input2 = torch::randn({3, batch});
+                    dim = 0;
+                    torch::Tensor result = torch::cross(input1, input2, dim);
+                    break;
+                }
+                case 3: {
+                    // 3D tensors
+                    int64_t batch1 = static_cast<int64_t>((batch_param % 4) + 1);
+                    int64_t batch2 = static_cast<int64_t>((batch_param / 4) + 1);
+                    input1 = torch::randn({batch1, batch2, 3});
+                    input2 = torch::randn({batch1, batch2, 3});
+                    dim = 2;
+                    torch::Tensor result = torch::cross(input1, input2, dim);
+                    break;
+                }
+                case 4: {
+                    // Broadcasting case: different batch dimensions
+                    int64_t batch = static_cast<int64_t>(batch_param);
+                    input1 = torch::randn({batch, 1, 3});
+                    input2 = torch::randn({1, batch, 3});
+                    dim = -1;
+                    torch::Tensor result = torch::cross(input1, input2, dim);
+                    break;
                 }
             }
         } catch (...) {
-            // Ignore exceptions from this variant
+            // Silently ignore expected failures from shape/type mismatches
+        }
+        
+        // Test with different dtypes
+        try {
+            torch::Tensor input1 = torch::randn({3}, torch::kFloat64);
+            torch::Tensor input2 = torch::randn({3}, torch::kFloat64);
+            torch::Tensor result = torch::cross(input1, input2);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Test with complex tensors
+        try {
+            torch::Tensor input1 = torch::randn({3}, torch::kComplexFloat);
+            torch::Tensor input2 = torch::randn({3}, torch::kComplexFloat);
+            torch::Tensor result = torch::cross(input1, input2);
+        } catch (...) {
+            // Silently ignore
+        }
+        
+        // Test with tensors created from fuzzer data
+        if (offset + 24 <= Size) {
+            try {
+                // Create 3-element vectors from fuzzer data
+                float data1[3], data2[3];
+                std::memcpy(data1, Data + offset, sizeof(float) * 3);
+                offset += sizeof(float) * 3;
+                std::memcpy(data2, Data + offset, sizeof(float) * 3);
+                offset += sizeof(float) * 3;
+                
+                torch::Tensor input1 = torch::from_blob(data1, {3}, torch::kFloat).clone();
+                torch::Tensor input2 = torch::from_blob(data2, {3}, torch::kFloat).clone();
+                torch::Tensor result = torch::cross(input1, input2);
+            } catch (...) {
+                // Silently ignore
+            }
+        }
+        
+        // Test with requires_grad for autograd coverage
+        try {
+            torch::Tensor input1 = torch::randn({3}, torch::requires_grad());
+            torch::Tensor input2 = torch::randn({3}, torch::requires_grad());
+            torch::Tensor result = torch::cross(input1, input2);
+            result.sum().backward();
+        } catch (...) {
+            // Silently ignore
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

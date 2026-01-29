@@ -1,63 +1,95 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Skip if there's not enough data
-        if (Size < 2) {
+        if (Size < 4) {
             return 0;
         }
         
         // Create input tensor for torch.special.ndtr
+        // ndtr computes the cumulative distribution function of the standard normal distribution
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
         // Apply torch.special.ndtr operation
         torch::Tensor result = torch::special::ndtr(input);
         
-        // Try to access the result to ensure computation is performed
+        // Verify result is valid - use sum() to avoid .item() issues with multi-element tensors
         if (result.defined() && result.numel() > 0) {
-            auto item = result.item();
+            volatile float sum_val = result.sum().item<float>();
+            (void)sum_val;
         }
         
-        // Try with different input configurations if we have more data
-        if (Size - offset >= 2) {
-            // Create another tensor with different properties
+        // Test with output tensor variant if we have more data
+        if (Size - offset >= 4) {
             torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Apply torch.special.ndtr with the new tensor
-            torch::Tensor result2 = torch::special::ndtr(input2);
+            // Pre-allocate output tensor with same shape
+            torch::Tensor out = torch::empty_like(input2);
             
-            // Try to access the result
-            if (result2.defined() && result2.numel() > 0) {
-                auto item2 = result2.item();
+            // Use the out parameter variant
+            torch::special::ndtr_out(out, input2);
+            
+            // Verify result
+            if (out.defined() && out.numel() > 0) {
+                volatile float sum_val2 = out.sum().item<float>();
+                (void)sum_val2;
             }
         }
         
-        // Test with edge cases if we have more data
+        // Test with specific dtypes to improve coverage
         if (Size - offset >= 2) {
-            // Create a tensor with potentially extreme values
-            torch::Tensor edge_input = fuzzer_utils::createTensor(Data, Size, offset);
+            // Extract dtype choice from fuzzer data
+            uint8_t dtype_choice = Data[offset % Size] % 3;
+            offset++;
             
-            // Apply operation to edge case
-            torch::Tensor edge_result = torch::special::ndtr(edge_input);
-            
-            // Try to access the result
-            if (edge_result.defined() && edge_result.numel() > 0) {
-                auto edge_item = edge_result.item();
+            torch::Tensor typed_input;
+            try {
+                torch::Tensor base_input = fuzzer_utils::createTensor(Data, Size, offset);
+                
+                // Convert to different floating point types (ndtr requires floating point)
+                switch (dtype_choice) {
+                    case 0:
+                        typed_input = base_input.to(torch::kFloat32);
+                        break;
+                    case 1:
+                        typed_input = base_input.to(torch::kFloat64);
+                        break;
+                    case 2:
+                        typed_input = base_input.to(torch::kFloat16);
+                        break;
+                    default:
+                        typed_input = base_input.to(torch::kFloat32);
+                        break;
+                }
+                
+                torch::Tensor typed_result = torch::special::ndtr(typed_input);
+                
+                if (typed_result.defined() && typed_result.numel() > 0) {
+                    volatile float sum_val3 = typed_result.sum().to(torch::kFloat32).item<float>();
+                    (void)sum_val3;
+                }
+            } catch (const c10::Error &) {
+                // Silently catch type conversion errors or unsupported dtype errors
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

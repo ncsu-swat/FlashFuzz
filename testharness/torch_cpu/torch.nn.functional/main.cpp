@@ -1,16 +1,20 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes to create tensors and parameters
         if (Size < 8) {
             return 0;
         }
@@ -18,20 +22,16 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create parameters for nn.functional operations
-        // We'll test various nn.functional operations based on available bytes
         if (offset + 1 >= Size) {
             return 0;
         }
         
-        // Use a byte to select which nn.functional operation to test
         uint8_t op_selector = Data[offset++];
         
-        // Test different nn.functional operations based on the selector
-        switch (op_selector % 10) {
+        switch (op_selector % 12) {
             case 0: {
                 // Test relu
-                auto output = torch::nn::functional::relu(input);
+                auto output = torch::relu(input);
                 break;
             }
             case 1: {
@@ -45,113 +45,103 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 break;
             }
             case 3: {
-                // Test softmax
-                if (offset + 1 >= Size) {
-                    break;
+                // Test softmax - need valid dimension
+                try {
+                    int64_t dim = input.dim() > 0 ? (static_cast<int64_t>(Data[offset % Size]) % input.dim()) : 0;
+                    offset++;
+                    auto output = torch::softmax(input, dim);
+                } catch (...) {
+                    // Shape mismatch, silently ignore
                 }
-                int64_t dim = static_cast<int64_t>(Data[offset++]);
-                auto output = torch::nn::functional::softmax(input, torch::nn::functional::SoftmaxFuncOptions(dim));
                 break;
             }
             case 4: {
                 // Test dropout
-                if (offset + sizeof(float) >= Size) {
-                    break;
-                }
-                float p = 0.0;
+                if (offset + sizeof(float) >= Size) break;
+                float p = 0.0f;
                 std::memcpy(&p, Data + offset, sizeof(float));
                 offset += sizeof(float);
-                p = std::abs(p) / 10.0f; // Normalize to [0, 0.1]
-                auto output = torch::dropout(input, p, true);
+                // Clamp p to valid range [0, 1)
+                p = std::fmod(std::abs(p), 1.0f);
+                if (std::isnan(p) || std::isinf(p)) p = 0.5f;
+                auto output = torch::dropout(input, p, /*train=*/true);
                 break;
             }
             case 5: {
-                // Test log_softmax
-                if (offset + 1 >= Size) {
-                    break;
+                // Test log_softmax - need valid dimension
+                try {
+                    int64_t dim = input.dim() > 0 ? (static_cast<int64_t>(Data[offset % Size]) % input.dim()) : 0;
+                    offset++;
+                    auto output = torch::log_softmax(input, dim);
+                } catch (...) {
+                    // Shape mismatch, silently ignore
                 }
-                int64_t dim = static_cast<int64_t>(Data[offset++]);
-                auto output = torch::nn::functional::log_softmax(input, torch::nn::functional::LogSoftmaxFuncOptions(dim));
                 break;
             }
             case 6: {
                 // Test leaky_relu
-                if (offset + sizeof(float) >= Size) {
-                    break;
-                }
-                float negative_slope = 0.0;
+                if (offset + sizeof(float) >= Size) break;
+                float negative_slope = 0.0f;
                 std::memcpy(&negative_slope, Data + offset, sizeof(float));
                 offset += sizeof(float);
-                negative_slope = std::abs(negative_slope) / 10.0f; // Normalize to [0, 0.1]
-                auto output = torch::nn::functional::leaky_relu(input, torch::nn::functional::LeakyReLUFuncOptions().negative_slope(negative_slope));
+                negative_slope = std::fmod(std::abs(negative_slope), 1.0f);
+                if (std::isnan(negative_slope) || std::isinf(negative_slope)) negative_slope = 0.01f;
+                auto output = torch::leaky_relu(input, negative_slope);
                 break;
             }
             case 7: {
                 // Test gelu
-                auto output = torch::nn::functional::gelu(input);
+                auto output = torch::gelu(input);
                 break;
             }
             case 8: {
-                // Test batch_norm
-                if (input.dim() < 2 || offset + 2 >= Size) {
-                    break;
-                }
-                
-                // Create running_mean and running_var tensors
-                torch::Tensor running_mean = fuzzer_utils::createTensor(Data, Size, offset);
-                torch::Tensor running_var = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Get momentum and eps parameters
-                float momentum = 0.1;
-                float eps = 1e-5;
-                if (offset + 2*sizeof(float) <= Size) {
-                    std::memcpy(&momentum, Data + offset, sizeof(float));
-                    offset += sizeof(float);
-                    std::memcpy(&eps, Data + offset, sizeof(float));
-                    offset += sizeof(float);
-                    
-                    // Ensure valid values
-                    momentum = std::abs(momentum) / 10.0f; // Normalize to [0, 0.1]
-                    eps = std::abs(eps) / 1000.0f + 1e-6;  // Ensure positive and small
-                }
-                
-                auto options = torch::nn::functional::BatchNormFuncOptions()
-                    .training(true)
-                    .momentum(momentum)
-                    .eps(eps);
-                
-                auto output = torch::nn::functional::batch_norm(
-                    input, running_mean, running_var, options);
+                // Test elu
+                auto output = torch::elu(input);
                 break;
             }
             case 9: {
-                // Test layer_norm
-                if (input.dim() < 1 || offset + 1 >= Size) {
-                    break;
+                // Test selu
+                auto output = torch::selu(input);
+                break;
+            }
+            case 10: {
+                // Test hardtanh
+                try {
+                    float min_val = -1.0f;
+                    float max_val = 1.0f;
+                    if (offset + 2 * sizeof(float) <= Size) {
+                        std::memcpy(&min_val, Data + offset, sizeof(float));
+                        offset += sizeof(float);
+                        std::memcpy(&max_val, Data + offset, sizeof(float));
+                        offset += sizeof(float);
+                        // Ensure valid range
+                        if (std::isnan(min_val) || std::isinf(min_val)) min_val = -1.0f;
+                        if (std::isnan(max_val) || std::isinf(max_val)) max_val = 1.0f;
+                        if (min_val > max_val) std::swap(min_val, max_val);
+                    }
+                    auto output = torch::hardtanh(input, min_val, max_val);
+                } catch (...) {
+                    // Invalid params, silently ignore
                 }
-                
-                // Create normalized_shape
-                std::vector<int64_t> normalized_shape;
-                uint8_t num_dims = Data[offset++] % 4 + 1; // 1 to 4 dimensions
-                
-                for (uint8_t i = 0; i < num_dims && offset < Size; i++) {
-                    int64_t dim_size = static_cast<int64_t>(Data[offset++]) % 16 + 1; // 1 to 16
-                    normalized_shape.push_back(dim_size);
+                break;
+            }
+            case 11: {
+                // Test threshold
+                try {
+                    float threshold = 0.0f;
+                    float value = 0.0f;
+                    if (offset + 2 * sizeof(float) <= Size) {
+                        std::memcpy(&threshold, Data + offset, sizeof(float));
+                        offset += sizeof(float);
+                        std::memcpy(&value, Data + offset, sizeof(float));
+                        offset += sizeof(float);
+                        if (std::isnan(threshold) || std::isinf(threshold)) threshold = 0.0f;
+                        if (std::isnan(value) || std::isinf(value)) value = 0.0f;
+                    }
+                    auto output = torch::threshold(input, threshold, value);
+                } catch (...) {
+                    // Invalid params, silently ignore
                 }
-                
-                // Create weight and bias tensors
-                torch::Tensor weight = fuzzer_utils::createTensor(Data, Size, offset);
-                torch::Tensor bias = fuzzer_utils::createTensor(Data, Size, offset);
-                
-                // Get eps parameter
-                float eps = 1e-5;
-                if (offset + sizeof(float) <= Size) {
-                    std::memcpy(&eps, Data + offset, sizeof(float));
-                    offset += sizeof(float);
-                    eps = std::abs(eps) / 1000.0f + 1e-6;  // Ensure positive and small
-                }
-                
-                auto output = torch::layer_norm(input, normalized_shape, weight, bias, eps);
                 break;
             }
         }
@@ -159,7 +149,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

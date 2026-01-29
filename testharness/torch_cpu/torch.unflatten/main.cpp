@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,42 +23,69 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Extract parameters for unflatten operation
+        // Skip scalar tensors - unflatten requires at least 1D
+        if (input_tensor.dim() == 0) {
+            return 0;
+        }
+        
         // Need at least 2 more bytes for dim and sizes
         if (offset + 2 > Size) {
             return 0;
         }
         
-        // Get dimension to unflatten
-        int64_t dim = static_cast<int64_t>(Data[offset++]);
-        
-        // Allow negative dimensions (PyTorch handles them by wrapping)
-        if (dim > 127) {
-            dim = dim - 256; // Convert to negative value if high bit is set
-        }
+        // Get dimension to unflatten - constrain to valid range
+        int8_t raw_dim = static_cast<int8_t>(Data[offset++]);
+        int64_t dim = raw_dim % input_tensor.dim();
         
         // Get number of dimensions to unflatten into
         uint8_t num_unflatten_dims = Data[offset++] % 4 + 1; // 1-4 dimensions
         
-        // Parse unflatten sizes
-        std::vector<int64_t> unflatten_sizes;
-        for (uint8_t i = 0; i < num_unflatten_dims && offset < Size; ++i) {
-            int64_t size = static_cast<int64_t>(Data[offset++] % 8 + 1); // 1-8 size
-            unflatten_sizes.push_back(size);
+        // Get the size of the dimension we're unflattening
+        int64_t dim_size = input_tensor.size(dim);
+        
+        // Skip if dimension size is 0
+        if (dim_size == 0) {
+            return 0;
         }
         
-        // If we don't have enough dimensions, add some defaults
-        while (unflatten_sizes.size() < num_unflatten_dims) {
-            unflatten_sizes.push_back(1);
+        // Parse unflatten sizes - they must multiply to dim_size
+        std::vector<int64_t> unflatten_sizes;
+        int64_t remaining = dim_size;
+        
+        for (uint8_t i = 0; i < num_unflatten_dims - 1 && offset < Size && remaining > 1; ++i) {
+            // Choose a factor of remaining, or a small value that we'll adjust later
+            int64_t size = static_cast<int64_t>(Data[offset++] % 4 + 1); // 1-4
+            
+            // Find the closest valid divisor
+            while (size > 1 && remaining % size != 0) {
+                size--;
+            }
+            
+            if (size > 0 && remaining % size == 0) {
+                unflatten_sizes.push_back(size);
+                remaining /= size;
+            }
+        }
+        
+        // Add the remaining size as the last dimension
+        unflatten_sizes.push_back(remaining);
+        
+        // If we ended up with just one size that equals dim_size, add another dimension of 1
+        // to make unflatten meaningful (though unflatten with single dim is valid)
+        if (unflatten_sizes.size() == 1 && offset < Size && Data[offset++] % 2 == 0) {
+            unflatten_sizes.insert(unflatten_sizes.begin(), 1);
         }
         
         // Apply unflatten operation
         torch::Tensor output;
         
         // Try different variants of unflatten
+        uint8_t variant = 0;
         if (offset < Size) {
-            uint8_t variant = Data[offset++] % 3;
-            
+            variant = Data[offset++] % 2;
+        }
+        
+        try {
             switch (variant) {
                 case 0:
                     // Variant 1: unflatten with dimension and sizes vector
@@ -61,32 +93,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     break;
                     
                 case 1:
-                    // Variant 2: unflatten with named dimension (if tensor has names)
-                    if (unflatten_sizes.size() >= 2) {
-                        // Create some dimension names
-                        std::vector<torch::Dimname> dimnames;
-                        for (size_t i = 0; i < input_tensor.dim(); ++i) {
-                            dimnames.push_back(torch::Dimname::wildcard());
-                        }
-                        
-                        // Apply names to the tensor
-                        auto named_tensor = input_tensor.refine_names(dimnames);
-                        
-                        // Create names for the unflattened dimensions
-                        std::vector<torch::Dimname> unflatten_names;
-                        for (size_t i = 0; i < unflatten_sizes.size(); ++i) {
-                            unflatten_names.push_back(torch::Dimname::wildcard());
-                        }
-                        
-                        // Use the first dimname for unflattening with names
-                        output = named_tensor.unflatten(dimnames[0], unflatten_sizes, unflatten_names);
-                    } else {
-                        output = input_tensor.unflatten(dim, unflatten_sizes);
-                    }
-                    break;
-                    
-                case 2:
-                    // Variant 3: unflatten with dimension and sizes as initializer list
+                    // Variant 2: unflatten with dimension and sizes as initializer list
                     if (unflatten_sizes.size() == 1) {
                         output = input_tensor.unflatten(dim, {unflatten_sizes[0]});
                     } else if (unflatten_sizes.size() == 2) {
@@ -98,9 +105,9 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     }
                     break;
             }
-        } else {
-            // Default variant if we don't have enough data
-            output = input_tensor.unflatten(dim, unflatten_sizes);
+        } catch (const c10::Error& e) {
+            // Expected failures due to invalid dimension/size combinations
+            return 0;
         }
         
         // Basic operations on the output tensor to ensure it's valid
@@ -108,19 +115,39 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         auto numel = output.numel();
         auto dtype = output.dtype();
         
+        // Verify the unflatten was correct
+        if (numel != input_tensor.numel()) {
+            std::cerr << "Numel mismatch after unflatten!" << std::endl;
+            return -1;
+        }
+        
         // Try some operations that might expose issues
-        if (numel > 0) {
+        if (numel > 0 && output.is_floating_point()) {
             auto sum = output.sum();
             auto mean = output.mean();
         }
         
-        // Try reshaping back to original
-        auto reshaped = output.reshape_as(input_tensor);
+        // Verify we can flatten back
+        try {
+            auto flattened = output.flatten(dim, dim + static_cast<int64_t>(unflatten_sizes.size()) - 1);
+            
+            // Verify shapes match
+            if (!flattened.sizes().equals(input_tensor.sizes())) {
+                // Shape mismatch is unexpected
+                std::cerr << "Shape mismatch after flatten roundtrip!" << std::endl;
+            }
+        } catch (const c10::Error& e) {
+            // Flatten might fail in edge cases, that's ok
+        }
+        
+        // Try contiguous and clone operations
+        auto contiguous = output.contiguous();
+        auto cloned = output.clone();
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

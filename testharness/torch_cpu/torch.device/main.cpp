@@ -1,19 +1,28 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least 1 byte for device type and 1 byte for index
+        // Need at least 2 bytes for device type and index
         if (Size < 2) {
             return 0;
         }
+        
+        size_t offset = 0;
+        
+        // Parse device type and index from the first two bytes
+        uint8_t device_type_byte = Data[offset++];
+        uint8_t device_index_byte = Data[offset++];
         
         // Create a tensor to test with device operations
         torch::Tensor tensor;
@@ -24,13 +33,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             tensor = torch::ones({2, 3});
         }
         
-        // Parse device type (cpu, cuda, etc.)
-        uint8_t device_type_byte = (offset < Size) ? Data[offset++] : 0;
-        uint8_t device_index_byte = (offset < Size) ? Data[offset++] : 0;
-        
-        // Map device_type_byte to a device type
+        // Map device_type_byte to a valid device type
+        // Only use device types that exist in PyTorch C++ frontend
         std::string device_type;
-        switch (device_type_byte % 4) {
+        switch (device_type_byte % 3) {
             case 0:
                 device_type = "cpu";
                 break;
@@ -38,10 +44,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 device_type = "cuda";
                 break;
             case 2:
-                device_type = "mkldnn";
-                break;
-            case 3:
-                device_type = "opengl";
+                device_type = "meta";
                 break;
         }
         
@@ -50,10 +53,21 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Test different ways to create and use torch::Device
         
-        // 1. Create device from string
+        // 1. Create device from string (no index)
         try {
             torch::Device device1(device_type);
-            auto tensor_on_device1 = tensor.to(device1);
+            // Test device properties
+            (void)device1.str();
+            (void)device1.type();
+            (void)device1.has_index();
+            (void)device1.is_cuda();
+            (void)device1.is_cpu();
+            (void)device1.is_meta();
+            
+            // Only move to CPU or meta devices since CUDA may not be available
+            if (device1.is_cpu() || device1.is_meta()) {
+                auto tensor_on_device1 = tensor.to(device1);
+            }
         } catch (...) {
             // Device might not be available, continue
         }
@@ -62,105 +76,110 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         try {
             std::string device_str = device_type + ":" + std::to_string(device_index);
             torch::Device device2(device_str);
-            auto tensor_on_device2 = tensor.to(device2);
-        } catch (...) {
-            // Device might not be available, continue
-        }
-        
-        // 3. Create device from type and index
-        try {
-            std::string device_str = device_type + ":" + std::to_string(device_index);
-            torch::Device device3(device_str);
-            auto tensor_on_device3 = tensor.to(device3);
-        } catch (...) {
-            // Device might not be available, continue
-        }
-        
-        // 4. Test device properties
-        try {
-            std::string device_str = device_type + ":" + std::to_string(device_index);
-            torch::Device device4(device_str);
-            std::string device_str_out = device4.str();
-            torch::DeviceType device_type_enum = device4.type();
-            int index = device4.index();
-            bool is_cuda = device4.is_cuda();
-            bool is_cpu = device4.is_cpu();
-        } catch (...) {
-            // Device might not be available, continue
-        }
-        
-        // 5. Test device equality
-        try {
-            std::string device_str_a = device_type + ":" + std::to_string(device_index);
-            std::string device_str_b = device_type + ":" + std::to_string(device_index);
-            std::string device_str_c = device_type + ":" + std::to_string((device_index + 1) % 8);
+            (void)device2.index();
             
-            torch::Device device5a(device_str_a);
-            torch::Device device5b(device_str_b);
-            torch::Device device5c(device_str_c);
-            
-            bool equal = (device5a == device5b);
-            bool not_equal = (device5a != device5c);
-        } catch (...) {
-            // Device might not be available, continue
-        }
-        
-        // 6. Test moving tensors between devices
-        try {
-            // Create two different devices
-            torch::Device cpu_device("cpu");
-            std::string other_device_str = device_type + ":" + std::to_string(device_index);
-            torch::Device other_device(other_device_str);
-            
-            // Move tensor to first device
-            auto tensor_on_cpu = tensor.to(cpu_device);
-            
-            // Move to second device if different from CPU
-            if (device_type != "cpu") {
-                auto tensor_on_other = tensor_on_cpu.to(other_device);
-                // Move back to CPU
-                auto back_to_cpu = tensor_on_other.to(cpu_device);
+            if (device2.is_cpu()) {
+                auto tensor_on_device2 = tensor.to(device2);
             }
         } catch (...) {
             // Device might not be available, continue
         }
         
-        // 7. Test device with options
+        // 3. Create device from DeviceType enum directly
         try {
-            std::string device_str = device_type + ":" + std::to_string(device_index);
-            torch::Device device7(device_str);
-            torch::TensorOptions options = torch::TensorOptions().device(device7);
+            torch::Device device3(torch::kCPU);
+            auto tensor_on_cpu = tensor.to(device3);
+            (void)tensor_on_cpu.device();
+        } catch (...) {
+            // Continue on failure
+        }
+        
+        // 4. Create device from DeviceType enum with index
+        try {
+            torch::Device device4(torch::kCPU, 0);
+            (void)device4.str();
+            (void)device4.index();
+        } catch (...) {
+            // Continue on failure
+        }
+        
+        // 5. Test device equality and comparison
+        try {
+            torch::Device cpu_device1(torch::kCPU);
+            torch::Device cpu_device2("cpu");
+            torch::Device cpu_device3(torch::kCPU, 0);
+            
+            bool equal1 = (cpu_device1 == cpu_device2);
+            bool equal2 = (cpu_device1 == cpu_device3);
+            (void)equal1;
+            (void)equal2;
+            
+            // Test inequality
+            torch::Device meta_device(torch::kMeta);
+            bool not_equal = (cpu_device1 != meta_device);
+            (void)not_equal;
+        } catch (...) {
+            // Continue on failure
+        }
+        
+        // 6. Test device with TensorOptions
+        try {
+            torch::Device cpu_device(torch::kCPU);
+            torch::TensorOptions options = torch::TensorOptions().device(cpu_device);
             auto new_tensor = torch::ones({3, 4}, options);
+            
+            // Verify device
+            torch::Device result_device = new_tensor.device();
+            (void)result_device.is_cpu();
         } catch (...) {
-            // Device might not be available, continue
+            // Continue on failure
         }
         
-        // 8. Test device with invalid inputs
+        // 7. Test tensor.device() accessor
         try {
-            // Create device with invalid type
-            if (offset < Size) {
-                std::string invalid_type = "invalid_device_type";
-                torch::Device invalid_device(invalid_type);
-            }
+            torch::Device tensor_device = tensor.device();
+            (void)tensor_device.str();
+            (void)tensor_device.type();
+            (void)tensor_device.is_cpu();
         } catch (...) {
-            // Expected to throw
+            // Continue on failure
         }
         
-        // 9. Test device with negative index
+        // 8. Test device set_index (if available)
         try {
-            if (offset < Size) {
-                int negative_index = -1;
-                std::string negative_device_str = device_type + ":" + std::to_string(negative_index);
-                torch::Device negative_device(negative_device_str);
+            torch::Device device8(torch::kCPU);
+            // Check if device supports index operations
+            if (device8.has_index()) {
+                (void)device8.index();
             }
         } catch (...) {
-            // May throw depending on implementation
+            // Continue on failure
+        }
+        
+        // 9. Test creating device from another device
+        try {
+            torch::Device original(torch::kCPU);
+            torch::Device copy = original;
+            bool same = (original == copy);
+            (void)same;
+        } catch (...) {
+            // Continue on failure
+        }
+        
+        // 10. Test device hash (for use in containers)
+        try {
+            torch::Device device10(torch::kCPU);
+            std::hash<torch::Device> hasher;
+            size_t hash_val = hasher(device10);
+            (void)hash_val;
+        } catch (...) {
+            // Hash might not be available in all versions
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

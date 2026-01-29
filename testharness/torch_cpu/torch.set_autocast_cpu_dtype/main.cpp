@@ -1,12 +1,17 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
-#include <torch/csrc/autograd/autocast_mode.h>
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <torch/torch.h>
+#include <ATen/autocast_mode.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -18,61 +23,106 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Parse the dtype to set for autocast
         uint8_t dtype_selector = Data[offset++];
-        torch::ScalarType autocast_dtype = fuzzer_utils::parseDataType(dtype_selector);
         
-        // Set the autocast CPU dtype
-        torch::autograd::set_autocast_cpu_dtype(autocast_dtype);
+        // Limit to dtypes that are valid for autocast CPU
+        // Typically bfloat16 or float16 for autocast
+        torch::ScalarType autocast_dtype;
+        switch (dtype_selector % 3) {
+            case 0:
+                autocast_dtype = torch::kBFloat16;
+                break;
+            case 1:
+                autocast_dtype = torch::kHalf;
+                break;
+            default:
+                autocast_dtype = torch::kFloat;
+                break;
+        }
+        
+        // Set the autocast CPU dtype using the new API
+        at::autocast::set_autocast_dtype(at::kCPU, autocast_dtype);
         
         // Create a tensor to test with autocast
         if (offset < Size) {
             torch::Tensor tensor = fuzzer_utils::createTensor(Data, Size, offset);
             
-            // Test autocast functionality by creating a context and performing an operation
+            // Ensure tensor is float type for autocast operations
+            if (!tensor.is_floating_point()) {
+                tensor = tensor.to(torch::kFloat);
+            }
+            
+            // Test autocast functionality
             {
-                torch::autograd::AutocastMode autocast_mode(torch::kCPU, true);
+                at::autocast::set_autocast_enabled(at::kCPU, true);
                 
                 // Perform some operations that would trigger autocast
-                torch::Tensor result = tensor + tensor;
-                torch::Tensor result2 = tensor * 2.0;
-                if (tensor.dim() >= 2) {
-                    torch::Tensor result3 = torch::matmul(tensor, tensor);
+                // Use inner try-catch for shape-related failures
+                try {
+                    torch::Tensor result = tensor + tensor;
+                    torch::Tensor result2 = tensor * 2.0f;
+                    
+                    // For matmul, create compatible shapes
+                    if (tensor.dim() == 2 && tensor.size(0) > 0 && tensor.size(1) > 0) {
+                        torch::Tensor transposed = tensor.t();
+                        torch::Tensor result3 = torch::matmul(tensor, transposed);
+                    } else if (tensor.dim() == 1 && tensor.size(0) > 0) {
+                        torch::Tensor result3 = torch::dot(tensor, tensor);
+                    }
+                } catch (...) {
+                    // Silently catch shape mismatches
+                }
+                
+                at::autocast::set_autocast_enabled(at::kCPU, false);
+            }
+            
+            // Test with autocast disabled
+            {
+                at::autocast::set_autocast_enabled(at::kCPU, false);
+                
+                try {
+                    torch::Tensor result = tensor + tensor;
+                    torch::Tensor result2 = tensor * 2.0f;
+                } catch (...) {
+                    // Silently catch failures
                 }
             }
             
-            // Test disabling autocast
+            // Test toggling autocast multiple times
             {
-                torch::autograd::AutocastMode autocast_mode(torch::kCPU, false);
+                at::autocast::set_autocast_enabled(at::kCPU, true);
                 
-                // Perform operations with autocast disabled
-                torch::Tensor result = tensor + tensor;
-                torch::Tensor result2 = tensor * 2.0;
-            }
-            
-            // Test nested autocast contexts
-            {
-                torch::autograd::AutocastMode outer_mode(torch::kCPU, true);
+                try {
+                    torch::Tensor outer_result = tensor + tensor;
+                } catch (...) {}
                 
-                // Perform operation in outer context
-                torch::Tensor outer_result = tensor + tensor;
+                at::autocast::set_autocast_enabled(at::kCPU, false);
                 
-                {
-                    // Inner context with different setting
-                    torch::autograd::AutocastMode inner_mode(torch::kCPU, false);
-                    torch::Tensor inner_result = tensor + tensor;
-                }
+                try {
+                    torch::Tensor inner_result = tensor - tensor;
+                } catch (...) {}
                 
-                // Back to outer context
-                torch::Tensor outer_result2 = tensor * 2.0;
+                at::autocast::set_autocast_enabled(at::kCPU, true);
+                
+                try {
+                    torch::Tensor outer_result2 = tensor * 2.0f;
+                } catch (...) {}
+                
+                at::autocast::set_autocast_enabled(at::kCPU, false);
             }
         }
         
-        // Reset autocast dtype to default (float32)
-        torch::autograd::set_autocast_cpu_dtype(torch::ScalarType::Float);
+        // Get the current autocast dtype to verify it was set
+        torch::ScalarType current_dtype = at::autocast::get_autocast_dtype(at::kCPU);
+        (void)current_dtype; // Avoid unused variable warning
+        
+        // Reset autocast dtype to default
+        at::autocast::set_autocast_dtype(at::kCPU, torch::kBFloat16);
+        at::autocast::set_autocast_enabled(at::kCPU, false);
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

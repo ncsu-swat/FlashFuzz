@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -22,7 +27,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         int64_t rank = input_tensor.dim();
         
         // If we've consumed all data or not enough left for axes, return
-        if (offset + 2 >= Size) {
+        if (offset + 2 > Size) {
             return 0;
         }
         
@@ -33,6 +38,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test single axis moveaxis
         try {
             torch::Tensor result1 = torch::moveaxis(input_tensor, source_axis, destination_axis);
+            (void)result1; // Prevent unused variable warning
         } catch (const c10::Error &e) {
             // PyTorch-specific exceptions are expected for invalid inputs
         }
@@ -48,15 +54,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             // Ensure we have enough data for the axes
             if (offset + 2 * num_axes <= Size) {
                 for (uint8_t i = 0; i < num_axes; ++i) {
-                    if (offset + 1 < Size) {
-                        source_axes.push_back(static_cast<int8_t>(Data[offset++]));
-                        destination_axes.push_back(static_cast<int8_t>(Data[offset++]));
-                    }
+                    source_axes.push_back(static_cast<int8_t>(Data[offset++]));
+                    destination_axes.push_back(static_cast<int8_t>(Data[offset++]));
                 }
                 
                 // Test multiple axes moveaxis
                 try {
                     torch::Tensor result2 = torch::moveaxis(input_tensor, source_axes, destination_axes);
+                    (void)result2; // Prevent unused variable warning
                 } catch (const c10::Error &e) {
                     // PyTorch-specific exceptions are expected for invalid inputs
                 }
@@ -72,6 +77,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             
             try {
                 torch::Tensor empty_result = torch::moveaxis(empty_tensor, source_axis, destination_axis);
+                (void)empty_result; // Prevent unused variable warning
             } catch (const c10::Error &e) {
                 // PyTorch-specific exceptions are expected for invalid inputs
             }
@@ -82,6 +88,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             torch::Tensor scalar_tensor = torch::tensor(static_cast<int>(Data[offset]));
             try {
                 torch::Tensor scalar_result = torch::moveaxis(scalar_tensor, source_axis, destination_axis);
+                (void)scalar_result; // Prevent unused variable warning
             } catch (const c10::Error &e) {
                 // PyTorch-specific exceptions are expected for invalid inputs
             }

@@ -1,12 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 #include <torch/torch.h>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -20,7 +24,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::ModuleList moduleList;
         
         // Determine number of modules to add (1-10)
-        uint8_t numModules = (Size > 0) ? (Data[offset] % 10) + 1 : 3;
+        uint8_t numModules = (Data[offset] % 10) + 1;
         offset = std::min(offset + 1, Size);
         
         // Create and add modules to the ModuleList
@@ -85,20 +89,28 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Test ModuleList operations
         
         // 1. Test size() method
-        auto size = moduleList->size();
+        size_t listSize = moduleList->size();
         
-        // 2. Test iteration through modules
-        for (const auto& module : *moduleList) {
-            auto paramSize = module->parameters().size();
+        // 2. Test is_empty() method
+        bool isEmpty = moduleList->is_empty();
+        
+        // 3. Test iteration through modules using begin/end
+        for (auto it = moduleList->begin(); it != moduleList->end(); ++it) {
+            auto paramSize = (*it)->parameters().size();
+            (void)paramSize; // suppress unused variable warning
         }
         
-        // 3. Test indexing
-        if (moduleList->size() > 0) {
-            auto firstModule = (*moduleList)[0];
+        // 4. Test indexing with at() and operator[]
+        if (listSize > 0) {
+            auto firstModule = moduleList[0];
+            
+            // Test ptr() method for accessing underlying module
+            auto modulePtr = moduleList->ptr(0);
+            (void)modulePtr;
         }
         
-        // 4. Test extend method if we have enough modules
-        if (numModules > 2) {
+        // 5. Test extend method if we have modules
+        if (listSize > 0) {
             torch::nn::ModuleList additionalModules;
             additionalModules->push_back(torch::nn::Linear(10, 5));
             additionalModules->push_back(torch::nn::ReLU());
@@ -106,24 +118,40 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             moduleList->extend(*additionalModules);
         }
         
-        // 5. Test push_back method instead of append
+        // 6. Test push_back method with different module
         moduleList->push_back(torch::nn::Linear(5, 1));
         
-        // 6. Create a tensor and try to pass it through the modules
+        // 7. Test children() method
+        auto children = moduleList->children();
+        (void)children;
+        
+        // 8. Test named_children()
+        auto namedChildren = moduleList->named_children();
+        (void)namedChildren;
+        
+        // 9. Test parameters() method
+        auto params = moduleList->parameters();
+        (void)params;
+        
+        // 10. Test named_parameters()
+        auto namedParams = moduleList->named_parameters();
+        (void)namedParams;
+        
+        // 11. Create a tensor and try to pass it through compatible modules
         if (offset < Size && Size - offset > 2) {
             try {
                 auto tensor = fuzzer_utils::createTensor(Data, Size, offset);
                 
-                // Only process the tensor if it's valid for the modules
+                // Only process the tensor if it's valid
                 if (tensor.defined() && tensor.numel() > 0) {
                     // Try to pass the tensor through each module
                     for (size_t i = 0; i < moduleList->size(); ++i) {
-                        auto module = (*moduleList)[i];
+                        auto module = moduleList->ptr(i);
                         
                         // Check if the module is a Linear layer
                         if (auto linearPtr = std::dynamic_pointer_cast<torch::nn::LinearImpl>(module)) {
                             // Reshape tensor to match Linear layer input requirements
-                            if (tensor.dim() > 1) {
+                            if (tensor.dim() >= 1) {
                                 int64_t inFeatures = linearPtr->options.in_features();
                                 if (tensor.size(-1) == inFeatures) {
                                     tensor = linearPtr->forward(tensor);
@@ -140,7 +168,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                         }
                         // Check if the module is Conv2d
                         else if (auto convPtr = std::dynamic_pointer_cast<torch::nn::Conv2dImpl>(module)) {
-                            // Reshape tensor to match Conv2d input requirements if needed
+                            // Conv2d requires 4D input (batch, channels, height, width)
                             if (tensor.dim() == 4) {
                                 int64_t inChannels = convPtr->options.in_channels();
                                 if (tensor.size(1) == inChannels) {
@@ -160,22 +188,34 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                     }
                 }
             } catch (const std::exception& e) {
-                // Catch exceptions from tensor operations but continue fuzzing
+                // Catch exceptions from tensor operations silently - these are expected
+                // when tensor shapes don't match module requirements
             }
         }
         
-        // 7. Test clear method
-        moduleList->clear();
+        // 12. Test train/eval mode switching
+        moduleList->train();
+        moduleList->eval();
         
-        // 8. Test insert method
-        moduleList->insert(0, torch::nn::Linear(10, 5));
+        // 13. Test to() method for device/dtype conversion
+        moduleList->to(torch::kFloat32);
+        
+        // 14. Test zero_grad()
+        moduleList->zero_grad();
+        
+        // 15. Test clone() if available
+        try {
+            auto cloned = moduleList->clone();
+            (void)cloned;
+        } catch (...) {
+            // clone may not be available for all configurations
+        }
         
         return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

@@ -1,111 +1,135 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cmath>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        // Need at least a few bytes for basic parameters
-        if (Size < 4) {
+        // Need at least a few bytes for parameters
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Extract parameters for InstanceNorm1d from the remaining data
-        uint8_t num_features = 0;
+        // Extract parameters first before creating tensor
+        // Extract num_features (1-128 range)
+        int64_t num_features = (Data[offset++] % 127) + 1;
+        
+        // Extract shape parameters
+        int64_t batch_size = (Data[offset++] % 8) + 1;  // 1-8
+        int64_t seq_length = (Data[offset++] % 64) + 1; // 1-64
+        
         float eps = 1e-5;
-        float momentum = 0.1;
-        bool affine = false;
-        bool track_running_stats = false;
-        
-        if (offset < Size) {
-            // Extract num_features - ensure it's at least 1
-            num_features = Data[offset++] + 1;
-        }
-        
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&eps, Data + offset, sizeof(float));
             offset += sizeof(float);
-            // Ensure eps is positive and not too small
             eps = std::abs(eps);
-            if (eps < 1e-10) eps = 1e-5;
+            if (eps < 1e-10 || std::isnan(eps) || std::isinf(eps)) {
+                eps = 1e-5;
+            }
         }
         
+        float momentum = 0.1;
         if (offset + sizeof(float) <= Size) {
             std::memcpy(&momentum, Data + offset, sizeof(float));
             offset += sizeof(float);
-            // Ensure momentum is in [0, 1]
             momentum = std::abs(momentum);
-            if (momentum > 1.0) momentum = momentum - std::floor(momentum);
+            if (momentum > 1.0 || std::isnan(momentum) || std::isinf(momentum)) {
+                momentum = 0.1;
+            }
         }
         
+        bool affine = false;
+        bool track_running_stats = false;
         if (offset < Size) {
             affine = Data[offset++] & 0x1;
         }
-        
         if (offset < Size) {
             track_running_stats = Data[offset++] & 0x1;
         }
         
-        // Reshape input tensor if needed to match InstanceNorm1d requirements
-        // InstanceNorm1d expects input of shape (N, C, L) or (C, L)
-        auto input_sizes = input.sizes().vec();
+        // Determine input format: 2D (C, L) or 3D (N, C, L)
+        bool use_3d = (offset < Size) ? (Data[offset++] & 0x1) : true;
         
-        // If input is empty or scalar, reshape it to a valid shape
-        if (input_sizes.empty()) {
-            input = input.reshape({1, num_features, 1});
-        } 
-        // If input is 1D, reshape to (1, C, L)
-        else if (input_sizes.size() == 1) {
-            int64_t length = input_sizes[0];
-            input = input.reshape({1, num_features, length > 0 ? length : 1});
+        torch::NoGradGuard no_grad;
+        
+        // Create input tensor with shape matching num_features
+        torch::Tensor input;
+        if (use_3d) {
+            // (N, C, L) format
+            input = torch::randn({batch_size, num_features, seq_length});
+        } else {
+            // (C, L) format - unbatched
+            input = torch::randn({num_features, seq_length});
         }
-        // If input is 2D, interpret as (C, L)
-        else if (input_sizes.size() == 2) {
-            // Keep as is, InstanceNorm1d accepts (C, L)
-        }
-        // If input has more than 3 dimensions, reshape to 3D
-        else if (input_sizes.size() > 3) {
-            int64_t total_elements = input.numel();
-            int64_t L = 1;
-            int64_t N = 1;
-            if (total_elements > 0) {
-                L = total_elements / (num_features * N);
-                if (L <= 0) L = 1;
+        
+        // Use remaining fuzzer data to perturb the tensor values
+        if (offset < Size) {
+            size_t remaining = Size - offset;
+            auto input_data = input.data_ptr<float>();
+            int64_t numel = input.numel();
+            for (size_t i = 0; i < remaining && i < static_cast<size_t>(numel); i++) {
+                input_data[i] += static_cast<float>(Data[offset + i] - 128) / 128.0f;
             }
-            input = input.reshape({N, num_features, L});
         }
         
         // Create InstanceNorm1d module
-        torch::nn::InstanceNorm1d instance_norm(
-            torch::nn::InstanceNorm1dOptions(num_features)
-                .eps(eps)
-                .momentum(momentum)
-                .affine(affine)
-                .track_running_stats(track_running_stats)
-        );
+        auto options = torch::nn::InstanceNorm1dOptions(num_features)
+            .eps(eps)
+            .momentum(momentum)
+            .affine(affine)
+            .track_running_stats(track_running_stats);
+        
+        torch::nn::InstanceNorm1d instance_norm(options);
         
         // Apply InstanceNorm1d
         torch::Tensor output = instance_norm(input);
         
-        // Perform some operations on the output to ensure it's used
-        auto sum = output.sum();
-        
-        // Convert to CPU if needed and access a value to ensure computation
-        if (sum.device().is_cuda()) {
-            sum = sum.to(torch::kCPU);
+        // Verify output shape matches input shape
+        if (output.sizes() != input.sizes()) {
+            std::cerr << "Shape mismatch!" << std::endl;
+            return -1;
         }
         
+        // Exercise the output
+        auto sum = output.sum();
         float result = sum.item<float>();
         
-        // Use the result in a way that prevents the compiler from optimizing it away
+        // Additional operations to improve coverage
+        if (affine) {
+            // Access learned parameters
+            auto weight = instance_norm->weight;
+            auto bias = instance_norm->bias;
+            if (weight.defined()) {
+                (void)weight.sum().item<float>();
+            }
+            if (bias.defined()) {
+                (void)bias.sum().item<float>();
+            }
+        }
+        
+        if (track_running_stats) {
+            // Access running stats if tracked
+            auto running_mean = instance_norm->running_mean;
+            auto running_var = instance_norm->running_var;
+            if (running_mean.defined()) {
+                (void)running_mean.sum().item<float>();
+            }
+            if (running_var.defined()) {
+                (void)running_var.sum().item<float>();
+            }
+        }
+        
+        // Prevent optimization
         if (std::isnan(result) || std::isinf(result)) {
             return 0;
         }
@@ -113,7 +137,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

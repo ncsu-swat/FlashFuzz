@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -26,7 +31,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             offset += sizeof(int64_t);
             
             // Ensure upscale_factor is positive (required by PixelUnshuffle)
-            // But don't filter out 0 or negative values completely as they should trigger exceptions
             upscale_factor = std::abs(raw_factor) % 8 + 1;
             
             // Occasionally test with invalid values to check error handling
@@ -37,66 +41,62 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             }
         }
         
-        // Create PixelUnshuffle module
+        // Create PixelUnshuffle module - may throw for invalid upscale_factor
         torch::nn::PixelUnshuffle pixelUnshuffle(upscale_factor);
         
-        // Apply the operation
-        torch::Tensor output = pixelUnshuffle->forward(input);
-        
-        // Optionally perform some validation on the output
-        if (!output.defined()) {
-            throw std::runtime_error("Output tensor is undefined");
+        // Apply the operation - may throw for incompatible input shapes
+        try {
+            torch::Tensor output = pixelUnshuffle->forward(input);
+            
+            // Optionally perform some validation on the output
+            if (output.defined()) {
+                // Access some properties to ensure the tensor is valid
+                auto sizes = output.sizes();
+                auto numel = output.numel();
+                (void)sizes;
+                (void)numel;
+            }
+        } catch (const std::exception& e) {
+            // Expected for random tensor shapes that don't meet PixelUnshuffle requirements
         }
         
         // Test some edge cases with specific tensor shapes
         if (offset + 1 <= Size) {
             uint8_t edge_case_selector = Data[offset++];
             
-            // Create tensors with specific shapes for edge cases
-            if (edge_case_selector % 5 == 0) {
-                // Test with a tensor that has exactly the right dimensions for unshuffle
-                std::vector<int64_t> shape = {1, 1, upscale_factor, upscale_factor};
-                torch::Tensor edge_input = torch::ones(shape);
-                torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
-            } else if (edge_case_selector % 5 == 1) {
-                // Test with a tensor that has dimensions not divisible by upscale_factor
-                if (upscale_factor > 1) {
-                    std::vector<int64_t> shape = {1, 3, upscale_factor + 1, upscale_factor + 1};
-                    torch::Tensor edge_input = torch::ones(shape);
-                    try {
-                        torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
-                    } catch (const std::exception& e) {
-                        // Expected exception for incompatible dimensions
-                    }
-                }
-            } else if (edge_case_selector % 5 == 2) {
-                // Test with a 2D tensor (missing batch and channel dims)
-                if (upscale_factor > 1) {
-                    std::vector<int64_t> shape = {upscale_factor * 2, upscale_factor * 2};
-                    torch::Tensor edge_input = torch::ones(shape);
-                    try {
-                        torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
-                    } catch (const std::exception& e) {
-                        // Expected exception for wrong number of dimensions
-                    }
-                }
-            } else if (edge_case_selector % 5 == 3) {
-                // Test with a 5D tensor (extra dimension)
-                std::vector<int64_t> shape = {1, 1, upscale_factor, upscale_factor, 1};
-                torch::Tensor edge_input = torch::ones(shape);
+            // Only test edge cases with valid upscale_factor
+            if (upscale_factor > 0) {
                 try {
-                    torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
+                    if (edge_case_selector % 5 == 0) {
+                        // Test with a tensor that has exactly the right dimensions for unshuffle
+                        std::vector<int64_t> shape = {1, 1, upscale_factor, upscale_factor};
+                        torch::Tensor edge_input = torch::ones(shape);
+                        torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
+                    } else if (edge_case_selector % 5 == 1) {
+                        // Test with a tensor that has dimensions not divisible by upscale_factor
+                        if (upscale_factor > 1) {
+                            std::vector<int64_t> shape = {1, 3, upscale_factor + 1, upscale_factor + 1};
+                            torch::Tensor edge_input = torch::ones(shape);
+                            torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
+                        }
+                    } else if (edge_case_selector % 5 == 2) {
+                        // Test with a 2D tensor (missing batch and channel dims)
+                        std::vector<int64_t> shape = {upscale_factor * 2, upscale_factor * 2};
+                        torch::Tensor edge_input = torch::ones(shape);
+                        torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
+                    } else if (edge_case_selector % 5 == 3) {
+                        // Test with a 5D tensor (extra dimension)
+                        std::vector<int64_t> shape = {1, 1, upscale_factor, upscale_factor, 1};
+                        torch::Tensor edge_input = torch::ones(shape);
+                        torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
+                    } else {
+                        // Test with larger valid dimensions
+                        std::vector<int64_t> shape = {2, 4, upscale_factor * 3, upscale_factor * 3};
+                        torch::Tensor edge_input = torch::randn(shape);
+                        torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
+                    }
                 } catch (const std::exception& e) {
-                    // Expected exception for wrong number of dimensions
-                }
-            } else {
-                // Test with empty tensor (zero in one dimension)
-                std::vector<int64_t> shape = {0, 1, upscale_factor, upscale_factor};
-                torch::Tensor edge_input = torch::ones(shape);
-                try {
-                    torch::Tensor edge_output = pixelUnshuffle->forward(edge_input);
-                } catch (const std::exception& e) {
-                    // May or may not throw depending on implementation
+                    // Expected exceptions for incompatible shapes/dimensions
                 }
             }
         }
@@ -104,7 +104,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

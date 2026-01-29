@@ -8,7 +8,12 @@
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -33,8 +38,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             bool enabled_mode = c10::InferenceMode::is_enabled();
             bool enabled_tensor = torch::is_inference(tensor);
             torch::Tensor result1 = tensor + 1;
+            bool result1_inference = torch::is_inference(result1);
             (void)enabled_mode;
             (void)enabled_tensor;
+            (void)result1_inference;
             (void)result1.sum();
         }
 
@@ -44,8 +51,10 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             bool disabled_mode = c10::InferenceMode::is_enabled();
             bool disabled_tensor = torch::is_inference(tensor);
             torch::Tensor result2 = tensor + 2;
+            bool result2_inference = torch::is_inference(result2);
             (void)disabled_mode;
             (void)disabled_tensor;
+            (void)result2_inference;
             (void)result2.sum();
         }
 
@@ -80,14 +89,18 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             (void)new_tensor.sum();
         }
         
-        // Test with different tensor types
+        // Test with different tensor types - may fail due to shape mismatch
         if (offset + 1 < Size) {
-            torch::Tensor another_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            c10::InferenceMode type_guard(true);
-            torch::Tensor combined = tensor + another_tensor;
-            bool combined_inference = torch::is_inference(combined);
-            (void)combined_inference;
-            (void)combined.sum();
+            try {
+                torch::Tensor another_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                c10::InferenceMode type_guard(true);
+                torch::Tensor combined = tensor + another_tensor;
+                bool combined_inference = torch::is_inference(combined);
+                (void)combined_inference;
+                (void)combined.sum();
+            } catch (...) {
+                // Silently ignore shape mismatches and other expected errors
+            }
         }
     }
     catch (const std::exception &e)

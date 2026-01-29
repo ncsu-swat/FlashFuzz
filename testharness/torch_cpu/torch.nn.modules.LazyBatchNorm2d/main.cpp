@@ -1,16 +1,19 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
@@ -19,49 +22,56 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         // Ensure input has at least 4 dimensions for BatchNorm2d (N, C, H, W)
         if (input.dim() < 4) {
-            // Expand dimensions to make it 4D
             while (input.dim() < 4) {
                 input = input.unsqueeze(0);
             }
+        } else if (input.dim() > 4) {
+            // Reduce to 4D by flattening extra dimensions
+            auto sizes = input.sizes().vec();
+            int64_t batch = sizes[0];
+            int64_t channels = sizes[1];
+            int64_t height = sizes[2];
+            int64_t remaining = 1;
+            for (size_t i = 3; i < sizes.size(); i++) {
+                remaining *= sizes[i];
+            }
+            input = input.reshape({batch, channels, height, remaining});
         }
         
-        // Extract parameters for LazyBatchNorm2d
-        uint8_t num_features_byte = 0;
-        if (offset < Size) {
-            num_features_byte = Data[offset++];
-        }
-        
-        // Get number of features from the second dimension (channels)
+        // Ensure channel dimension is at least 1
         int64_t num_features = input.size(1);
+        if (num_features < 1) {
+            return 0;
+        }
         
-        // Extract other parameters
+        // Extract parameters for BatchNorm2d
         double eps = 1e-5;
         double momentum = 0.1;
         bool affine = true;
         bool track_running_stats = true;
         
-        if (offset + 3 < Size) {
-            // Use some bytes to determine eps (small positive value)
+        if (offset + 4 <= Size) {
             uint32_t eps_raw = 0;
             std::memcpy(&eps_raw, Data + offset, sizeof(uint32_t));
             offset += sizeof(uint32_t);
-            eps = std::max(1e-10, static_cast<double>(eps_raw) / std::numeric_limits<uint32_t>::max());
-            
-            // Use a byte to determine momentum (between 0 and 1)
-            if (offset < Size) {
-                momentum = static_cast<double>(Data[offset++]) / 255.0;
-            }
-            
-            // Use bytes to determine boolean parameters
-            if (offset < Size) {
-                affine = Data[offset++] % 2 == 0;
-            }
-            if (offset < Size) {
-                track_running_stats = Data[offset++] % 2 == 0;
-            }
+            // Keep eps in reasonable range
+            eps = 1e-10 + (static_cast<double>(eps_raw) / std::numeric_limits<uint32_t>::max()) * 1e-3;
         }
         
-        // Create BatchNorm2d module (LazyBatchNorm2d is not available, use regular BatchNorm2d)
+        if (offset < Size) {
+            momentum = static_cast<double>(Data[offset++]) / 255.0;
+        }
+        
+        if (offset < Size) {
+            affine = Data[offset++] % 2 == 0;
+        }
+        
+        if (offset < Size) {
+            track_running_stats = Data[offset++] % 2 == 0;
+        }
+        
+        // Create BatchNorm2d module with num_features from input
+        // Note: LazyBatchNorm2d is Python-only, use BatchNorm2d in C++
         torch::nn::BatchNorm2d bn(
             torch::nn::BatchNorm2dOptions(num_features)
                 .eps(eps)
@@ -70,48 +80,62 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 .track_running_stats(track_running_stats)
         );
         
+        // Convert input to float for batch normalization
+        input = input.to(torch::kFloat32);
+        
         // Apply the module to the input tensor
         torch::Tensor output = bn->forward(input);
         
-        // Test the module in training and evaluation modes
+        // Test the module in training mode
         bn->train();
         torch::Tensor output_train = bn->forward(input);
         
+        // Test in evaluation mode
         bn->eval();
         torch::Tensor output_eval = bn->forward(input);
         
-        // Test with different input shapes
+        // Test with different input shapes (same channel count)
         if (offset + 2 < Size) {
-            // Create a new input with different spatial dimensions
             uint8_t height_byte = Data[offset++];
             uint8_t width_byte = Data[offset++];
             
             int64_t new_height = 1 + (height_byte % 32);
             int64_t new_width = 1 + (width_byte % 32);
+            int64_t batch_size = std::max<int64_t>(1, input.size(0));
             
-            // Create a new input tensor with the same batch size and channels
-            // but different spatial dimensions
-            torch::Tensor new_input;
             try {
-                new_input = torch::ones({input.size(0), input.size(1), new_height, new_width});
+                torch::Tensor new_input = torch::randn({batch_size, num_features, new_height, new_width});
                 torch::Tensor new_output = bn->forward(new_input);
             } catch (const std::exception& e) {
-                // Ignore exceptions from this test
+                // Silently ignore shape-related exceptions
             }
         }
         
-        // Test with zero batch size
+        // Test reset_parameters if affine
+        if (affine) {
+            bn->reset_parameters();
+            torch::Tensor output_after_reset = bn->forward(input);
+        }
+        
+        // Test with batch size 1
         try {
-            torch::Tensor zero_batch_input = torch::ones({0, input.size(1), input.size(2), input.size(3)});
-            torch::Tensor zero_batch_output = bn->forward(zero_batch_input);
+            torch::Tensor single_batch = input.slice(0, 0, 1);
+            bn->eval(); // Use eval mode for single batch
+            torch::Tensor single_output = bn->forward(single_batch);
         } catch (const std::exception& e) {
-            // Ignore exceptions from this test
+            // Silently ignore
+        }
+        
+        // Test running_mean and running_var access if tracking stats
+        if (track_running_stats && bn->running_mean.defined()) {
+            auto mean = bn->running_mean;
+            auto var = bn->running_var;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

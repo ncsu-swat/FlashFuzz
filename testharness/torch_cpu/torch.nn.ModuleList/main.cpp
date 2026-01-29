@@ -1,11 +1,16 @@
 #include "fuzzer_utils.h" // General fuzzing utilities
 #include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -19,13 +24,13 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         torch::nn::ModuleList moduleList;
         
         // Determine number of modules to add (1-10)
-        uint8_t numModules = (Size > 0) ? (Data[offset] % 10) + 1 : 3;
+        uint8_t numModules = (Data[offset] % 10) + 1;
         offset++;
         
         // Create and add modules to the ModuleList
         for (uint8_t i = 0; i < numModules && offset < Size; i++) {
             // Determine module type based on data
-            uint8_t moduleType = (offset < Size) ? Data[offset] % 5 : 0;
+            uint8_t moduleType = Data[offset] % 5;
             offset++;
             
             // Create different types of modules based on the data
@@ -91,18 +96,32 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // 1. Test size() method
         auto size = moduleList->size();
         
-        // 2. Test iteration through modules
+        // 2. Test is_empty() method
+        bool isEmpty = moduleList->is_empty();
+        (void)isEmpty;
+        
+        // 3. Test iteration through modules
         for (const auto& module : *moduleList) {
             auto paramSize = module->parameters().size();
+            (void)paramSize; // Suppress unused variable warning
         }
         
-        // 3. Test indexed access
+        // 4. Test indexed access with operator[]
         if (moduleList->size() > 0) {
-            auto firstModule = (*moduleList)[0];
-            auto lastModule = (*moduleList)[moduleList->size() - 1];
+            auto firstModule = moduleList[0];
+            auto lastModule = moduleList[moduleList->size() - 1];
+            (void)firstModule;
+            (void)lastModule;
         }
         
-        // 4. Test extend method if we have enough modules
+        // 5. Test ptr() method for indexed access
+        if (moduleList->size() > 0) {
+            auto modulePtr = moduleList->ptr(0);
+            (void)modulePtr;
+        }
+        
+        // 6. Test extend method with another ModuleList
+        // extend expects the modules to be iterated, so we need to pass the dereferenced impl
         if (moduleList->size() >= 2) {
             torch::nn::ModuleList otherList;
             
@@ -111,84 +130,129 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             otherList->push_back(torch::nn::ReLU());
             
             // Extend the original list with the other list
+            // Pass dereferenced ModuleList (the impl)
             moduleList->extend(*otherList);
         }
         
-        // 5. Test push_back method instead of append
+        // 7. Test push_back method
         moduleList->push_back(torch::nn::Linear(20, 10));
         
-        // 6. Test insert method
-        if (moduleList->size() > 0) {
-            size_t insertIdx = (offset < Size) ? Data[offset] % moduleList->size() : 0;
+        // 8. Test insert method
+        if (moduleList->size() > 0 && offset < Size) {
+            size_t insertIdx = Data[offset] % moduleList->size();
             offset++;
             moduleList->insert(insertIdx, torch::nn::Dropout(0.2));
         }
         
-        // 7. Create a tensor and pass it through modules that can handle it
-        if (offset < Size) {
+        // 9. Create a tensor and pass it through modules that can handle it
+        if (offset < Size && moduleList->size() > 0) {
             try {
                 // Create a tensor with appropriate dimensions for the first module
                 torch::Tensor input;
                 
-                // Try to determine what kind of input the first module expects
-                if (moduleList->size() > 0) {
-                    auto firstModule = (*moduleList)[0];
-                    
-                    // Check module type and create appropriate input
-                    if (auto linear = std::dynamic_pointer_cast<torch::nn::LinearImpl>(firstModule)) {
-                        int64_t batchSize = 2;
-                        int64_t inFeatures = linear->options.in_features();
-                        input = torch::rand({batchSize, inFeatures});
-                        auto output = linear->forward(input);
-                    }
-                    else if (auto conv = std::dynamic_pointer_cast<torch::nn::Conv2dImpl>(firstModule)) {
-                        int64_t batchSize = 2;
-                        int64_t inChannels = conv->options.in_channels();
-                        int64_t height = 28;
-                        int64_t width = 28;
-                        input = torch::rand({batchSize, inChannels, height, width});
-                        auto output = conv->forward(input);
-                    }
-                    else if (auto relu = std::dynamic_pointer_cast<torch::nn::ReLUImpl>(firstModule)) {
-                        input = fuzzer_utils::createTensor(Data, Size, offset);
-                        auto output = relu->forward(input);
-                    }
-                    else if (auto dropout = std::dynamic_pointer_cast<torch::nn::DropoutImpl>(firstModule)) {
-                        input = fuzzer_utils::createTensor(Data, Size, offset);
-                        auto output = dropout->forward(input);
-                    }
-                    else if (auto batchnorm = std::dynamic_pointer_cast<torch::nn::BatchNorm2dImpl>(firstModule)) {
-                        int64_t batchSize = 2;
-                        int64_t numFeatures = batchnorm->options.num_features();
-                        int64_t height = 28;
-                        int64_t width = 28;
-                        input = torch::rand({batchSize, numFeatures, height, width});
-                        auto output = batchnorm->forward(input);
-                    }
+                auto firstModule = moduleList->ptr(0);
+                
+                // Check module type and create appropriate input
+                if (auto linear = std::dynamic_pointer_cast<torch::nn::LinearImpl>(firstModule)) {
+                    int64_t batchSize = 2;
+                    int64_t inFeatures = linear->options.in_features();
+                    input = torch::rand({batchSize, inFeatures});
+                    auto output = linear->forward(input);
+                    (void)output;
+                }
+                else if (auto conv = std::dynamic_pointer_cast<torch::nn::Conv2dImpl>(firstModule)) {
+                    int64_t batchSize = 2;
+                    int64_t inChannels = conv->options.in_channels();
+                    int64_t height = 28;
+                    int64_t width = 28;
+                    input = torch::rand({batchSize, inChannels, height, width});
+                    auto output = conv->forward(input);
+                    (void)output;
+                }
+                else if (auto relu = std::dynamic_pointer_cast<torch::nn::ReLUImpl>(firstModule)) {
+                    input = fuzzer_utils::createTensor(Data, Size, offset);
+                    auto output = relu->forward(input);
+                    (void)output;
+                }
+                else if (auto dropout = std::dynamic_pointer_cast<torch::nn::DropoutImpl>(firstModule)) {
+                    input = fuzzer_utils::createTensor(Data, Size, offset);
+                    auto output = dropout->forward(input);
+                    (void)output;
+                }
+                else if (auto batchnorm = std::dynamic_pointer_cast<torch::nn::BatchNorm2dImpl>(firstModule)) {
+                    int64_t batchSize = 2;
+                    int64_t numFeatures = batchnorm->options.num_features();
+                    int64_t height = 28;
+                    int64_t width = 28;
+                    input = torch::rand({batchSize, numFeatures, height, width});
+                    auto output = batchnorm->forward(input);
+                    (void)output;
                 }
             }
-            catch (const std::exception& e) {
-                // Catch exceptions from tensor creation or forward pass
+            catch (const std::exception&) {
+                // Silently catch exceptions from tensor creation or forward pass
+                // These are expected for invalid shape combinations
             }
         }
         
-        // 8. Test children() method
+        // 10. Test children() method
         auto children = moduleList->children();
         for (const auto& child : children) {
             auto paramSize = child->parameters().size();
+            (void)paramSize;
         }
         
-        // 9. Test named_children() method
+        // 11. Test named_children() method
         auto namedChildren = moduleList->named_children();
         for (const auto& item : namedChildren) {
             auto name = item.key();
             auto child = item.value();
             auto paramSize = child->parameters().size();
+            (void)name;
+            (void)paramSize;
         }
         
-        // 10. Test pop_back method instead of clear
-        if (offset < Size && Data[offset] % 2 == 0 && moduleList->size() > 0) {
-            moduleList->pop_back();
+        // 12. Test parameters() method
+        auto params = moduleList->parameters();
+        for (const auto& param : params) {
+            auto paramShape = param.sizes();
+            (void)paramShape;
+        }
+        
+        // 13. Test named_parameters() method
+        auto namedParams = moduleList->named_parameters();
+        for (const auto& item : namedParams) {
+            auto name = item.key();
+            auto param = item.value();
+            (void)name;
+            (void)param;
+        }
+        
+        // 14. Test clone() method
+        if (moduleList->size() > 0) {
+            auto clonedList = std::dynamic_pointer_cast<torch::nn::ModuleListImpl>(moduleList->clone());
+            if (clonedList) {
+                auto clonedSize = clonedList->size();
+                (void)clonedSize;
+            }
+        }
+        
+        // 15. Test train() and eval() mode switching
+        moduleList->train();
+        moduleList->eval();
+        
+        // 16. Test to() method for device/dtype conversion
+        moduleList->to(torch::kFloat32);
+        
+        // 17. Test zero_grad() method
+        moduleList->zero_grad();
+        
+        // 18. Test at() method for indexed access (bounds-checked)
+        if (moduleList->size() > 0 && offset < Size) {
+            size_t idx = Data[offset] % moduleList->size();
+            offset++;
+            auto moduleAtIdx = moduleList->at<torch::nn::Module>(idx);
+            (void)moduleAtIdx;
         }
     }
     catch (const std::exception &e)

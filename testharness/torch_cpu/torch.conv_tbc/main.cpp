@@ -1,86 +1,103 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
-        if (Size < 10) {
+        if (Size < 16) {
             return 0;
         }
         
-        // Create input tensor (TBC format: Time, Batch, Channel)
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Ensure input has at least 3 dimensions for TBC format
-        if (input.dim() < 3) {
-            input = input.reshape({
-                input.numel() > 0 ? 1 : 0,  // Time
-                input.numel() > 0 ? 1 : 0,  // Batch
-                input.numel() > 0 ? input.numel() : 0  // Channel
-            });
-        }
+        // Extract dimensions from fuzzer data
+        int64_t time_dim = (Data[offset++] % 16) + 1;      // 1-16
+        int64_t batch_dim = (Data[offset++] % 8) + 1;      // 1-8
+        int64_t in_channels = (Data[offset++] % 16) + 1;   // 1-16
+        int64_t out_channels = (Data[offset++] % 16) + 1;  // 1-16
+        int64_t kernel_width = (Data[offset++] % 5) + 1;   // 1-5
+        int64_t pad = Data[offset++] % 10;                 // 0-9
         
-        // Create weight tensor (kernel)
-        torch::Tensor weight = fuzzer_utils::createTensor(Data, Size, offset);
+        // Create input tensor in TBC format: [Time, Batch, Channels]
+        torch::Tensor input = torch::randn({time_dim, batch_dim, in_channels});
         
-        // Ensure weight has correct shape for conv_tbc: [kernel_width, in_channels, out_channels]
-        if (weight.dim() != 3 && weight.numel() > 0) {
-            int64_t total_elements = weight.numel();
-            int64_t kernel_width = std::max(int64_t(1), std::min(int64_t(5), total_elements > 0 ? total_elements % 5 + 1 : 1));
-            int64_t in_channels = input.dim() >= 3 ? input.size(2) : 1;
-            int64_t out_channels = std::max(int64_t(1), total_elements / (kernel_width * std::max(int64_t(1), in_channels)));
-            
-            weight = weight.reshape({kernel_width, in_channels, out_channels});
-        }
+        // Create weight tensor: [kernel_width, in_channels, out_channels]
+        torch::Tensor weight = torch::randn({kernel_width, in_channels, out_channels});
         
-        // Create bias tensor
-        torch::Tensor bias;
+        // Create bias tensor: [out_channels]
+        torch::Tensor bias = torch::randn({out_channels});
+        
+        // Use remaining data to perturb tensor values
         if (offset < Size) {
-            bias = fuzzer_utils::createTensor(Data, Size, offset);
+            torch::Tensor input_noise = fuzzer_utils::createTensor(Data, Size, offset);
+            if (input_noise.numel() > 0) {
+                int64_t copy_size = std::min(input_noise.numel(), input.numel());
+                input.view(-1).slice(0, 0, copy_size).copy_(
+                    input_noise.view(-1).slice(0, 0, copy_size));
+            }
+        }
+        
+        if (offset < Size) {
+            torch::Tensor weight_noise = fuzzer_utils::createTensor(Data, Size, offset);
+            if (weight_noise.numel() > 0) {
+                int64_t copy_size = std::min(weight_noise.numel(), weight.numel());
+                weight.view(-1).slice(0, 0, copy_size).copy_(
+                    weight_noise.view(-1).slice(0, 0, copy_size));
+            }
+        }
+        
+        if (offset < Size) {
+            torch::Tensor bias_noise = fuzzer_utils::createTensor(Data, Size, offset);
+            if (bias_noise.numel() > 0) {
+                int64_t copy_size = std::min(bias_noise.numel(), bias.numel());
+                bias.view(-1).slice(0, 0, copy_size).copy_(
+                    bias_noise.view(-1).slice(0, 0, copy_size));
+            }
+        }
+        
+        // Inner try-catch for expected operation failures
+        try {
+            // Apply conv_tbc
+            torch::Tensor output = torch::conv_tbc(input, weight, bias, pad);
             
-            // Ensure bias has correct shape: [out_channels]
-            if (weight.dim() == 3) {
-                int64_t out_channels = weight.size(2);
-                if (bias.numel() != out_channels) {
-                    bias = bias.reshape({out_channels});
+            // Use the output to prevent optimization
+            if (output.defined() && output.numel() > 0) {
+                volatile float sum = output.sum().item<float>();
+                (void)sum;
+            }
+        } catch (const c10::Error&) {
+            // Expected failures (shape mismatches, etc.) - catch silently
+        }
+        
+        // Also test with different dtypes
+        if (Size > 32) {
+            try {
+                torch::Tensor input_f64 = input.to(torch::kFloat64);
+                torch::Tensor weight_f64 = weight.to(torch::kFloat64);
+                torch::Tensor bias_f64 = bias.to(torch::kFloat64);
+                
+                torch::Tensor output = torch::conv_tbc(input_f64, weight_f64, bias_f64, pad);
+                
+                if (output.defined() && output.numel() > 0) {
+                    volatile double sum = output.sum().item<double>();
+                    (void)sum;
                 }
+            } catch (const c10::Error&) {
+                // Expected failures - catch silently
             }
-        } else {
-            // If we don't have enough data for bias, create a zero tensor
-            if (weight.dim() == 3) {
-                bias = torch::zeros({weight.size(2)}, weight.options());
-            } else {
-                bias = torch::zeros({1}, weight.options());
-            }
-        }
-        
-        // Get padding value
-        int64_t pad = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&pad, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            // Limit padding to reasonable values
-            pad = std::abs(pad) % 10;
-        }
-        
-        // Try to apply conv_tbc
-        torch::Tensor output = torch::conv_tbc(input, weight, bias, pad);
-        
-        // Use the output to prevent optimization from removing the computation
-        if (output.defined() && output.numel() > 0) {
-            volatile float sum = output.sum().item<float>();
-            (void)sum;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,11 +1,16 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <torch/script.h>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -17,33 +22,31 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         // Create a tensor to iterate over
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create a JIT script module to test Iterator
+        // Test 1: Iterate over tensor elements using JIT
+        // Define a proper TorchScript function (not a method)
         std::string script_code = R"(
-            def forward(self, x):
-                result = []
-                for item in x:
-                    result.append(item)
-                return result
-        )";
+def iterate_tensor(x):
+    result = []
+    for item in x:
+        result.append(item)
+    return result
+)";
         
-        auto compilation_unit = torch::jit::compile(script_code);
-        auto &module_func = compilation_unit->get_function("forward");
+        try {
+            auto compilation_unit = torch::jit::compile(script_code);
+            auto &iterate_func = compilation_unit->get_function("iterate_tensor");
+            
+            std::vector<torch::jit::IValue> inputs;
+            inputs.push_back(input_tensor);
+            
+            torch::jit::IValue output = iterate_func(inputs);
+        } catch (const std::exception&) {
+            // Script compilation or execution may fail for certain inputs
+        }
         
-        // Create inputs for the module
-        std::vector<torch::jit::IValue> inputs;
-        inputs.push_back(input_tensor);
-        
-        // Execute the module with Iterator
-        torch::jit::IValue output = module_func(inputs);
-        
-        // Try different iterator patterns if we have more data
+        // Test 2: Iterate over a list of tensors
         if (offset + 1 < Size) {
-            uint8_t iterator_type = Data[offset++];
-            
-            // Create a list of tensors to iterate over
             std::vector<torch::Tensor> tensor_list;
-            
-            // Add the first tensor
             tensor_list.push_back(input_tensor);
             
             // Try to create and add more tensors if we have data
@@ -56,72 +59,145 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 }
             }
             
-            // Create a JIT script that iterates over a list of tensors
             std::string list_script = R"(
-                def forward(self, x_list):
-                    result = []
-                    for x in x_list:
-                        result.append(x.sum())
-                    return result
-            )";
+def iterate_list(x_list):
+    result = []
+    for x in x_list:
+        result.append(x.sum())
+    return result
+)";
             
-            auto list_compilation_unit = torch::jit::compile(list_script);
-            auto &list_module_func = list_compilation_unit->get_function("forward");
+            try {
+                auto list_compilation_unit = torch::jit::compile(list_script);
+                auto &list_func = list_compilation_unit->get_function("iterate_list");
+                
+                c10::List<torch::Tensor> jit_list;
+                for (const auto& t : tensor_list) {
+                    jit_list.push_back(t);
+                }
+                
+                torch::jit::IValue list_input(jit_list);
+                torch::jit::IValue list_output = list_func({list_input});
+            } catch (const std::exception&) {
+                // May fail for incompatible tensors
+            }
             
-            // Create a list input
-            torch::jit::IValue list_input = torch::jit::IValue(tensor_list);
-            
-            // Execute with the list
-            torch::jit::IValue list_output = list_module_func({list_input});
-            
-            // Test nested iteration if we have enough tensors
+            // Test 3: Nested iteration
             if (tensor_list.size() >= 2) {
                 std::string nested_script = R"(
-                    def forward(self, x_list):
-                        result = []
-                        for x in x_list:
-                            for item in x:
-                                result.append(item)
-                        return result
-                )";
+def nested_iterate(x_list):
+    result = []
+    for x in x_list:
+        for item in x:
+            result.append(item.sum())
+    return result
+)";
                 
-                auto nested_compilation_unit = torch::jit::compile(nested_script);
-                auto &nested_module_func = nested_compilation_unit->get_function("forward");
-                torch::jit::IValue nested_output = nested_module_func({list_input});
+                try {
+                    auto nested_compilation_unit = torch::jit::compile(nested_script);
+                    auto &nested_func = nested_compilation_unit->get_function("nested_iterate");
+                    
+                    c10::List<torch::Tensor> nested_list;
+                    for (const auto& t : tensor_list) {
+                        nested_list.push_back(t);
+                    }
+                    
+                    torch::jit::IValue nested_output = nested_func({torch::jit::IValue(nested_list)});
+                } catch (const std::exception&) {
+                    // Nested iteration may fail for 0-dim tensors
+                }
             }
         }
         
-        // Test with different tensor types if we have more data
+        // Test 4: Enumerate-style iteration with index
         if (offset + 4 < Size) {
+            std::string enumerate_script = R"(
+def enumerate_iterate(x):
+    result = []
+    idx = 0
+    for item in x:
+        result.append(item * idx)
+        idx = idx + 1
+    return result
+)";
+            
             try {
-                torch::Tensor another_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+                auto enum_compilation_unit = torch::jit::compile(enumerate_script);
+                auto &enum_func = enum_compilation_unit->get_function("enumerate_iterate");
                 
-                // Create a dictionary to iterate over
-                c10::Dict<std::string, torch::Tensor> tensor_dict;
-                tensor_dict.insert("input", input_tensor);
-                tensor_dict.insert("another", another_tensor);
-                
-                std::string dict_script = R"(
-                    def forward(self, x_dict):
-                        result = []
-                        for key in x_dict:
-                            result.append(x_dict[key])
-                        return result
-                )";
-                
-                auto dict_compilation_unit = torch::jit::compile(dict_script);
-                auto &dict_module_func = dict_compilation_unit->get_function("forward");
-                torch::jit::IValue dict_input = torch::jit::IValue(tensor_dict);
-                torch::jit::IValue dict_output = dict_module_func({dict_input});
+                torch::jit::IValue enum_output = enum_func({input_tensor});
             } catch (const std::exception&) {
-                // Continue if this part fails
+                // May fail for certain tensor types
+            }
+        }
+        
+        // Test 5: Range-based iteration in JIT
+        if (offset + 2 < Size) {
+            int range_end = static_cast<int>(Data[offset++] % 100) + 1;
+            
+            std::string range_script = R"(
+def range_iterate(n: int):
+    result = 0
+    for i in range(n):
+        result = result + i
+    return result
+)";
+            
+            try {
+                auto range_compilation_unit = torch::jit::compile(range_script);
+                auto &range_func = range_compilation_unit->get_function("range_iterate");
+                
+                torch::jit::IValue range_output = range_func({range_end});
+            } catch (const std::exception&) {
+                // Range iteration issues
+            }
+        }
+        
+        // Test 6: Zip-style iteration (two lists)
+        if (offset + 4 < Size) {
+            std::string zip_script = R"(
+def zip_iterate(list1, list2):
+    result = []
+    for i in range(min(len(list1), len(list2))):
+        result.append(list1[i] + list2[i])
+    return result
+)";
+            
+            try {
+                auto zip_compilation_unit = torch::jit::compile(zip_script);
+                auto &zip_func = zip_compilation_unit->get_function("zip_iterate");
+                
+                c10::List<torch::Tensor> list1;
+                c10::List<torch::Tensor> list2;
+                
+                list1.push_back(input_tensor);
+                
+                torch::Tensor t2 = fuzzer_utils::createTensor(Data, Size, offset);
+                list2.push_back(t2);
+                
+                // Add more if possible
+                if (offset + 2 < Size) {
+                    try {
+                        torch::Tensor t3 = fuzzer_utils::createTensor(Data, Size, offset);
+                        list1.push_back(t3);
+                        if (offset + 2 < Size) {
+                            torch::Tensor t4 = fuzzer_utils::createTensor(Data, Size, offset);
+                            list2.push_back(t4);
+                        }
+                    } catch (const std::exception&) {
+                    }
+                }
+                
+                torch::jit::IValue zip_output = zip_func({torch::jit::IValue(list1), torch::jit::IValue(list2)});
+            } catch (const std::exception&) {
+                // Zip iteration may fail
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

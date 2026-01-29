@@ -1,66 +1,112 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least a few bytes for basic operations
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
+        size_t offset = 0;
         
-        // Extract padding values from the remaining data
-        int64_t padding_left = 0;
-        int64_t padding_right = 0;
+        // Extract padding values first (constrain to reasonable range)
+        int64_t padding_left = static_cast<int64_t>(Data[offset++] % 32);
+        int64_t padding_right = static_cast<int64_t>(Data[offset++] % 32);
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding_left, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
+        // Extract dimensions for a proper 3D tensor (N, C, W)
+        int64_t batch_size = static_cast<int64_t>((Data[offset++] % 4) + 1);
+        int64_t channels = static_cast<int64_t>((Data[offset++] % 8) + 1);
+        // Width must be at least max(padding_left, padding_right) for circular padding
+        int64_t min_width = std::max(padding_left, padding_right);
+        int64_t width = static_cast<int64_t>((Data[offset++] % 32) + 1) + min_width;
         
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&padding_right, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-        }
+        // Create a 3D input tensor suitable for circular padding (N, C, W)
+        torch::Tensor input = torch::randn({batch_size, channels, width});
         
-        // Create padding configuration
-        std::vector<int64_t> padding;
-        
-        // Decide between symmetric and asymmetric padding based on a byte from the input
+        // Use remaining data to modify tensor values if available
         if (offset < Size) {
-            uint8_t padding_type = Data[offset++];
+            size_t remaining = Size - offset;
+            size_t tensor_size = static_cast<size_t>(input.numel());
+            size_t copy_size = std::min(remaining, tensor_size * sizeof(float));
             
-            if (padding_type % 2 == 0) {
-                // Symmetric padding (single value)
-                padding.push_back(padding_left);
-            } else {
-                // Asymmetric padding (two values)
-                padding.push_back(padding_left);
-                padding.push_back(padding_right);
+            if (copy_size >= sizeof(float)) {
+                auto accessor = input.accessor<float, 3>();
+                size_t idx = 0;
+                for (int64_t b = 0; b < batch_size && (idx + 1) * sizeof(float) <= copy_size; b++) {
+                    for (int64_t c = 0; c < channels && (idx + 1) * sizeof(float) <= copy_size; c++) {
+                        for (int64_t w = 0; w < width && (idx + 1) * sizeof(float) <= copy_size; w++) {
+                            float val;
+                            std::memcpy(&val, Data + offset + idx * sizeof(float), sizeof(float));
+                            if (std::isfinite(val)) {
+                                accessor[b][c][w] = val;
+                            }
+                            idx++;
+                        }
+                    }
+                }
             }
-        } else {
-            // Default to symmetric padding if we don't have enough data
-            padding.push_back(padding_left);
         }
         
-        // Create the CircularPad1d module
-        torch::nn::CircularPad1d circular_pad(torch::nn::CircularPad1dOptions(padding));
+        // Apply circular padding using functional API
+        // For 1D padding on 3D input, pad format is (left, right)
+        try {
+            torch::Tensor output = torch::nn::functional::pad(
+                input,
+                torch::nn::functional::PadFuncOptions({padding_left, padding_right})
+                    .mode(torch::kCircular)
+            );
+            
+            // Use the output to prevent optimization
+            if (output.defined()) {
+                volatile auto sum = output.sum().item<float>();
+                (void)sum;
+            }
+        } catch (const c10::Error&) {
+            // Expected failures for invalid padding configurations
+        }
         
-        // Apply the padding operation
-        torch::Tensor output = circular_pad(input);
+        // Also test with 2D input (unbatched: C, W)
+        // Width must still be large enough for circular padding
+        torch::Tensor input_2d = torch::randn({channels, width});
+        try {
+            torch::Tensor output_2d = torch::nn::functional::pad(
+                input_2d,
+                torch::nn::functional::PadFuncOptions({padding_left, padding_right})
+                    .mode(torch::kCircular)
+            );
+            if (output_2d.defined()) {
+                volatile auto sum = output_2d.sum().item<float>();
+                (void)sum;
+            }
+        } catch (const c10::Error&) {
+            // Expected failures
+        }
         
-        // Use the output to prevent optimization
-        if (output.defined()) {
-            volatile auto sum = output.sum().item<float>();
+        // Test with symmetric padding (same padding on both sides)
+        try {
+            int64_t symmetric_pad = (padding_left + padding_right) / 2;
+            if (symmetric_pad > 0 && symmetric_pad <= width) {
+                torch::Tensor output_sym = torch::nn::functional::pad(
+                    input,
+                    torch::nn::functional::PadFuncOptions({symmetric_pad, symmetric_pad})
+                        .mode(torch::kCircular)
+                );
+                if (output_sym.defined()) {
+                    volatile auto sum = output_sym.sum().item<float>();
+                    (void)sum;
+                }
+            }
+        } catch (const c10::Error&) {
+            // Expected failures
         }
         
         return 0;
@@ -68,7 +114,6 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

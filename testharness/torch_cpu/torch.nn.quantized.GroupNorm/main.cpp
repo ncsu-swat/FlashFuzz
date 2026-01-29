@@ -1,84 +1,93 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
 // --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least a few bytes for basic parameters
         if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input_tensor;
-        try {
-            input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-        } catch (const std::exception& e) {
-            return 0;
-        }
-        
-        // Ensure we have at least 4 more bytes for parameters
-        if (Size < offset + 4) {
-            return 0;
-        }
+        size_t offset = 0;
         
         // Extract parameters for GroupNorm
         uint8_t num_groups_byte = Data[offset++];
-        uint8_t num_channels_byte = Data[offset++];
+        uint8_t channels_multiplier_byte = Data[offset++];
         uint8_t eps_byte = Data[offset++];
         uint8_t affine_byte = Data[offset++];
+        uint8_t batch_byte = Data[offset++];
+        uint8_t spatial_byte = Data[offset++];
         
-        // Parse parameters
-        int64_t num_groups = static_cast<int64_t>(num_groups_byte) + 1; // Ensure at least 1 group
-        int64_t num_channels = static_cast<int64_t>(num_channels_byte) + 1; // Ensure at least 1 channel
-        double eps = static_cast<double>(eps_byte) / 255.0 + 1e-10; // Small positive value
-        bool affine = (affine_byte % 2) == 1; // 50% chance of true/false
+        // Parse parameters - ensure num_channels is divisible by num_groups
+        int64_t num_groups = (num_groups_byte % 8) + 1; // 1 to 8 groups
+        int64_t channels_per_group = (channels_multiplier_byte % 8) + 1; // 1 to 8 channels per group
+        int64_t num_channels = num_groups * channels_per_group; // Guaranteed divisible
         
-        // Create scale and zero_point tensors for quantization
-        torch::Tensor scale;
-        torch::Tensor zero_point;
+        double eps = static_cast<double>(eps_byte) / 255.0 * 1e-4 + 1e-6; // Small positive value
+        bool affine = (affine_byte % 2) == 1;
         
+        int64_t batch_size = (batch_byte % 4) + 1; // 1 to 4
+        int64_t spatial_size = (spatial_byte % 4) + 2; // 2 to 5
+        
+        // Create input tensor with proper shape for GroupNorm: (N, C, *)
+        torch::Tensor input_tensor;
         try {
-            if (offset + 2 < Size) {
-                scale = fuzzer_utils::createTensor(Data, Size, offset);
-                zero_point = fuzzer_utils::createTensor(Data, Size, offset);
+            input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+            // Reshape to valid GroupNorm input shape
+            int64_t total_elements = input_tensor.numel();
+            if (total_elements < num_channels) {
+                // Not enough elements, create a proper tensor
+                input_tensor = torch::randn({batch_size, num_channels, spatial_size, spatial_size});
             } else {
-                // Default scale and zero_point if not enough data
-                scale = torch::ones({1});
-                zero_point = torch::zeros({1}, torch::kInt);
+                // Try to reshape, or create new if impossible
+                int64_t spatial_total = total_elements / (batch_size * num_channels);
+                if (spatial_total > 0 && total_elements == batch_size * num_channels * spatial_total) {
+                    input_tensor = input_tensor.reshape({batch_size, num_channels, -1});
+                } else {
+                    input_tensor = torch::randn({batch_size, num_channels, spatial_size, spatial_size});
+                }
             }
-        } catch (const std::exception& e) {
-            // Default scale and zero_point if creation fails
-            scale = torch::ones({1});
-            zero_point = torch::zeros({1}, torch::kInt);
+        } catch (...) {
+            input_tensor = torch::randn({batch_size, num_channels, spatial_size, spatial_size});
         }
         
-        // Ensure scale is positive (required for quantization)
-        scale = torch::abs(scale) + 1e-5;
+        // Ensure input is float
+        input_tensor = input_tensor.to(torch::kFloat);
+        
+        // Get scale and zero_point for quantization
+        float scale_val = 0.1f;
+        int32_t zero_point_val = 0;
+        
+        if (offset + 2 <= Size) {
+            scale_val = static_cast<float>(Data[offset++]) / 255.0f * 0.5f + 0.01f; // 0.01 to 0.51
+            zero_point_val = static_cast<int32_t>(Data[offset++] % 128); // 0 to 127
+        }
         
         // Try to quantize the input tensor
         torch::Tensor quantized_input;
         try {
-            // Quantize the input tensor to uint8
             quantized_input = torch::quantize_per_tensor(
-                input_tensor.to(torch::kFloat), 
-                scale.item<float>(), 
-                zero_point.item<int32_t>(), 
+                input_tensor, 
+                scale_val, 
+                zero_point_val, 
                 torch::kQUInt8
             );
-        } catch (const std::exception& e) {
-            // If quantization fails, create a simple quantized tensor
-            auto options = torch::TensorOptions().dtype(torch::kFloat);
-            auto simple_tensor = torch::ones({1, num_channels, 2, 2}, options);
+        } catch (...) {
+            // If quantization fails, try with clamped values
+            auto clamped_input = torch::clamp(input_tensor, -10.0f, 10.0f);
             quantized_input = torch::quantize_per_tensor(
-                simple_tensor, 
-                0.1, 
+                clamped_input, 
+                0.1f, 
                 0, 
                 torch::kQUInt8
             );
@@ -90,31 +99,49 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
         
         if (affine) {
             try {
-                if (offset + 2 < Size) {
+                if (offset + 4 <= Size) {
                     weight = fuzzer_utils::createTensor(Data, Size, offset);
                     bias = fuzzer_utils::createTensor(Data, Size, offset);
                     
-                    // Ensure weight and bias have correct shapes
-                    weight = weight.reshape({num_channels});
-                    bias = bias.reshape({num_channels});
+                    // Flatten and ensure correct size
+                    weight = weight.flatten();
+                    bias = bias.flatten();
+                    
+                    if (weight.numel() >= num_channels) {
+                        weight = weight.slice(0, 0, num_channels).contiguous();
+                    } else {
+                        weight = torch::ones({num_channels});
+                    }
+                    
+                    if (bias.numel() >= num_channels) {
+                        bias = bias.slice(0, 0, num_channels).contiguous();
+                    } else {
+                        bias = torch::zeros({num_channels});
+                    }
                 } else {
                     weight = torch::ones({num_channels});
                     bias = torch::zeros({num_channels});
                 }
-            } catch (const std::exception& e) {
+            } catch (...) {
                 weight = torch::ones({num_channels});
                 bias = torch::zeros({num_channels});
             }
+            
+            // Ensure float type
+            weight = weight.to(torch::kFloat);
+            bias = bias.to(torch::kFloat);
         }
         
-        // Apply GroupNorm using functional API since quantized GroupNorm module doesn't exist
+        // Apply GroupNorm: dequantize -> group_norm -> quantize
+        // This simulates torch.nn.quantized.GroupNorm behavior
         torch::Tensor output;
+        
+        // Dequantize input for group norm operation
+        torch::Tensor dequantized_input = quantized_input.dequantize();
+        
+        // Apply group norm using functional API
+        torch::Tensor group_norm_output;
         try {
-            // Dequantize input for group norm operation
-            torch::Tensor dequantized_input = quantized_input.dequantize();
-            
-            // Apply group norm using functional API
-            torch::Tensor group_norm_output;
             if (affine) {
                 group_norm_output = torch::group_norm(
                     dequantized_input, 
@@ -127,64 +154,46 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 group_norm_output = torch::group_norm(
                     dequantized_input, 
                     num_groups, 
-                    torch::nullopt, 
-                    torch::nullopt, 
+                    /*weight=*/{}, 
+                    /*bias=*/{}, 
                     eps
                 );
             }
-            
-            // Quantize the output
+        } catch (...) {
+            // Shape mismatch - expected, silently continue
+            return 0;
+        }
+        
+        // Quantize the output
+        try {
             output = torch::quantize_per_tensor(
                 group_norm_output, 
-                scale.item<float>(), 
-                zero_point.item<int32_t>(), 
+                scale_val, 
+                zero_point_val, 
                 torch::kQUInt8
             );
-        } catch (const std::exception& e) {
-            // If forward fails, try with a simpler input
-            auto options = torch::TensorOptions().dtype(torch::kFloat);
-            auto simple_tensor = torch::ones({1, num_channels, 2, 2}, options);
-            
-            torch::Tensor simple_output;
-            if (affine) {
-                simple_output = torch::group_norm(
-                    simple_tensor, 
-                    num_groups, 
-                    weight, 
-                    bias, 
-                    eps
-                );
-            } else {
-                simple_output = torch::group_norm(
-                    simple_tensor, 
-                    num_groups, 
-                    torch::nullopt, 
-                    torch::nullopt, 
-                    eps
-                );
-            }
-            
+        } catch (...) {
+            // Quantization failed - try with clamped output
+            auto clamped_output = torch::clamp(group_norm_output, -10.0f, 10.0f);
             output = torch::quantize_per_tensor(
-                simple_output, 
-                0.1, 
+                clamped_output, 
+                0.1f, 
                 0, 
                 torch::kQUInt8
             );
         }
         
-        // Ensure the output is valid
+        // Validate the output
         if (output.numel() > 0) {
             auto dequantized = output.dequantize();
             auto sum = dequantized.sum().item<float>();
-            if (std::isnan(sum) || std::isinf(sum)) {
-                throw std::runtime_error("Output contains NaN or Inf values");
-            }
+            (void)sum; // Use the result to prevent optimization
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

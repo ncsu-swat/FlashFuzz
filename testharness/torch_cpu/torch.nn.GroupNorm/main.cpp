@@ -1,52 +1,69 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
         // Need at least a few bytes for basic parameters
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensor
-        torch::Tensor input = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for GroupNorm
-        // We need at least 4 bytes for num_groups, epsilon, affine, and track_running_stats
-        if (offset + 4 > Size) {
-            return 0;
-        }
-        
-        // Parse num_groups - should be positive and not exceed the number of channels
-        int64_t num_channels = 1;
-        if (input.dim() > 1) {
-            num_channels = input.size(1);
-        }
-        
+        // Extract parameters first to construct proper input tensor
+        uint8_t batch_byte = Data[offset++];
+        uint8_t channel_byte = Data[offset++];
+        uint8_t spatial_byte = Data[offset++];
         uint8_t num_groups_byte = Data[offset++];
-        int64_t num_groups = (num_groups_byte % 64) + 1; // Ensure positive value
+        uint8_t epsilon_byte = Data[offset++];
+        uint8_t affine_byte = Data[offset++];
         
-        // Ensure num_groups doesn't exceed num_channels
-        if (num_groups > num_channels) {
-            num_groups = num_channels;
-        }
+        // Determine num_channels - must be positive and divisible by num_groups
+        // Use values 1-64 for reasonable testing
+        int64_t base_groups = (num_groups_byte % 8) + 1;  // 1-8 groups
+        int64_t multiplier = (channel_byte % 8) + 1;      // 1-8 multiplier
+        int64_t num_channels = base_groups * multiplier;   // Ensures divisibility
+        int64_t num_groups = base_groups;
+        
+        // Determine batch size and spatial dimensions
+        int64_t batch_size = (batch_byte % 4) + 1;        // 1-4
+        int64_t spatial_dim = (spatial_byte % 8) + 1;     // 1-8
         
         // Parse epsilon - small positive value for numerical stability
-        uint8_t epsilon_byte = Data[offset++];
         double epsilon = static_cast<double>(epsilon_byte) / 255.0 * 0.1 + 1e-5;
         
         // Parse affine flag
-        bool affine = (Data[offset++] % 2) == 1;
+        bool affine = (affine_byte % 2) == 1;
         
-        // Parse track_running_stats flag (though not used in GroupNorm)
-        bool track_running_stats = (Data[offset++] % 2) == 1;
+        // Create input tensor with proper shape [N, C, *]
+        // Using 3D input: [batch, channels, spatial]
+        torch::Tensor input = torch::randn({batch_size, num_channels, spatial_dim});
+        
+        // Use remaining fuzzer data to perturb the input values
+        if (offset < Size) {
+            size_t remaining = Size - offset;
+            size_t num_elements = std::min(remaining, static_cast<size_t>(input.numel()));
+            auto input_accessor = input.accessor<float, 3>();
+            size_t idx = 0;
+            for (int64_t b = 0; b < batch_size && idx < num_elements; b++) {
+                for (int64_t c = 0; c < num_channels && idx < num_elements; c++) {
+                    for (int64_t s = 0; s < spatial_dim && idx < num_elements; s++) {
+                        float scale = (static_cast<float>(Data[offset + idx]) - 128.0f) / 64.0f;
+                        input_accessor[b][c][s] *= scale;
+                        idx++;
+                    }
+                }
+            }
+            offset += num_elements;
+        }
         
         // Create GroupNorm module
         torch::nn::GroupNorm group_norm(
@@ -55,52 +72,73 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 .affine(affine));
         
         // Apply GroupNorm to the input tensor
-        torch::Tensor output;
+        torch::Tensor output = group_norm->forward(input);
         
-        // GroupNorm expects input of shape [N, C, *] where * means any number of additional dimensions
-        // If input doesn't have at least 2 dimensions, we need to reshape it
-        if (input.dim() < 2) {
-            if (input.dim() == 0) {
-                // Scalar tensor - reshape to [1, 1]
-                input = input.reshape({1, 1});
-            } else if (input.dim() == 1) {
-                // 1D tensor - reshape to [1, size]
-                input = input.reshape({1, input.size(0)});
-            }
+        // Verify output has same shape as input
+        if (output.sizes() != input.sizes()) {
+            std::cerr << "Output shape mismatch" << std::endl;
+            return -1;
         }
         
-        // Apply GroupNorm
-        output = group_norm->forward(input);
-        
-        // Try to access output elements to ensure computation is performed
+        // Access output to ensure computation is performed
         if (output.numel() > 0) {
-            auto accessor = output.accessor<float, 1>();
-            volatile float first_element = accessor[0];
+            volatile float sum = output.sum().item<float>();
+            (void)sum;
         }
         
-        // Create another GroupNorm with different parameters
+        // Test with 4D input [N, C, H, W] if we have more data
         if (offset + 2 <= Size) {
-            uint8_t alt_num_groups_byte = Data[offset++];
-            int64_t alt_num_groups = (alt_num_groups_byte % 64) + 1;
-            if (alt_num_groups > num_channels) {
-                alt_num_groups = num_channels;
+            int64_t height = (Data[offset++] % 4) + 1;
+            int64_t width = (Data[offset++] % 4) + 1;
+            
+            torch::Tensor input_4d = torch::randn({batch_size, num_channels, height, width});
+            torch::Tensor output_4d = group_norm->forward(input_4d);
+            
+            volatile float val = output_4d.sum().item<float>();
+            (void)val;
+        }
+        
+        // Test with different num_groups configuration
+        if (offset + 2 <= Size) {
+            uint8_t alt_groups_byte = Data[offset++];
+            uint8_t alt_affine_byte = Data[offset++];
+            
+            // Find a valid divisor of num_channels for alt_num_groups
+            int64_t alt_num_groups = (alt_groups_byte % num_channels) + 1;
+            // Ensure it's a divisor
+            while (num_channels % alt_num_groups != 0 && alt_num_groups > 1) {
+                alt_num_groups--;
             }
             
-            uint8_t alt_epsilon_byte = Data[offset++];
-            double alt_epsilon = static_cast<double>(alt_epsilon_byte) / 255.0 * 0.1 + 1e-5;
+            bool alt_affine = (alt_affine_byte % 2) == 1;
             
             torch::nn::GroupNorm alt_group_norm(
                 torch::nn::GroupNormOptions(alt_num_groups, num_channels)
-                    .eps(alt_epsilon)
-                    .affine(!affine)); // Opposite of previous affine setting
+                    .eps(epsilon)
+                    .affine(alt_affine));
             
             torch::Tensor alt_output = alt_group_norm->forward(input);
+            
+            volatile float alt_val = alt_output.sum().item<float>();
+            (void)alt_val;
         }
+        
+        // Test eval mode vs train mode
+        group_norm->train();
+        torch::Tensor train_output = group_norm->forward(input);
+        
+        group_norm->eval();
+        torch::Tensor eval_output = group_norm->forward(input);
+        
+        volatile float train_sum = train_output.sum().item<float>();
+        volatile float eval_sum = eval_output.sum().item<float>();
+        (void)train_sum;
+        (void)eval_sum;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

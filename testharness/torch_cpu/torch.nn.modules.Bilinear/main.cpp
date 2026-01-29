@@ -1,160 +1,114 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+    
     try
     {
         size_t offset = 0;
         
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
-        // Create input tensors
-        torch::Tensor input1 = fuzzer_utils::createTensor(Data, Size, offset);
+        // Extract parameters for the Bilinear module from fuzzer data
+        int64_t in1_features = (Data[offset++] % 16) + 1;  // 1-16
+        int64_t in2_features = (Data[offset++] % 16) + 1;  // 1-16
+        int64_t out_features = (Data[offset++] % 16) + 1;  // 1-16
+        bool bias = Data[offset++] & 0x1;
+        int64_t batch_size = (Data[offset++] % 8) + 1;     // 1-8
         
-        // Ensure we have enough data for the second tensor
-        if (offset >= Size) {
-            return 0;
-        }
-        
-        torch::Tensor input2 = fuzzer_utils::createTensor(Data, Size, offset);
-        
-        // Extract parameters for the Bilinear module
-        int64_t in1_features = 0;
-        int64_t in2_features = 0;
-        int64_t out_features = 0;
-        bool bias = true;
-        
-        // Get dimensions from input tensors if possible
-        if (input1.dim() >= 1) {
-            in1_features = input1.size(-1);
-        } else {
-            // Default value if tensor doesn't have enough dimensions
-            in1_features = 5;
-        }
-        
-        if (input2.dim() >= 1) {
-            in2_features = input2.size(-1);
-        } else {
-            // Default value if tensor doesn't have enough dimensions
-            in2_features = 5;
-        }
-        
-        // Get out_features from remaining data if available
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&out_features, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
-            
-            // Ensure out_features is reasonable
-            out_features = std::abs(out_features) % 10 + 1;
-        } else {
-            // Default value
-            out_features = 3;
-        }
-        
-        // Get bias flag if data available
-        if (offset < Size) {
-            bias = Data[offset++] & 0x1;
-        }
-        
-        // Create the Bilinear module using BilinearOptions
+        // Create the Bilinear module
         torch::nn::BilinearOptions options(in1_features, in2_features, out_features);
         options.bias(bias);
         torch::nn::Bilinear bilinear(options);
         
-        // Reshape inputs if needed to match expected dimensions for bilinear
-        if (input1.dim() == 0) {
-            input1 = input1.reshape({1, in1_features});
-        } else if (input1.dim() == 1) {
-            input1 = input1.reshape({1, input1.size(0)});
-            if (input1.size(1) != in1_features) {
-                input1 = input1.narrow(1, 0, std::min(input1.size(1), in1_features));
-                if (input1.size(1) < in1_features) {
-                    input1 = torch::pad(input1, {0, in1_features - input1.size(1)});
-                }
-            }
-        } else {
-            // For higher dimensions, ensure the last dimension matches in1_features
-            if (input1.size(-1) != in1_features) {
-                auto sizes = input1.sizes().vec();
-                sizes.back() = in1_features;
-                input1 = input1.reshape(sizes);
-            }
+        // Create input tensors with correct shapes for bilinear operation
+        // Bilinear expects: input1 (N, in1_features), input2 (N, in2_features)
+        torch::Tensor input1;
+        torch::Tensor input2;
+        
+        // Try to create tensors from remaining fuzzer data
+        if (offset < Size) {
+            input1 = fuzzer_utils::createTensor(Data, Size, offset);
+        }
+        if (offset < Size) {
+            input2 = fuzzer_utils::createTensor(Data, Size, offset);
         }
         
-        if (input2.dim() == 0) {
-            input2 = input2.reshape({1, in2_features});
-        } else if (input2.dim() == 1) {
-            input2 = input2.reshape({1, input2.size(0)});
-            if (input2.size(1) != in2_features) {
-                input2 = input2.narrow(1, 0, std::min(input2.size(1), in2_features));
-                if (input2.size(1) < in2_features) {
-                    input2 = torch::pad(input2, {0, in2_features - input2.size(1)});
-                }
-            }
-        } else {
-            // For higher dimensions, ensure the last dimension matches in2_features
-            if (input2.size(-1) != in2_features) {
-                auto sizes = input2.sizes().vec();
-                sizes.back() = in2_features;
-                input2 = input2.reshape(sizes);
-            }
-        }
-        
-        // Ensure both inputs have the same batch dimensions
-        if (input1.dim() > 1 && input2.dim() > 1) {
-            auto batch_dims1 = input1.sizes().slice(0, input1.dim() - 1);
-            auto batch_dims2 = input2.sizes().slice(0, input2.dim() - 1);
-            
-            if (batch_dims1 != batch_dims2) {
-                // Reshape to match batch dimensions
-                std::vector<int64_t> new_shape1 = {1, in1_features};
-                std::vector<int64_t> new_shape2 = {1, in2_features};
-                
-                input1 = input1.reshape(new_shape1);
-                input2 = input2.reshape(new_shape2);
-            }
-        }
-        
-        // Convert tensors to the same dtype if they differ
-        if (input1.dtype() != input2.dtype()) {
-            if (input1.is_floating_point() && input2.is_floating_point()) {
-                // Convert to higher precision
-                if (input1.scalar_type() == torch::kDouble || input2.scalar_type() == torch::kDouble) {
-                    input1 = input1.to(torch::kDouble);
-                    input2 = input2.to(torch::kDouble);
-                } else if (input1.scalar_type() == torch::kFloat || input2.scalar_type() == torch::kFloat) {
-                    input1 = input1.to(torch::kFloat);
-                    input2 = input2.to(torch::kFloat);
-                } else {
-                    input1 = input1.to(torch::kFloat);
-                    input2 = input2.to(torch::kFloat);
-                }
+        // Ensure input1 has the correct shape (batch_size, in1_features)
+        try {
+            if (!input1.defined() || input1.numel() == 0) {
+                input1 = torch::randn({batch_size, in1_features});
             } else {
-                // If one is not floating point, convert both to float
-                input1 = input1.to(torch::kFloat);
-                input2 = input2.to(torch::kFloat);
+                // Flatten and take what we need, or pad with random values
+                input1 = input1.flatten().to(torch::kFloat);
+                int64_t needed = batch_size * in1_features;
+                if (input1.numel() >= needed) {
+                    input1 = input1.slice(0, 0, needed).reshape({batch_size, in1_features});
+                } else {
+                    // Pad with random values
+                    torch::Tensor padding = torch::randn({needed - input1.numel()});
+                    input1 = torch::cat({input1, padding}).reshape({batch_size, in1_features});
+                }
             }
+        } catch (...) {
+            input1 = torch::randn({batch_size, in1_features});
         }
+        
+        // Ensure input2 has the correct shape (batch_size, in2_features)
+        try {
+            if (!input2.defined() || input2.numel() == 0) {
+                input2 = torch::randn({batch_size, in2_features});
+            } else {
+                // Flatten and take what we need, or pad with random values
+                input2 = input2.flatten().to(torch::kFloat);
+                int64_t needed = batch_size * in2_features;
+                if (input2.numel() >= needed) {
+                    input2 = input2.slice(0, 0, needed).reshape({batch_size, in2_features});
+                } else {
+                    // Pad with random values
+                    torch::Tensor padding = torch::randn({needed - input2.numel()});
+                    input2 = torch::cat({input2, padding}).reshape({batch_size, in2_features});
+                }
+            }
+        } catch (...) {
+            input2 = torch::randn({batch_size, in2_features});
+        }
+        
+        // Ensure both tensors are float type (required by Bilinear)
+        input1 = input1.to(torch::kFloat);
+        input2 = input2.to(torch::kFloat);
         
         // Apply the bilinear module
         torch::Tensor output = bilinear->forward(input1, input2);
         
         // Perform some operations on the output to ensure it's used
         auto sum = output.sum();
+        auto mean = output.mean();
         
-        return 0; // keep the input
+        // Test with different batch sizes if we have enough data
+        if (Size > 20) {
+            int64_t batch2 = (Data[Size - 1] % 4) + 1;
+            torch::Tensor input1_v2 = torch::randn({batch2, in1_features});
+            torch::Tensor input2_v2 = torch::randn({batch2, in2_features});
+            torch::Tensor output2 = bilinear->forward(input1_v2, input2_v2);
+            (void)output2.sum();
+        }
+        
+        return 0;
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
 }

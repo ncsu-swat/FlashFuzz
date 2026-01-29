@@ -1,63 +1,102 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
+#include <cstring>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
         
-        // Need at least a few bytes for basic tensor creation
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
         
         // Create input tensor
         torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
         
-        // Create indices tensor
-        torch::Tensor indices_tensor;
-        if (offset < Size) {
-            indices_tensor = fuzzer_utils::createTensor(Data, Size, offset);
-            
-            // Ensure indices tensor has the same shape as input tensor or is broadcastable
-            // Convert indices to long type as required by take_along_dim
-            indices_tensor = indices_tensor.to(torch::kInt64);
-        } else {
-            // If we don't have enough data for a second tensor, create a simple indices tensor
-            if (input_tensor.dim() > 0) {
-                // Create indices with same shape as input
-                indices_tensor = torch::zeros_like(input_tensor, torch::kInt64);
+        // Handle scalar tensors (0-dim)
+        if (input_tensor.dim() == 0) {
+            // For scalar tensors, indices must also be scalar with value 0
+            torch::Tensor indices_tensor = torch::zeros({}, torch::kInt64);
+            torch::Tensor result = torch::take_along_dim(input_tensor, indices_tensor);
+            return 0;
+        }
+        
+        // Get dimension from fuzzer data
+        int64_t dim = 0;
+        if (offset + sizeof(uint8_t) <= Size) {
+            dim = static_cast<int64_t>(Data[offset] % input_tensor.dim());
+            offset += sizeof(uint8_t);
+        }
+        
+        // Get the size along the chosen dimension
+        int64_t dim_size = input_tensor.size(dim);
+        if (dim_size <= 0) {
+            return 0;
+        }
+        
+        // Determine how many indices to gather (from fuzzer data)
+        int64_t num_indices = 1;
+        if (offset + sizeof(uint8_t) <= Size) {
+            num_indices = 1 + (Data[offset] % 16);  // 1 to 16 indices
+            offset += sizeof(uint8_t);
+        }
+        
+        // Build the shape for indices tensor:
+        // Same shape as input except dimension 'dim' can differ
+        std::vector<int64_t> indices_shape;
+        for (int64_t i = 0; i < input_tensor.dim(); i++) {
+            if (i == dim) {
+                indices_shape.push_back(num_indices);
             } else {
-                // For scalar tensors, create a simple scalar index
-                indices_tensor = torch::zeros({}, torch::kInt64);
+                indices_shape.push_back(input_tensor.size(i));
             }
         }
         
-        // Get a dimension value to use with take_along_dim
-        int64_t dim = 0;
-        if (offset + sizeof(int64_t) <= Size) {
-            std::memcpy(&dim, Data + offset, sizeof(int64_t));
-            offset += sizeof(int64_t);
+        // Create indices tensor with valid values (0 to dim_size-1)
+        torch::Tensor indices_tensor = torch::randint(0, dim_size, indices_shape, torch::kInt64);
+        
+        // If we have more fuzzer data, use it to modify some index values
+        if (offset < Size) {
+            auto indices_accessor = indices_tensor.flatten();
+            int64_t num_elements = indices_accessor.numel();
+            for (int64_t i = 0; i < num_elements && offset < Size; i++, offset++) {
+                // Use fuzzer byte to select index value, ensuring it's in valid range
+                indices_tensor.flatten()[i] = static_cast<int64_t>(Data[offset] % dim_size);
+            }
+            indices_tensor = indices_tensor.reshape(indices_shape);
         }
         
-        // Apply take_along_dim operation
-        // If input is a scalar (0-dim tensor), dim parameter is ignored
-        if (input_tensor.dim() > 0) {
-            // Allow negative dimensions to test edge cases
-            torch::Tensor result = torch::take_along_dim(input_tensor, indices_tensor, dim);
-        } else {
-            // For scalar tensors, dim is ignored
-            torch::Tensor result = torch::take_along_dim(input_tensor, indices_tensor);
+        // Test take_along_dim with explicit dimension
+        torch::Tensor result = torch::take_along_dim(input_tensor, indices_tensor, dim);
+        
+        // Also test with c10::optional<int64_t> nullopt (flattened case)
+        if (offset < Size && (Data[offset - 1] % 4 == 0)) {
+            try {
+                // When dim is nullopt, input is flattened and indices must be 1D
+                torch::Tensor flat_input = input_tensor.flatten();
+                int64_t flat_size = flat_input.numel();
+                if (flat_size > 0) {
+                    int64_t flat_num_indices = 1 + (num_indices % 16);
+                    torch::Tensor flat_indices = torch::randint(0, flat_size, {flat_num_indices}, torch::kInt64);
+                    torch::Tensor flat_result = torch::take_along_dim(flat_input, flat_indices, 0);
+                }
+            } catch (...) {
+                // Silently ignore inner exceptions for edge cases
+            }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

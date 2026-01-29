@@ -1,11 +1,15 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
         size_t offset = 0;
@@ -27,21 +31,23 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
             input_copy.reciprocal_();
         }
         
-        // Try with options if there's more data
+        // Try with different output dtypes
         if (offset + 1 < Size) {
-            // Use the next byte to determine if we should use non-default options
             uint8_t options_byte = Data[offset++];
             
-            // Try with different output dtypes
             if (options_byte % 3 == 0) {
                 torch::ScalarType output_dtype = fuzzer_utils::parseDataType(Data[offset % Size]);
-                torch::Tensor result_with_dtype = torch::reciprocal(input_tensor.to(output_dtype));
+                try {
+                    // Some dtype conversions may fail, that's expected
+                    torch::Tensor result_with_dtype = torch::reciprocal(input_tensor.to(output_dtype));
+                } catch (...) {
+                    // Silent catch for expected conversion failures
+                }
             }
         }
         
         // Try with edge case tensors if we have more data
         if (offset + 2 < Size) {
-            // Create a tensor with very small values
             std::vector<int64_t> shape = {2, 2};
             torch::Tensor small_values;
             
@@ -49,35 +55,44 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
                 // Very small values close to zero
                 small_values = torch::full(shape, 1e-10);
             } else {
-                // Zero values (should cause division by zero)
+                // Zero values (reciprocal of zero gives inf, not exception)
                 small_values = torch::zeros(shape);
             }
             
-            // Try reciprocal on these edge cases
-            try {
-                torch::Tensor result_edge = torch::reciprocal(small_values);
-            } catch (const std::exception& e) {
-                // Expected exception for division by zero
-            }
+            // Reciprocal handles zeros by returning inf, no exception expected
+            torch::Tensor result_edge = torch::reciprocal(small_values);
             
-            // Try with infinity and NaN values
+            // Try with infinity and NaN values using proper tensor operations
             torch::Tensor special_values = torch::empty(shape);
-            special_values[0][0] = std::numeric_limits<float>::infinity();
-            special_values[0][1] = -std::numeric_limits<float>::infinity();
-            special_values[1][0] = std::numeric_limits<float>::quiet_NaN();
-            special_values[1][1] = 1.0;
+            auto accessor = special_values.accessor<float, 2>();
+            accessor[0][0] = std::numeric_limits<float>::infinity();
+            accessor[0][1] = -std::numeric_limits<float>::infinity();
+            accessor[1][0] = std::numeric_limits<float>::quiet_NaN();
+            accessor[1][1] = 1.0f;
             
+            torch::Tensor result_special = torch::reciprocal(special_values);
+        }
+        
+        // Test with output tensor (out parameter variant)
+        if (offset + 3 < Size) {
+            torch::Tensor out_tensor = torch::empty_like(input_tensor);
+            torch::reciprocal_out(out_tensor, input_tensor);
+        }
+        
+        // Test with complex tensors
+        if (offset + 4 < Size && Data[offset] % 4 == 0) {
             try {
-                torch::Tensor result_special = torch::reciprocal(special_values);
-            } catch (const std::exception& e) {
-                // Handle any unexpected exceptions
+                torch::Tensor complex_tensor = torch::randn({2, 2}, torch::kComplexFloat);
+                torch::Tensor result_complex = torch::reciprocal(complex_tensor);
+            } catch (...) {
+                // Silent catch for any complex number issues
             }
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

@@ -1,78 +1,94 @@
-#include "fuzzer_utils.h" // General fuzzing utilities
-#include <iostream>       // For cerr
-#include <tuple>          // For std::get with lu_unpack result
+#include "fuzzer_utils.h"
+#include <iostream>
 
-// --- Fuzzer Entry Point ---
 extern "C" int LLVMFuzzerTestOneInput(const uint8_t *Data, size_t Size)
 {
-    std::cout << "Start Fuzzing" << std::endl;
+    // Progress tracking
+    static uint64_t iteration_count = 0;
+    iteration_count++;
+    if (iteration_count % 10000 == 0) {
+        std::cout << "Iterations: " << iteration_count << std::endl;
+    }
+
     try
     {
-        size_t offset = 0;
-        
         // Need at least some data to proceed
-        if (Size < 4) {
+        if (Size < 8) {
             return 0;
         }
+
+        size_t offset = 0;
+
+        // Extract dimensions from fuzzer data for controlled matrix sizes
+        // K = rows, N = columns
+        int64_t K = static_cast<int64_t>((Data[offset++] % 64) + 1);  // 1-64
+        int64_t N = static_cast<int64_t>((Data[offset++] % 64) + 1);  // 1-64
         
-        // Create input tensor
-        torch::Tensor input_tensor = fuzzer_utils::createTensor(Data, Size, offset);
+        // FBGEMM requires N to be a multiple of certain alignment (typically 4 or 8)
+        // Round N up to multiple of 4 for better compatibility
+        N = ((N + 3) / 4) * 4;
         
-        // Get parameters for fbgemm_pack_quantized_matrix
-        // We need K, N for the matrix dimensions
-        int64_t K = 0;
-        int64_t N = 0;
+        // Determine which variant to test
+        bool use_two_arg_variant = (Size > offset) && (Data[offset++] % 2 == 0);
+
+        // Create a 2D tensor with Int8 dtype (required by fbgemm)
+        // Use remaining data to fill tensor values
+        size_t remaining = Size - offset;
+        int64_t total_elements = K * N;
         
-        if (input_tensor.dim() >= 2) {
-            K = input_tensor.size(0);
-            N = input_tensor.size(1);
-        } else if (input_tensor.dim() == 1) {
-            K = 1;
-            N = input_tensor.size(0);
-        } else {
-            // For scalar tensors, use small dimensions
-            K = 1;
-            N = 1;
+        std::vector<int8_t> tensor_data(total_elements);
+        for (int64_t i = 0; i < total_elements; ++i) {
+            if (i < static_cast<int64_t>(remaining)) {
+                tensor_data[i] = static_cast<int8_t>(Data[offset + i]);
+            } else {
+                // Fill remaining with pattern derived from available data
+                tensor_data[i] = static_cast<int8_t>(i % 256);
+            }
         }
-        
-        // Convert input tensor to uint8 if needed
-        torch::Tensor uint8_input;
-        if (input_tensor.scalar_type() != torch::kUInt8) {
-            uint8_input = input_tensor.to(torch::kUInt8);
-        } else {
-            uint8_input = input_tensor;
-        }
-        
-        // Call fbgemm_pack_quantized_matrix with correct signature
+
+        torch::Tensor input_tensor = torch::from_blob(
+            tensor_data.data(),
+            {K, N},
+            torch::kInt8
+        ).clone();  // Clone to own the memory
+
+        // Ensure tensor is contiguous (required by FBGEMM)
+        input_tensor = input_tensor.contiguous();
+
         torch::Tensor packed_weights;
+        
         try {
-            packed_weights = torch::fbgemm_pack_quantized_matrix(
-                uint8_input,
-                K,
-                N
-            );
+            if (use_two_arg_variant) {
+                // Two-argument version: infers K and N from tensor shape
+                packed_weights = torch::fbgemm_pack_quantized_matrix(input_tensor);
+            } else {
+                // Four-argument version: explicitly specifies K and N
+                packed_weights = torch::fbgemm_pack_quantized_matrix(
+                    input_tensor,
+                    K,
+                    N
+                );
+            }
         } catch (const c10::Error& e) {
-            // Catch PyTorch-specific errors but don't discard the input
+            // FBGEMM may not be available on all platforms (e.g., non-x86)
+            // or may fail for certain dimension combinations
+            // Silently catch these expected failures
             return 0;
         }
-        
-        // Try to use the packed weights to ensure they're valid
+
+        // Verify the packed result is defined
         if (packed_weights.defined()) {
+            // Just check basic properties - the packed format is opaque
             auto sizes = packed_weights.sizes();
             auto numel = packed_weights.numel();
-            auto dtype = packed_weights.dtype();
-            
-            // Access some elements to ensure the tensor is valid
-            if (numel > 0) {
-                auto first_elem = packed_weights.flatten()[0].item<float>();
-                auto last_elem = packed_weights.flatten()[numel - 1].item<float>();
-            }
+            (void)sizes;
+            (void)numel;
         }
     }
     catch (const std::exception &e)
     {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        return -1; // discard the input
+        return -1;
     }
-    return 0; // keep the input
+    return 0;
 }

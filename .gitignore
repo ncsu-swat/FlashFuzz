@@ -234,3 +234,7 @@ ___tmp
 .venv-tf219
 
 tmp
+
+crash-*
+slow-*
+
