@@ -83,6 +83,13 @@ def parse_args():
         help="Enable GPU mode, use GPU for the experiment, you should have nvidia container toolkit installed",
     )
 
+    parser.add_argument(
+        "--copy-logs",
+        required=False,
+        action="store_true",
+        help="Copy execution.log and fuzz-0.log from containers (can use significant disk space)",
+    )
+
     # TODO: Add `--crash-report`, `--compilation-check`, and `--validation` arguments
 
     args = parser.parse_args()
@@ -127,6 +134,7 @@ def main():
                     slurm=args.slurm,
                     vs=args.vs,
                     gpu=args.gpu,
+                    copy_logs=args.copy_logs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -142,6 +150,7 @@ def main():
                         slurm=args.slurm,
                         vs=args.vs,
                         gpu=args.gpu,
+                        copy_logs=args.copy_logs,
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -158,6 +167,7 @@ def main():
                     slurm=args.slurm,
                     vs=args.vs,
                     gpu=args.gpu,
+                    copy_logs=args.copy_logs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -174,6 +184,7 @@ def main():
                         slurm=args.slurm,
                         vs=args.vs,
                         gpu=args.gpu,
+                        copy_logs=args.copy_logs,
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -190,6 +201,7 @@ def main():
                     slurm=args.slurm,
                     vs=args.vs,
                     gpu=args.gpu,
+                    copy_logs=args.copy_logs,
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()
@@ -208,6 +220,7 @@ def main():
                     slurm=args.slurm,
                     vs=args.vs,
                     gpu=args.gpu,
+                    copy_logs=args.copy_logs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -223,6 +236,7 @@ def main():
                         slurm=args.slurm,
                         vs=args.vs,
                         gpu=args.gpu,
+                        copy_logs=args.copy_logs,
                     )
                     scheduler.add_experiment(exp)
         if args.mode == "cov":
@@ -239,6 +253,7 @@ def main():
                     slurm=args.slurm,
                     vs=args.vs,
                     gpu=args.gpu,
+                    copy_logs=args.copy_logs,
                 )
                 scheduler.add_experiment(exp)
             else:
@@ -255,6 +270,7 @@ def main():
                         slurm=args.slurm,
                         vs=args.vs,
                         gpu=args.gpu,
+                        copy_logs=args.copy_logs,
                     )
                     scheduler.add_experiment(exp)
                 scheduler.run_all()
@@ -271,6 +287,7 @@ def main():
                     slurm=args.slurm,
                     vs=args.vs,
                     gpu=args.gpu,
+                    copy_logs=args.copy_logs,
                 )
                 exp.merge_coverage_files()
                 exp.get_coverage_results()

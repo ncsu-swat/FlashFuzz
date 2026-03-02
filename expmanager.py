@@ -37,7 +37,7 @@ def loop_until_ctrl_c(callback: Optional[Callable[[], None]] = None, interval: f
 
 
 class Experiment():
-    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False, slurm: bool = False, vs: Optional[str] = None, gpu: bool = False):
+    def __init__(self, dll: str, mode: str, ver: str, api: str, cpus: int = 16, mem: int = 16, check_valid: bool = False, time_budget: int = 180, itv: int = 60, debug: bool = False, slurm: bool = False, vs: Optional[str] = None, gpu: bool = False, copy_logs: bool = False):
         self.dll = dll
         self.mode = mode
         self.ver = ver
@@ -59,6 +59,7 @@ class Experiment():
         self.itv = itv
         self.debug = debug
         self.slurm = slurm
+        self.copy_logs = copy_logs
         # result directory includes vs tag if provided to disambiguate baselines
         vs_suffix = f"-{self.vs}" if self.vs else ""
         if self.api == "all":
@@ -323,12 +324,16 @@ class Experiment():
             self.execute_command(f"cd /root/tensorflow/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --ver {self.ver} --time_budget {self.time_budget} --no-compile")
             self.execute_command(f"mkdir -p /root/tensorflow/fuzz/{self.api}/artifacts")
             self.execute_command(f"cd /root/tensorflow/fuzz/{self.api} && bash fuzz.sh > execution.log")
-            self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
-            self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
+            if self.copy_logs:
+                self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/execution.log", self.result_dir)
+                self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/fuzz-0.log", self.result_dir)
             self.copy_results_from_container(f"/root/tensorflow/fuzz/{self.api}/artifacts/", self.result_dir)
             # Compute and persist validity stats for this API
             try:
-                self._compute_and_write_stats()
+                if self.copy_logs:
+                    self._compute_and_write_stats()
+                else:
+                    self._compute_stats_in_container(f"/root/tensorflow/fuzz/{self.api}")
             except Exception as e:
                 print(f"Failed to compute stats for {self.api}: {e}")
             self.status = Status.COMPLETED
@@ -377,12 +382,16 @@ class Experiment():
             self.execute_command(f"cd /root/fuzz/ && python3 build_test_harness.py --dll {self.dll} --mode {self.mode} --ver {self.ver} --time_budget {self.time_budget} --no-compile")
             self.execute_command(f"mkdir -p /root/fuzz/{self.api}/artifacts")
             self.execute_command(f"cd /root/fuzz/{self.api} && bash fuzz.sh > execution.log")
-            self.copy_results_from_container(f"/root/fuzz/{self.api}/execution.log", self.result_dir)
-            self.copy_results_from_container(f"/root/fuzz/{self.api}/fuzz-0.log", self.result_dir)
+            if self.copy_logs:
+                self.copy_results_from_container(f"/root/fuzz/{self.api}/execution.log", self.result_dir)
+                self.copy_results_from_container(f"/root/fuzz/{self.api}/fuzz-0.log", self.result_dir)
             self.copy_results_from_container(f"/root/fuzz/{self.api}/artifacts/", self.result_dir)
             # Compute and persist validity stats for this API
             try:
-                self._compute_and_write_stats()
+                if self.copy_logs:
+                    self._compute_and_write_stats()
+                else:
+                    self._compute_stats_in_container(f"/root/fuzz/{self.api}")
             except Exception as e:
                 print(f"Failed to compute stats for {self.api}: {e}")
             self.status = Status.COMPLETED
@@ -609,6 +618,59 @@ class Experiment():
 
         # Write to stat.txt under result dir
         stat_path = os.path.join(target_dir, "stat.txt")
+        try:
+            with open(stat_path, "w") as sf:
+                sf.write("\n".join(lines) + "\n")
+        except Exception as e:
+            print(f"Failed to write stats file {stat_path}: {e}")
+
+    def _compute_stats_in_container(self, fuzz_dir: str) -> None:
+        """Compute stats by running grep inside the container, avoiding large log copies."""
+        os.makedirs(self.result_dir, exist_ok=True)
+
+        # Count invalid lines (Exception caught + CPU Execution error)
+        invalid = 0
+        try:
+            cmd = f"docker exec {self.container_name} sh -c \"grep -c -E 'Exception caught:|CPU Execution error' {fuzz_dir}/fuzz-0.log\""
+            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if proc.returncode == 0 and proc.stdout.strip():
+                invalid = int(proc.stdout.strip())
+        except Exception:
+            pass
+
+        # Get rounds — try stat line first, fallback to 'Done N runs'
+        rounds = 0
+        try:
+            cmd = f"docker exec {self.container_name} sh -c \"grep 'stat::number_of_executed_units' {fuzz_dir}/fuzz-0.log | tail -1 | awk '{{print \\$NF}}'\""
+            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if proc.returncode == 0 and proc.stdout.strip():
+                rounds = int(proc.stdout.strip())
+        except Exception:
+            pass
+
+        if rounds == 0:
+            try:
+                cmd = f"docker exec {self.container_name} sh -c \"grep '^Done ' {fuzz_dir}/fuzz-0.log | tail -1 | awk '{{print \\$2}}'\""
+                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                if proc.returncode == 0 and proc.stdout.strip():
+                    rounds = int(proc.stdout.strip())
+            except Exception:
+                pass
+
+        valid = max(0, rounds - invalid)
+        ratio = (valid / rounds) if rounds > 0 else 0.0
+
+        lines = [
+            f"api: {self.api}",
+            f"rounds: {rounds}",
+            f"invalid: {invalid}",
+            f"valid: {valid}",
+            f"validity_ratio: {ratio:.6f}",
+        ]
+
+        print(" | ".join(lines))
+
+        stat_path = os.path.join(self.result_dir, "stat.txt")
         try:
             with open(stat_path, "w") as sf:
                 sf.write("\n".join(lines) + "\n")
