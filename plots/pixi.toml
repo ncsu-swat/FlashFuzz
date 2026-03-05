@@ -1,0 +1,14 @@
+[workspace]
+authors = ["canarypwn <canarypwn@aosc.io>"]
+channels = ["conda-forge"]
+name = "rq1"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.10,<3.13"
+ipykernel = "*"
+matplotlib-base = "*"
+matplotlib = ">=3.10.5,<4"

@@ -110,6 +110,10 @@ def main():
     # filter apis not start with tf or torch
     apis = [api for api in apis if api.startswith("tf.") or api.startswith("torch.")]
 
+    # If --apis is specified, only keep those APIs
+    if args.apis:
+        apis = [api for api in apis if api in args.apis]
+
     scheduler = Scheduler(num_parallel=args.num_parallel)
 
     if args.dll == "tf" :
