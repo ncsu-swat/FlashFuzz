@@ -220,6 +220,60 @@ This computes per-decile exception rates across all fuzz logs, which feeds into 
 
 > **Note:** The validity tools may produce inaccurate results for the TensorFlow ablation study. The TensorFlow fuzz logs use different error markers across harness variants, which can cause the heuristic-based counters to under- or over-count invalid inputs. PyTorch results are not affected.
 
+### E4: Finding Bugs in the Wild (RQ4)
+
+FlashFuzz can also be used to find real bugs in the latest versions of TensorFlow and PyTorch. To fuzz a newer version:
+
+#### TensorFlow 2.19
+
+```bash
+docker build -t ncsuswat/flashfuzz:tf2.19-base -f docker/tf2.19-base.Dockerfile .
+docker build -t ncsuswat/flashfuzz:tf2.19-fuzz -f docker/tf2.19-fuzz.Dockerfile .
+python3 -u run.py --dll tf --version 2.19 --mode fuzz --time_budget 600 --num_parallel 50
+```
+
+#### PyTorch 2.7
+
+```bash
+docker build -t ncsuswat/flashfuzz:torch2.7-base -f docker/torch-2.7-base.Dockerfile .
+docker build -t ncsuswat/flashfuzz:torch2.7-fuzz -f docker/torch-2.7-fuzz.Dockerfile .
+python3 -u run.py --dll torch --version 2.7 --mode fuzz --time_budget 600 --num_parallel 50
+```
+
+#### Testing newer releases
+
+When a new version of PyTorch or TensorFlow is released (e.g., PyTorch 2.10), you need to:
+
+1. **Create new Dockerfiles** — copy an existing base+fuzz Dockerfile pair (e.g., `docker/torch-2.7-base.Dockerfile`) and update the git clone tag to the new version.
+2. **Create a new API list** — add `api_list/torch2.10-flashfuzz.txt`. You can start by copying the previous version's list and adjusting for any added/removed APIs.
+3. **Reuse existing test harnesses** — the harnesses in `testharness/` are generally version-agnostic and can be reused as-is. Update individual harnesses only if the API signature has changed in the new release.
+
+Then build and run as usual:
+
+```bash
+docker build -t ncsuswat/flashfuzz:torch2.10-base -f docker/torch-2.10-base.Dockerfile .
+docker build -t ncsuswat/flashfuzz:torch2.10-fuzz -f docker/torch-2.10-fuzz.Dockerfile .
+python3 -u run.py --dll torch --version 2.10 --mode fuzz --time_budget 600 --num_parallel 50
+```
+
+#### Collecting and triaging crashes
+
+After fuzzing completes, each API's result directory contains an `artifacts/` folder with crash-triggering inputs (files named `crash-*`). Use the crash collection tool to aggregate and triage them:
+
+```bash
+python3 tools/collect_fuzz_crashes.py _fuzz_result/tf2.19-fuzz-600s reports
+```
+
+This produces:
+- `reports/<name>-crashes.json` — structured crash data (crash type, stack trace, artifact paths)
+- `reports/<name>-crashes.md` — human-readable Markdown summary
+
+The tool automatically filters out known false positives (e.g., floating-point exceptions in the harness itself, UBSan SEGV at known benign addresses). Review the remaining crashes manually:
+
+1. **Check the stack trace** — crashes with stack frames inside library kernels (e.g., `tensorflow/core/kernels/`, `aten/src/ATen/native/`) are likely real bugs.
+2. **Reproduce the crash** — re-run the fuzzer with the crash artifact as input to confirm it's deterministic.
+3. **File a bug report** — report confirmed crashes to the library's issue tracker with the crash type, stack trace, and a minimal reproducer.
+
 ---
 
 ## Reproducing Figures
