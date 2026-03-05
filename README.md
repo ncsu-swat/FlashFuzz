@@ -9,7 +9,7 @@ FlashFuzz is a framework that employs coverage-guided fuzzing to test Deep Learn
 ## Provenance
 
 - **Paper:** included in `paper/flashfuzz.pdf`
-- **Repository:** <!-- TODO: add Zenodo DOI or archival link -->
+- **Repository:** https://github.com/ncsu-swat/FlashFuzz/tree/artifact-evaluation
 
 ## Table of Contents
 
@@ -52,12 +52,14 @@ FlashFuzz is a framework that employs coverage-guided fuzzing to test Deep Learn
 
 ### Building Docker Images
 
-Pre-built Docker images are available on Docker Hub. Pull them to skip the lengthy build step:
+Pre-built Docker images are available on GitHub Container Registry. Pull and retag them to skip the lengthy build step:
 
 ```bash
-docker pull ncsuswat/flashfuzz:torch2.2-base
-docker pull ncsuswat/flashfuzz:torch2.2-fuzz
-# ... (see build_docker.sh for the full list of image tags)
+# Pull from GHCR and retag to the local name used by run.py
+for tag in torch2.2-base torch2.2-fuzz torch2.2-cov tf2.16-base tf2.16-fuzz tf2.16-cov; do
+  docker pull ghcr.io/ncsu-swat/flashfuzz:$tag
+  docker tag ghcr.io/ncsu-swat/flashfuzz:$tag ncsuswat/flashfuzz:$tag
+done
 ```
 
 Alternatively, build from source (takes several hours due to compiling TensorFlow/PyTorch with coverage instrumentation):
