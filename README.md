@@ -107,7 +107,7 @@ The full evaluation reproduces the main experiments from the paper. Each experim
 | FlashFuzz fuzzing (TF) | ~2 hours |
 | FlashFuzz fuzzing (PyTorch) | ~4 hours |
 | Coverage collection (per tool per library) | ~3-5 hours |
-| Ablation study (4 variants x 2 libraries) | ~2-3 days |
+| Ablation study (4 variants x 2 libraries) | ~5-6 hours |
 
 ### Common Flags
 
