@@ -31,15 +31,15 @@ The artifact includes:
 - Ablation study harness variants (with/without helper functions, with/without documentation).
 - Jupyter notebooks and post-processing scripts to reproduce all figures and tables in the paper.
 
-= Badges Claimed
+= Badges Applied For
 
-*Artifact Available.* The artifact is publicly available at #link("https://github.com/ncsu-swat/FlashFuzz/tree/artifact-evaluation") under the MIT license, ensuring long-term public availability.
+*Artifact Available.* The artifact is publicly archived on Zenodo (#link("https://doi.org/10.5281/zenodo.18884206")[DOI: 10.5281/zenodo.18884206]) under the MIT license, ensuring long-term public availability. The development repository is at #link("https://github.com/ncsu-swat/FlashFuzz/tree/artifact-evaluation").
 
-*Artifact Reviewed.* We claim the Reviewed badge on all four criteria:
+*Artifact Reviewed.* We apply for the Reviewed badge on all four criteria:
 - *Documented:* The repository includes a detailed `README.md` with step-by-step instructions for setup, a kick-the-tires quick test (~30 min), and full experiment reproduction.
 - *Consistent:* The artifact directly produces the results reported in the paper (coverage comparisons, ablation study, validity analysis, and bug detection).
 - *Complete:* All components needed to reproduce the paper's experiments are included: source code, test harnesses, Docker images, baseline configurations, API lists, and plotting scripts.
-- *Exercisable:* Pre-built Docker images are available on Docker Hub. The kick-the-tires evaluation can be completed in ~30 minutes. All scripts and notebooks can be executed to reproduce the paper's results.
+- *Exercisable:* Pre-built Docker images are available on GitHub Container Registry. The kick-the-tires evaluation can be completed in ~10 minutes with pre-built images. All scripts and notebooks can be executed to reproduce the paper's results.
 
 = Technology Skills
 
@@ -52,6 +52,8 @@ Reviewers should be familiar with:
 No knowledge of fuzzing internals, C++ test harness code, or DL library internals is required to run the artifact.
 
 = Access and Environment
+
+*Zenodo archive:* #link("https://doi.org/10.5281/zenodo.18884206")[DOI: 10.5281/zenodo.18884206]
 
 *Repository:* #link("https://github.com/ncsu-swat/FlashFuzz/tree/artifact-evaluation")
 
@@ -73,4 +75,4 @@ No knowledge of fuzzing internals, C++ test harness code, or DL library internal
 
 *Software dependencies:* Python 3.10+, `tqdm`, `bs4`, `regex`. A `pixi.toml` is provided for one-command environment setup via #link("https://pixi.sh")[Pixi].
 
-*Setup time:* ~10 minutes with pre-built Docker images (pull + pixi install). ~2--4 hours if building Docker images from source.
+*Setup time:* ~10 minutes with pre-built Docker images (pull + pixi install). ~30 minutes if building the kick-the-tires image from source. Several hours if building all images from source.

@@ -16,3 +16,4 @@ regex = ">=2025.7.34,<2026"
 
 [target.linux-64.dependencies]
 typst = ">=0.14.2,<0.15"
+gh = ">=2.87.3,<3"

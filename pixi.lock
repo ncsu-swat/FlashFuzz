@@ -16,6 +16,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/ca-certificates-2025.7.14-hbd8a1cb_0.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-64/cffi-1.17.1-py312h06ac9bb_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/colorama-0.4.6-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/linux-64/gh-2.87.3-h76a2195_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/h2-4.2.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hpack-4.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
@@ -150,6 +151,15 @@ packages:
   license_family: BSD
   size: 27011
   timestamp: 1733218222191
+- conda: https://conda.anaconda.org/conda-forge/linux-64/gh-2.87.3-h76a2195_0.conda
+  sha256: d11ce5465c6d9dda9e139eb01c71574cd694fdf8a02ad3dd65f919cfc99a6f7e
+  md5: b9e1e9e61748f2983917459b4ca56398
+  depends:
+  - __glibc >=2.17,<3.0.a0
+  license: Apache-2.0
+  license_family: APACHE
+  size: 22811233
+  timestamp: 1771994966015
 - conda: https://conda.anaconda.org/conda-forge/noarch/h2-4.2.0-pyhd8ed1ab_0.conda
   sha256: 0aa1cdc67a9fe75ea95b5644b734a756200d6ec9d0dff66530aec3d1c1e9df75
   md5: b4754fb1bdcb70c8fd54f918301582c6

@@ -4,12 +4,13 @@
 
 FlashFuzz is a framework that employs coverage-guided fuzzing to test Deep Learning APIs at scale. This artifact contains all source code, test harnesses, Dockerfiles, baseline configurations, and plotting scripts needed to reproduce the experiments from the paper.
 
-**Badges claimed:** Available, Reviewed (Documented, Consistent, Complete, Exercisable)
+**Badges applied for:** Available, Reviewed (Documented, Consistent, Complete, Exercisable)
 
 ## Provenance
 
 - **Paper:** included in `paper/flashfuzz.pdf`
 - **Repository:** https://github.com/ncsu-swat/FlashFuzz/tree/artifact-evaluation
+- **Archived:** [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.18884206.svg)](https://doi.org/10.5281/zenodo.18884206)
 
 ## Table of Contents
 
@@ -309,6 +310,15 @@ The tool automatically filters out known false positives (e.g., floating-point e
 2. **Reproduce the crash** — re-run the fuzzer with the crash artifact as input to confirm it's deterministic.
 3. **File a bug report** — report confirmed crashes to the library's issue tracker with the crash type, stack trace, and a minimal reproducer.
 
+#### Bugs found by FlashFuzz
+
+The `bugs/` directory contains CSVs listing all bugs discovered by FlashFuzz in the latest versions of PyTorch and TensorFlow:
+
+- `bugs/torch.csv` — 32 bugs in PyTorch (14 fixed, 17 confirmed, 1 reported)
+- `bugs/tf.csv` — 21 bugs in TensorFlow (confirmed or fixed)
+
+Each issue link includes a minimal reproducible Python script demonstrating the bug. Reviewers can verify any bug by visiting the issue link and running the provided script.
+
 ---
 
 ## Reproducing Figures
@@ -365,6 +375,7 @@ FlashFuzz/
   ablation/               # Ablation study harness variants
   plots/                  # Jupyter notebooks for figure reproduction
   tools/                  # Post-processing scripts (stats, crashes, deciles)
+  bugs/                   # Bugs found by FlashFuzz (torch.csv, tf.csv)
   scripts/                # Helper scripts (coverage, merge, etc.)
   reports/                # Bug reports
   paper/                  # Paper PDF
