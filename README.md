@@ -50,6 +50,77 @@ FlashFuzz is a framework that employs coverage-guided fuzzing to test Deep Learn
   ```
   Alternatively, install the Python dependencies manually: Python 3.12, `tqdm`, `bs4`, `regex`.
 
+---
+
+## Kick-the-Tires (Short Run, ~30 min)
+
+This section verifies that the artifact works end-to-end. We fuzz a small subset of PyTorch APIs with a short time budget. Estimated total time: **~10 minutes** (with pre-built images) or **~40 minutes** (building from source).
+
+### Step 1: Pull the PyTorch 2.2 fuzz image (~2 min with pre-built, ~30 min from source)
+
+Pull pre-built images from GitHub Container Registry:
+
+```bash
+for tag in torch2.2-base torch2.2-fuzz; do
+  docker pull ghcr.io/ncsu-swat/flashfuzz:$tag
+  docker tag ghcr.io/ncsu-swat/flashfuzz:$tag ncsuswat/flashfuzz:$tag
+done
+```
+
+Alternatively, build from source (takes ~30 minutes):
+
+```bash
+bash build_docker_kicktires.sh
+```
+
+### Step 2: Check that test harnesses compile (~30 sec)
+
+```bash
+python3 -u run.py --dll torch --version 2.2 --mode fuzz --check_valid
+```
+
+Expected output (numbers may vary slightly):
+```
+Build Summary: Build status: 1244/1576 PyTorch APIs built successfully.
+```
+
+### Step 3: Fuzz 5 APIs with a 60-second budget (~7 min)
+
+```bash
+python3 -u run.py --dll torch --version 2.2 --mode fuzz --time_budget 60 --apis torch.abs torch.add torch.argmax torch.concat torch.matmul
+```
+
+Results are stored in `_fuzz_result/`. Each API directory contains:
+- `execution.log` — stdout from the fuzzing run
+- `fuzz-0.log` — libFuzzer log with coverage and execution stats
+- `artifacts/` — crash-triggering inputs (if any)
+
+### Step 4: (Optional) Short coverage measurement (~10 min)
+
+Pull (or build) the coverage image and run coverage collection on the same APIs:
+
+```bash
+docker pull ghcr.io/ncsu-swat/flashfuzz:torch2.2-cov
+docker tag ghcr.io/ncsu-swat/flashfuzz:torch2.2-cov ncsuswat/flashfuzz:torch2.2-cov
+
+python3 -u run.py --dll torch --version 2.2 --mode cov --time_budget 60 --itv 30 --apis torch.abs torch.add torch.argmax torch.concat torch.matmul
+```
+
+Results are stored in `_cov_result/`.
+
+---
+
+## Full Evaluation
+
+The full evaluation reproduces the main experiments from the paper. Each experiment fuzzes hundreds of APIs with a 600-second (10-minute) time budget per API. With `--num_parallel 50`, the approximate wall-clock times are:
+
+| Experiment | Approx. Time |
+|---|---|
+| FlashFuzz fuzzing (TF) | ~3 hours |
+| FlashFuzz fuzzing (PyTorch) | ~3 hours |
+| Coverage collection (per tool per library) | ~3-5 hours |
+| Ablation study (4 variants x 2 libraries) | ~5-6 hours |
+
 ### Building Docker Images
 
 Pre-built Docker images are available on GitHub Container Registry. Pull and retag them to skip the lengthy build step:
@@ -71,64 +142,6 @@ bash build_docker.sh
 
 To build only the images needed for a specific experiment, run the relevant `docker build` commands from `build_docker.sh` individually.
 
----
-
-## Kick-the-Tires (Short Run, ~30 min)
-
-This section verifies that the artifact works end-to-end. We fuzz a small subset of PyTorch APIs with a short time budget.
-
-### Step 1: Build the PyTorch 2.2 fuzz image
-
-```bash
-bash build_docker_kicktires.sh
-```
-
-### Step 2: Check that test harnesses compile
-
-```bash
-python3 -u run.py --dll torch --version 2.2 --mode fuzz --check_valid
-```
-
-Expected output (numbers may vary slightly):
-```
-Build Summary: Build status: XXX/1164 PyTorch APIs built successfully.
-```
-
-### Step 3: Fuzz 5 APIs with a 60-second budget
-
-```bash
-python3 -u run.py --dll torch --version 2.2 --mode fuzz --time_budget 60 --apis torch.abs torch.add torch.argmax torch.concat torch.matmul
-```
-
-Results are stored in `_fuzz_result/`. Each API directory contains:
-- `execution.log` — stdout from the fuzzing run
-- `fuzz-0.log` — libFuzzer log with coverage and execution stats
-- `artifacts/` — crash-triggering inputs (if any)
-
-### Step 4: (Optional) Short coverage measurement
-
-Build the coverage image and run coverage collection on the same APIs:
-
-```bash
-docker build -t ncsuswat/flashfuzz:torch2.2-cov -f docker/torch-2.2-cov.Dockerfile .
-python3 -u run.py --dll torch --version 2.2 --mode cov --time_budget 60 --itv 30 --apis torch.abs torch.add torch.argmax torch.concat torch.matmul
-```
-
-Results are stored in `_cov_result/`.
-
----
-
-## Full Evaluation
-
-The full evaluation reproduces the main experiments from the paper. Each experiment fuzzes hundreds of APIs with a 600-second (10-minute) time budget per API. With `--num_parallel 50`, the approximate wall-clock times are:
-
-| Experiment | Approx. Time |
-|---|---|
-| FlashFuzz fuzzing (TF) | ~2 hours |
-| FlashFuzz fuzzing (PyTorch) | ~4 hours |
-| Coverage collection (per tool per library) | ~3-5 hours |
-| Ablation study (4 variants x 2 libraries) | ~5-6 hours |
-
 ### Common Flags
 
 | Flag | Description |
@@ -145,6 +158,8 @@ The full evaluation reproduces the main experiments from the paper. Each experim
 ### E1: Coverage Comparison (RQ1)
 
 This experiment compares FlashFuzz against three baselines (TitanFuzz, PathFinder, ACETest) on TensorFlow 2.16 and PyTorch 2.2.
+
+> **Note on baselines:** The coverage and validity data for baselines are collected using our universal coverage collection tool: https://github.com/ncsu-swat/Universal-DLL-Coverage-Collector. For TitanFuzz, we use our fork: https://github.com/ncsu-swat/TitanFuzz.
 
 #### FlashFuzz (ours)
 
