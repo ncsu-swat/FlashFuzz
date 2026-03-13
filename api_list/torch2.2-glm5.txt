@@ -1,0 +1,10 @@
+torch.add
+torch.matmul
+torch.mm
+torch.bmm
+torch.cat
+torch.mean
+torch.sum
+torch.relu
+torch.sigmoid
+torch.softmax
